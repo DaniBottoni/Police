@@ -6,8 +6,9 @@ const https = require('https');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
-const configPath = path.join(__dirname, 'config.json');
+const configPath   = path.join(__dirname, 'config.json');
 const warningsPath = path.join(__dirname, 'warnings.json');
+const historyPath  = path.join(__dirname, 'history.json');
 
 function loadJSON(filePath, label, fallback) {
     if (!fs.existsSync(filePath)) return fallback;
@@ -21,11 +22,27 @@ function loadJSON(filePath, label, fallback) {
     }
 }
 
-let guildConfigs = loadJSON(configPath, 'config.json', {});
+let guildConfigs   = loadJSON(configPath,   'config.json',   {});
 let activeWarnings = loadJSON(warningsPath, 'warnings.json', {});
+let warnHistory    = loadJSON(historyPath,  'history.json',  {});
 
-function saveConfigs() {
-    fs.writeFileSync(configPath, JSON.stringify(guildConfigs, null, 2));
+function saveConfigs() { fs.writeFileSync(configPath, JSON.stringify(guildConfigs, null, 2)); }
+
+function saveWarnings() {
+    fs.writeFileSync(warningsPath, JSON.stringify(activeWarnings, null, 2));
+    saveFileToGitHub(warningsPath, 'warnings.json', 'Auto-save: Update warnings.json').catch(e => console.error('Warning GitHub save failed:', e.message));
+}
+
+function saveHistory() {
+    fs.writeFileSync(historyPath, JSON.stringify(warnHistory, null, 2));
+    saveFileToGitHub(historyPath, 'history.json', 'Auto-save: Update history.json').catch(e => console.error('History GitHub save failed:', e.message));
+}
+
+function addHistory(guildId, entry) {
+    warnHistory[guildId] ??= [];
+    warnHistory[guildId].push(entry);
+    if (warnHistory[guildId].length > 1000) warnHistory[guildId] = warnHistory[guildId].slice(-1000);
+    saveHistory();
 }
 
 async function saveFileToGitHub(filePath, fileName, commitMessage) {
@@ -51,16 +68,11 @@ async function saveFileToGitHub(filePath, fileName, commitMessage) {
     }
 }
 
-function saveWarnings() {
-    fs.writeFileSync(warningsPath, JSON.stringify(activeWarnings, null, 2));
-    saveFileToGitHub(warningsPath, 'warnings.json', 'Auto-save: Update warnings.json').catch(e => console.error('Warning GitHub save failed:', e.message));
-}
-
 async function showAccessControlConfig(interaction, guildId) {
     const embed = new EmbedBuilder()
         .setColor('#5865F2')
         .setTitle('🔒 Access Configuration')
-        .setDescription('Select which role should have access to moderation commands:\n\n**Commands affected:**\n• `/warn` - Give warnings to users\n• `/unwarn` - Remove warnings from users\n• `/config` - Configure warning levels\n• `/viewconfig` - View warning configuration\n• `/accessconfig` - Change access control settings\n\n**Note:** Server administrators always have access to all commands.')
+        .setDescription('Select which role should have access to moderation commands:\n\n**Commands affected:**\n• `/warn` `/unwarn` `/config` `/viewconfig`\n• `/accessconfig` `/warnlist` `/history`\n\n**Note:** Server administrators always have access.')
         .setFooter({ text: 'Select a role from the dropdown below' });
     const row = new ActionRowBuilder().addComponents(
         new RoleSelectMenuBuilder().setCustomId(`access_role_${guildId}`).setPlaceholder('Select a role for command access').setMinValues(1).setMaxValues(1)
@@ -78,19 +90,15 @@ function hasCommandPermission(interaction, guildId) {
 // Supports: m:s | h:m:s | d:h:m:s | "forever"
 function parseDuration(durationStr) {
     if (durationStr.toLowerCase() === 'forever') return { days: 0, hours: 0, minutes: 0, seconds: 0, totalMs: null, isForever: true };
-
     const parts = durationStr.split(':').map(p => {
         const n = parseInt(p.trim());
         return (n < 0 || n > 9999) ? NaN : n;
     });
-
     if (parts.some(isNaN) || parts.length < 2 || parts.length > 4) return null;
-
     let days = 0, hours = 0, minutes = 0, seconds = 0;
     if (parts.length === 2) [minutes, seconds] = parts;
     else if (parts.length === 3) [hours, minutes, seconds] = parts;
     else [days, hours, minutes, seconds] = parts;
-
     const totalMs = (days * 86400 + hours * 3600 + minutes * 60 + seconds) * 1000;
     return (totalMs <= 0 || totalMs > 365 * 86400 * 1000) ? null : { days, hours, minutes, seconds, totalMs, isForever: false };
 }
@@ -103,6 +111,7 @@ function formatDuration(days, hours, minutes, seconds, isForever = false) {
 const warningTimers = new Map();
 
 async function handleWarningExpiry(warningKey, guildId, userId, roleId, channelId) {
+    const w = activeWarnings[warningKey];
     try {
         const guild = client.guilds.cache.get(guildId);
         if (!guild) return;
@@ -120,6 +129,7 @@ async function handleWarningExpiry(warningKey, guildId, userId, roleId, channelI
             if (channel) await channel.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('❌ Warning Removal Failed').setDescription(`Could not remove role from <@${userId}>. Check bot permissions and role hierarchy.`).addFields({ name: 'Error', value: error.message || 'Unknown error' }).setTimestamp()] });
         } catch {}
     }
+    if (w) addHistory(guildId, { ...w, endedAt: Date.now(), endReason: 'expired' });
     warningTimers.delete(warningKey);
     delete activeWarnings[warningKey];
     saveWarnings();
@@ -168,7 +178,10 @@ client.once('ready', () => {
             .addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)),
         new SlashCommandBuilder().setName('viewconfig').setDescription('View current warning configuration'),
         new SlashCommandBuilder().setName('accessconfig').setDescription('Configure which role can access moderation commands'),
-        new SlashCommandBuilder().setName('timeleft').setDescription('Check how much time is left on your warnings')
+        new SlashCommandBuilder().setName('timeleft').setDescription('Check how much time is left on your warnings'),
+        new SlashCommandBuilder().setName('warnlist').setDescription('View all active warnings in this server'),
+        new SlashCommandBuilder().setName('history').setDescription('View warning history for a user')
+            .addUserOption(o => o.setName('user').setDescription('User to look up').setRequired(true))
     ].map(c => c.toJSON());
 
     client.application.commands.set(commands);
@@ -190,6 +203,25 @@ client.on('guildCreate', async guild => {
     } catch (e) { console.error('Error in guildCreate:', e); }
 });
 
+// Reapply active warnings to users who left and rejoined
+client.on('guildMemberAdd', async member => {
+    const { guild, id: userId } = member;
+    const userWarnings = Object.entries(activeWarnings).filter(([, w]) => w.guildId === guild.id && w.userId === userId);
+    if (!userWarnings.length) return;
+
+    console.log(`🔄 Reapplying ${userWarnings.length} warning(s) to rejoining user ${member.user.tag}`);
+    for (const [, w] of userWarnings) {
+        const role = guild.roles.cache.get(w.roleId);
+        if (role) await member.roles.add(role).catch(e => console.error(`Failed to reapply warning role: ${e.message}`));
+    }
+
+    member.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ Warning Reinstated')
+        .setDescription(`Your active warning(s) in **${guild.name}** have been reapplied because you rejoined.`)
+        .addFields({ name: 'Active Warnings', value: userWarnings.map(([, w]) => `Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') })
+        .setTimestamp()]
+    }).catch(() => {});
+});
+
 client.on('interactionCreate', async interaction => {
     if (interaction.isRoleSelectMenu()) {
         if (!interaction.customId.startsWith('access_role_')) return;
@@ -205,7 +237,7 @@ client.on('interactionCreate', async interaction => {
         await saveFileToGitHub(configPath, 'config.json', 'Auto-save: Update config.json from Discord bot');
         await interaction.update({
             embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('✅ Access Control Updated')
-                .setDescription(`Members with the ${selectedRole} role can now use moderation commands.\n\n**Affected commands:**\n• \`/warn\`\n• \`/unwarn\`\n• \`/config\`\n• \`/viewconfig\`\n• \`/accessconfig\`\n\n*Server administrators always have access.*`)
+                .setDescription(`Members with the ${selectedRole} role can now use moderation commands.\n\n*Server administrators always have access.*`)
                 .setTimestamp()],
             components: []
         });
@@ -220,7 +252,7 @@ client.on('interactionCreate', async interaction => {
 
     guildConfigs[guildId] ??= { levels: {} };
 
-    const restrictedCommands = ['config', 'warn', 'unwarn', 'viewconfig', 'accessconfig'];
+    const restrictedCommands = ['config', 'warn', 'unwarn', 'viewconfig', 'accessconfig', 'warnlist', 'history'];
     if (restrictedCommands.includes(commandName) && !hasCommandPermission(interaction, guildId)) {
         const accessRole = guildConfigs[guildId]?.accessRoleId;
         return interaction.reply({
@@ -308,12 +340,20 @@ client.on('interactionCreate', async interaction => {
                 ).setTimestamp()]
             });
 
+            const baseEntry = {
+                guildId, userId: user.id, userTag: user.tag, roleId: role.id, roleName: role.name,
+                level, reason, issuedBy: interaction.user.tag, issuedAt: Date.now()
+            };
+
             if (!config.isForever) {
                 const warningKey = `${guildId}-${user.id}-${level}-${Date.now()}`;
                 const expiresAt = Date.now() + config.durationMs;
-                activeWarnings[warningKey] = { guildId, userId: user.id, roleId: role.id, level, expiresAt, channelId: interaction.channel.id };
+                activeWarnings[warningKey] = { ...baseEntry, expiresAt, channelId: interaction.channel.id, isForever: false };
                 saveWarnings();
                 scheduleWarningRemoval(warningKey, guildId, user.id, role.id, expiresAt, interaction.channel.id);
+            } else {
+                // Forever warnings go directly to history (no expiry to track)
+                addHistory(guildId, { ...baseEntry, expiresAt: null, isForever: true, endedAt: null, endReason: null });
             }
         } catch (error) {
             console.error(error);
@@ -353,7 +393,12 @@ client.on('interactionCreate', async interaction => {
                 const w = activeWarnings[key];
                 return w.userId === user.id && w.guildId === guildId && w.level === level;
             });
-            warningKeys.forEach(key => { clearTimeout(warningTimers.get(key)); warningTimers.delete(key); delete activeWarnings[key]; });
+            warningKeys.forEach(key => {
+                addHistory(guildId, { ...activeWarnings[key], endedAt: Date.now(), endReason: 'manual' });
+                clearTimeout(warningTimers.get(key));
+                warningTimers.delete(key);
+                delete activeWarnings[key];
+            });
             if (warningKeys.length > 0) saveWarnings();
 
             await interaction.reply({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('✅ Warning Removed')
@@ -391,11 +436,55 @@ client.on('interactionCreate', async interaction => {
                     embed.addFields({ name: fieldName, value: '⏳ **Time Left:** Expired (will be removed shortly)' });
                 } else {
                     const s = Math.floor(timeLeft / 1000);
-                    const timeDisplay = formatDuration(Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60), s % 60);
-                    embed.addFields({ name: fieldName, value: `⏳ **Time Left:** ${timeDisplay}\n📅 **Expires:** <t:${Math.floor(warning.expiresAt / 1000)}:F>` });
+                    embed.addFields({ name: fieldName, value: `⏳ **Time Left:** ${formatDuration(Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60), s % 60)}\n📅 **Expires:** <t:${Math.floor(warning.expiresAt / 1000)}:F>` });
                 }
             }
         }
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    else if (commandName === 'warnlist') {
+        const guildWarnings = Object.values(activeWarnings).filter(w => w.guildId === guildId);
+        if (!guildWarnings.length) return interaction.reply({ content: '✅ No active warnings in this server.', flags: [MessageFlags.Ephemeral] });
+
+        const embed = new EmbedBuilder().setColor('#FFA500').setTitle(`⚠️ Active Warnings (${guildWarnings.length})`).setTimestamp();
+
+        // Group by user
+        const byUser = {};
+        for (const w of guildWarnings) {
+            byUser[w.userId] ??= [];
+            byUser[w.userId].push(w);
+        }
+        for (const [userId, warnings] of Object.entries(byUser)) {
+            const lines = warnings.map(w => `• Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n');
+            embed.addFields({ name: `<@${userId}>`, value: lines });
+            if (embed.data.fields.length >= 25) break;
+        }
+        if (Object.keys(byUser).length > 25) embed.setFooter({ text: `Showing first 25 users of ${Object.keys(byUser).length} total` });
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    else if (commandName === 'history') {
+        const user = interaction.options.getUser('user');
+        const entries = (warnHistory[guildId] || []).filter(e => e.userId === user.id);
+
+        if (!entries.length) return interaction.reply({ content: `📋 No warning history found for ${user}.`, flags: [MessageFlags.Ephemeral] });
+
+        const embed = new EmbedBuilder().setColor('#5865F2')
+            .setTitle(`📋 Warning History — ${user.tag}`)
+            .setDescription(`${entries.length} total warning${entries.length > 1 ? 's' : ''} on record.`)
+            .setTimestamp();
+
+        for (const e of entries.slice(-10)) {
+            const status = e.endReason === 'expired' ? '✅ Expired' : e.endReason === 'manual' ? '🔓 Removed' : '⏳ Active';
+            embed.addFields({
+                name: `Level ${e.level} — ${e.roleName} — <t:${Math.floor(e.issuedAt / 1000)}:d>`,
+                value: `${status} • by ${e.issuedBy}\n${e.reason}`
+            });
+        }
+        if (entries.length > 10) embed.setFooter({ text: `Showing last 10 of ${entries.length} entries` });
+
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 });
