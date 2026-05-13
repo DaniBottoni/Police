@@ -1,1 +1,20 @@
-{}
+{
+  "1486307648218468392": [
+    {
+      "guildId": "1486307648218468392",
+      "userId": "1486306133424738404",
+      "userTag": "Police#2849",
+      "roleId": "1486801949310582904",
+      "roleName": "Warning 1",
+      "level": 1,
+      "reason": "No reason provided",
+      "issuedBy": "sleepyturtler",
+      "issuedAt": 1778662495518,
+      "expiresAt": 1778662555518,
+      "channelId": "1486307649111851010",
+      "isForever": false,
+      "endedAt": 1778662556075,
+      "endReason": "expired"
+    }
+  ]
+}
