@@ -56,7 +56,8 @@
     "accessRoleId": "1490604828479459378",
     "escalation": {
       "thresholds": {
-        "1": 2
+        "1": 2,
+        "2": 2
       },
       "cap": 3
     }
