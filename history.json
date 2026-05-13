@@ -15,6 +15,21 @@
       "isForever": false,
       "endedAt": 1778662556075,
       "endReason": "expired"
+    },
+    {
+      "guildId": "1486307648218468392",
+      "userId": "1486306133424738404",
+      "userTag": "Police#2849",
+      "roleId": "1488177796122677389",
+      "roleName": "Warning Forever",
+      "level": 3,
+      "reason": "No reason provided",
+      "issuedBy": "sleepyturtler",
+      "issuedAt": 1778662722985,
+      "expiresAt": null,
+      "isForever": true,
+      "endedAt": null,
+      "endReason": null
     }
   ]
 }
