@@ -124,6 +124,22 @@
       "isForever": false,
       "endedAt": 1778663295835,
       "endReason": "expired"
+    },
+    {
+      "guildId": "1486307648218468392",
+      "userId": "1323351253862060196",
+      "userTag": "summergirly_2009",
+      "roleId": "1486801991798886500",
+      "roleName": "Warning 2",
+      "level": 2,
+      "reason": "Auto-escalated from Level 1",
+      "issuedBy": "sleepyturtler",
+      "issuedAt": 1778663236458,
+      "expiresAt": 1778666836458,
+      "channelId": "1486307649111851010",
+      "isForever": false,
+      "endedAt": 1778666837032,
+      "endReason": "expired"
     }
   ]
 }
