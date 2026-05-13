@@ -108,6 +108,22 @@
       "isForever": true,
       "endedAt": null,
       "endReason": null
+    },
+    {
+      "guildId": "1486307648218468392",
+      "userId": "1323351253862060196",
+      "userTag": "summergirly_2009",
+      "roleId": "1486801949310582904",
+      "roleName": "Warning 1",
+      "level": 1,
+      "reason": "No reason provided",
+      "issuedBy": "sleepyturtler",
+      "issuedAt": 1778663235834,
+      "expiresAt": 1778663295834,
+      "channelId": "1486307649111851010",
+      "isForever": false,
+      "endedAt": 1778663295835,
+      "endReason": "expired"
     }
   ]
 }
