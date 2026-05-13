@@ -44,6 +44,13 @@
         "durationMs": null,
         "isForever": true,
         "durationDisplay": "Forever"
+      },
+      "5": {
+        "roleId": "1490604828479459378",
+        "roleName": "new role",
+        "durationMs": 120000,
+        "isForever": false,
+        "durationDisplay": "2m"
       }
     },
     "accessRoleId": "1490604828479459378"
