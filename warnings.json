@@ -26,5 +26,33 @@
     "expiresAt": 1778663295834,
     "channelId": "1486307649111851010",
     "isForever": false
+  },
+  "1486307648218468392-1323351253862060196-2-1778663236458": {
+    "guildId": "1486307648218468392",
+    "userId": "1323351253862060196",
+    "userTag": "summergirly_2009",
+    "roleId": "1486801991798886500",
+    "roleName": "Warning 2",
+    "level": 2,
+    "reason": "Auto-escalated from Level 1",
+    "issuedBy": "sleepyturtler",
+    "issuedAt": 1778663236458,
+    "expiresAt": 1778666836458,
+    "channelId": "1486307649111851010",
+    "isForever": false
+  },
+  "1486307648218468392-1323351253862060196-2-1778663270926": {
+    "guildId": "1486307648218468392",
+    "userId": "1323351253862060196",
+    "userTag": "summergirly_2009",
+    "roleId": "1486801991798886500",
+    "roleName": "Warning 2",
+    "level": 2,
+    "reason": "No reason provided",
+    "issuedBy": "sleepyturtler",
+    "issuedAt": 1778663270926,
+    "expiresAt": 1778666870926,
+    "channelId": "1486307649111851010",
+    "isForever": false
   }
 }
