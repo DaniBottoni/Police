@@ -56,7 +56,7 @@ function addHistory(guildId, entry) {
 
 async function saveFileToGitHub(filePath, fileName, commitMessage) {
     const { GITHUB_TOKEN: token, GITHUB_OWNER: owner, GITHUB_REPO: repo } = process.env;
-    if (!token || !owner || !repo) return false;
+    if (!token || !owner || !repo) { console.warn(`⚠️ GitHub save skipped for ${fileName}: missing env vars (token=${!!token}, owner=${!!owner}, repo=${!!repo})`); return false; }
     try {
         const base64Content = Buffer.from(fs.readFileSync(filePath, 'utf8')).toString('base64');
         const getRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${fileName}`, {
@@ -341,7 +341,7 @@ client.on('interactionCreate', async interaction => {
         const accessRole = guildConfigs[guildId]?.accessRoleId;
         return interaction.reply({
             content: `❌ You don't have permission to use this command.\n\n**Required:** Administrator permission OR ${accessRole ? `<@&${accessRole}>` : 'not configured'}\n\nAsk a server administrator to run \`/accessconfig\` to set up command access.`,
-            ephemeral: true
+            flags: [MessageFlags.Ephemeral]
         });
     }
 
@@ -377,7 +377,7 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Role', value: `${role}`, inline: true },
                     { name: 'Duration', value: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds, duration.isForever), inline: true }
                 ).setTimestamp()],
-            ephemeral: true
+            flags: [MessageFlags.Ephemeral]
         });
     }
 
@@ -445,7 +445,7 @@ client.on('interactionCreate', async interaction => {
         for (const [level, data] of Object.entries(config.levels)) {
             embed.addFields({ name: `Level ${level}`, value: `Role: <@&${data.roleId}>\nDuration: ${data.durationDisplay}`, inline: true });
         }
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     }
 
     else if (commandName === 'unwarn') {
@@ -517,7 +517,7 @@ client.on('interactionCreate', async interaction => {
                 }
             }
         }
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     }
 
     else if (commandName === 'warnlist') {
@@ -534,7 +534,7 @@ client.on('interactionCreate', async interaction => {
         }
         if (Object.keys(byUser).length > 25) embed.setFooter({ text: `Showing first 25 users of ${Object.keys(byUser).length} total` });
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     }
 
     else if (commandName === 'history') {
@@ -556,7 +556,7 @@ client.on('interactionCreate', async interaction => {
         }
         if (entries.length > 10) embed.setFooter({ text: `Showing last 10 of ${entries.length} entries` });
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     }
 
     else if (commandName === 'escalation') {
@@ -610,10 +610,13 @@ client.on('interactionCreate', async interaction => {
                 embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}** (escalation stops here)` : 'None (uncapped)' });
             }
 
-            await interaction.reply({ embeds: [embed], ephemeral: true });
+            await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
         }
     }
 });
+
+process.on('unhandledRejection', error => console.error('⚠️ Unhandled rejection (bot kept alive):', error));
+client.on('error', error => console.error('⚠️ Discord client error:', error));
 
 client.login(process.env.DISCORD_TOKEN);
 
