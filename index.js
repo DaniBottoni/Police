@@ -9,7 +9,6 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 const configPath   = path.join(__dirname, 'config.json');
 const warningsPath = path.join(__dirname, 'warnings.json');
 const historyPath  = path.join(__dirname, 'history.json');
-const countsPath   = path.join(__dirname, 'counts.json');
 
 function loadJSON(filePath, label, fallback) {
     if (!fs.existsSync(filePath)) return fallback;
@@ -26,15 +25,10 @@ function loadJSON(filePath, label, fallback) {
 let guildConfigs   = loadJSON(configPath,   'config.json',   {});
 let activeWarnings = loadJSON(warningsPath, 'warnings.json', {});
 let warnHistory    = loadJSON(historyPath,  'history.json',  {});
-let warnCounts     = loadJSON(countsPath,   'counts.json',   {});
 
 function saveConfigs() {
     fs.writeFileSync(configPath, JSON.stringify(guildConfigs, null, 2));
     saveFileToGitHub(configPath, 'config.json', 'Auto-save: Update config.json').catch(e => console.error('Config GitHub save failed:', e.message));
-}
-function saveCounts() {
-    fs.writeFileSync(countsPath, JSON.stringify(warnCounts, null, 2));
-    saveFileToGitHub(countsPath, 'counts.json', 'Auto-save: Update counts.json').catch(e => console.error('Counts GitHub save failed:', e.message));
 }
 
 function saveWarnings() {
@@ -185,34 +179,27 @@ async function applyWarning(guild, member, user, guildId, level, reason, channel
 }
 
 // Check escalation after a manual warn — auto-applies next level if threshold is hit
-// Returns an object describing what happened (for followUp messages)
+// Counts only currently active warnings for this user+level
 async function checkEscalation(guild, member, user, guildId, level, channelId, issuedByTag) {
     const esc = guildConfigs[guildId].escalation ?? {};
     const threshold = esc.thresholds?.[level];
     if (!threshold) return null;
 
-    warnCounts[guildId] ??= {};
-    warnCounts[guildId][user.id] ??= {};
-    const count = (warnCounts[guildId][user.id][level] = (warnCounts[guildId][user.id][level] || 0) + 1);
-    saveCounts();
+    const count = Object.values(activeWarnings).filter(w => w.guildId === guildId && w.userId === user.id && w.level === level).length;
 
     if (count < threshold) return { counted: true, count, threshold };
-
-    // Threshold hit — reset and try to escalate
-    warnCounts[guildId][user.id][level] = 0;
-    saveCounts();
 
     const nextLevel = level + 1;
     const cap = esc.cap;
 
-    if (cap && nextLevel > cap) return { atCap: true, cap };
+    if (cap != null && nextLevel > cap) return { atCap: true, cap };
 
     if (!guildConfigs[guildId].levels[nextLevel]) return { noNextLevel: true, nextLevel };
 
     const result = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
     if (result.error) return { escalationError: result.error };
 
-    const hitCap = cap && nextLevel === cap;
+    const hitCap = cap != null && nextLevel === cap;
     return { escalated: true, nextLevel, role: result.role, config: result.config, hitCap };
 }
 
