@@ -53,7 +53,11 @@
         "durationDisplay": "2m"
       }
     },
-    "accessRoleId": "1490604828479459378"
+    "accessRoleId": "1490604828479459378",
+    "escalation": {
+      "thresholds": {},
+      "cap": 3
+    }
   },
   "1490648060727001168": {
     "levels": {
