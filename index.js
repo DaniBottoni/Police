@@ -601,9 +601,19 @@ client.on('interactionCreate', async interaction => {
             if (!config || Object.keys(config.levels).length === 0) return interaction.reply({ content: '📋 No warning levels configured yet. Use /config set to add some.', flags: [MessageFlags.Ephemeral] });
             const embed = new EmbedBuilder().setColor('#0099ff').setTitle('🚨 Warning Configuration').setTimestamp();
             for (const [level, data] of Object.entries(config.levels))
-                embed.addFields({ name: `Level ${level}`, value: `Role: <@&${data.roleId}>
-Duration: ${data.durationDisplay}`, inline: true });
+                embed.addFields({ name: `Level ${level}`, value: `Role: <@&${data.roleId}>\nDuration: ${data.durationDisplay}`, inline: true });
             await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'logchannel') {
+            const channel = interaction.options.getChannel('channel');
+            if (!channel.isTextBased()) return interaction.reply({ content: '❌ Please select a text channel.', flags: [MessageFlags.Ephemeral] });
+            guildConfigs[guildId].logChannelId = channel.id;
+            saveConfigs();
+            await interaction.reply({ content: `✅ Mod-log channel set to ${channel}.`, flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'removelogchannel') {
+            if (!guildConfigs[guildId].logChannelId) return interaction.reply({ content: '❌ No log channel is currently set.', flags: [MessageFlags.Ephemeral] });
+            delete guildConfigs[guildId].logChannelId;
+            saveConfigs();
+            await interaction.reply({ content: '✅ Mod-log channel removed.', flags: [MessageFlags.Ephemeral] });
         }
     }
 
