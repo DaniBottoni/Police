@@ -12,5 +12,19 @@
     "expiresAt": 1779873286951,
     "channelId": "1465638829443645440",
     "isForever": false
+  },
+  "1486307648218468392-1486306133424738404-1-1779167412228": {
+    "guildId": "1486307648218468392",
+    "userId": "1486306133424738404",
+    "userTag": "Police#2849",
+    "roleId": "1486801949310582904",
+    "roleName": "Warning 1",
+    "level": 1,
+    "reason": "No reason provided",
+    "issuedBy": "sleepyturtler",
+    "issuedAt": 1779167412228,
+    "expiresAt": 1779167472228,
+    "channelId": "1486307649111851010",
+    "isForever": false
   }
 }
