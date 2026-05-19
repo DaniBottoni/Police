@@ -278,6 +278,22 @@
       "isForever": false,
       "endedAt": 1779171023885,
       "endReason": "expired"
+    },
+    {
+      "guildId": "1486307648218468392",
+      "userId": "1486306133424738404",
+      "userTag": "Police#2849",
+      "roleId": "1486801991798886500",
+      "roleName": "Warning 2",
+      "level": 2,
+      "reason": "Auto-escalated from Level 1",
+      "issuedBy": "sleepyturtler",
+      "issuedAt": 1779167423461,
+      "expiresAt": 1779171023461,
+      "channelId": "1486307649111851010",
+      "isForever": false,
+      "endedAt": 1779189834880,
+      "endReason": "expired"
     }
   ]
 }
