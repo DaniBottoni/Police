@@ -57,7 +57,8 @@
     "escalation": {
       "thresholds": {
         "1": 2,
-        "2": 2
+        "2": 2,
+        "4": 3
       },
       "cap": 4,
       "timeouts": {
