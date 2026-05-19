@@ -9,9 +9,9 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 - **/mywarnings:** Shows you how much time is left on your warnings.
 
 ## Config:
-- **/config:** Config the warning levels by matching them to roles and setting how long they take to expire.
-- **/accessconfig:** Config what role is needed to access mod commands like /warn and /config.
-- **/viewconfig:** Shows your current warning configuration.
+- **/config set:** Config the warning levels by matching them to roles and setting how long they take to expire.
+- **/config access:** Config what role is needed to access mod commands like /warn and /config.
+- **/config view:** Shows your current warning configuration.
 
 ## Escalation:
 - **/escalation set:** Configure how many level X warnings you need to automatically bump up to a level Y.
@@ -19,6 +19,8 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 - **/escalation setcap:** Sets the cap of the warnings, where any additional warning won't escalate.
 - **/escalation removecap:** Removes the escalation cap.
 - **/escalation view:** Shows the current escalation setup.
+- **/escalation settimeout:** Adds a special threshold where the user gets a configurable timeout.
+- **/escalation removetimeout:** Removes one of the special steps.
 
 ## Moderation:
 - **/history:** Shows the warning history of a specific user.
