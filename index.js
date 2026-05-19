@@ -289,7 +289,7 @@ client.once('ready', () => {
             .addSubcommand(s => s.setName('removetimeout').setDescription('Remove timeout from an escalation level')
                 .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View current escalation configuration')),
-        new SlashCommandBuilder().setName('help').setDescription('View all available commands'),
+        new SlashCommandBuilder().setName('help').setDescription('View all commands and features of the bot'),
     ].map(c => c.toJSON());
 
     client.application.commands.set(commands);
@@ -380,7 +380,7 @@ client.on('interactionCreate', async interaction => {
                         { name: '/escalation view', value: 'View all active escalation rules, thresholds, timeouts, and the level cap.' }
                     ).setFooter({ text: 'Use the buttons to explore other categories' }),
                 help_storage: new EmbedBuilder().setColor('#5865F2').setTitle('GitHub Storage')
-                    .setDescription('Police Bot uses your GitHub repository as persistent storage, so no data is lost when the bot restarts on Render\'s free tier.')
+                    .setDescription('Police Bot uses your GitHub repository as persistent storage, so no data is lost when the bot restarts.')
                     .addFields(
                         { name: 'warnings.json', value: 'All active warnings with expiry timestamps, user IDs, role IDs, and channel IDs for timer restoration.' },
                         { name: 'history.json', value: 'Full warning history per server — every warn ever issued, including expired and manually removed ones.' },
