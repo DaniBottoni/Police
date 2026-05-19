@@ -431,7 +431,7 @@ client.on('interactionCreate', async interaction => {
             embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('📖 Police Bot — Commands')
                 .addFields(
                     { name: '⚠️ Warn', value: '`/warn` — warn a user at a configured level\n`/unwarn` — remove a warning (with confirmation)\n`/timeout` — apply a Discord timeout\n`/mywarnings` — check your own active warnings\n`/warnlist` — see all active warnings\n`/history` — view a user\'s full warning history' },
-                    { name: '⚙️ Config', value: '`/config` — set up a warning level (role + duration)\n`/config view` — view all configured levels\n`/config access` — set the moderator role' },
+                    { name: '⚙️ Config', value: '`/config set` — set up a warning level (role + duration)\n`/config view` — view all configured levels\n`/config access` — set the moderator role' },
                     { name: '⬆️ Escalation', value: '`/escalation set` — set a threshold to auto-escalate\n`/escalation remove` — remove a threshold\n`/escalation setcap` / `removecap` — set/remove the level cap\n`/escalation settimeout` — timeout on escalation to a level\n`/escalation removetimeout` — remove that timeout\n`/escalation view` — view all rules' },
                     { name: '❓ Other', value: '`/help` — this menu' }
                 ).setFooter({ text: 'Mod commands require the configured access role or Administrator' })],
