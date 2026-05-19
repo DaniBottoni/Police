@@ -263,10 +263,11 @@ client.once('ready', () => {
             .addStringOption(o => o.setName('duration').setDescription('Duration (m:s / h:m:s / d:h:m:s, max 28 days)').setRequired(true))
             .addStringOption(o => o.setName('reason').setDescription('Reason for the timeout')),
         new SlashCommandBuilder().setName('config').setDescription('Configure warning levels')
-            .addIntegerOption(o => o.setName('level').setDescription('Warning level (1, 2, 3...)').setRequired(true))
-            .addRoleOption(o => o.setName('role').setDescription('Role to assign').setRequired(true))
-            .addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)),
-        new SlashCommandBuilder().setName('config_view').setDescription('View all configured warning levels'),
+            .addSubcommand(s => s.setName('set').setDescription('Set up a warning level')
+                .addIntegerOption(o => o.setName('level').setDescription('Warning level (1, 2, 3...)').setRequired(true))
+                .addRoleOption(o => o.setName('role').setDescription('Role to assign').setRequired(true))
+                .addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)))
+            .addSubcommand(s => s.setName('view').setDescription('View all configured warning levels')),
         new SlashCommandBuilder().setName('accessconfig').setDescription('Configure which role can access moderation commands'),
         new SlashCommandBuilder().setName('mywarnings').setDescription('Check how much time is left on your warnings'),
         new SlashCommandBuilder().setName('warnlist').setDescription('View all active warnings in this server'),
@@ -416,7 +417,7 @@ client.on('interactionCreate', async interaction => {
 
     guildConfigs[guildId] ??= { levels: {} };
 
-    const restrictedCommands = ['config', 'config_view', 'warn', 'unwarn', 'timeout', 'accessconfig', 'warnlist', 'history', 'escalation'];
+    const restrictedCommands = ['config', 'warn', 'unwarn', 'timeout', 'accessconfig', 'warnlist', 'history', 'escalation'];
     if (restrictedCommands.includes(commandName) && !hasCommandPermission(interaction, guildId)) {
         const accessRole = guildConfigs[guildId]?.accessRoleId;
         return interaction.reply({
@@ -443,37 +444,39 @@ client.on('interactionCreate', async interaction => {
     }
 
     else if (commandName === 'config') {
-        const level = interaction.options.getInteger('level');
-        const role = interaction.options.getRole('role');
-        const durationStr = interaction.options.getString('duration');
-        if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
-        const duration = parseDuration(durationStr);
-        if (!duration) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, `d:h:m:s`, or `forever`. Max 365 days.', flags: [MessageFlags.Ephemeral] });
-        guildConfigs[guildId].levels[level] = {
-            roleId: role.id, roleName: role.name,
-            durationMs: duration.totalMs, isForever: duration.isForever,
-            durationDisplay: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds, duration.isForever)
-        };
-        saveConfigs();
-        console.log(`🔒 [AUDIT] ${interaction.user.tag} configured Level ${level} → ${role.name} in ${interaction.guild.name}`);
-        await interaction.reply({
-            embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('🚨 Warning Level Configured')
-                .addFields(
-                    { name: 'Level', value: `${level}`, inline: true },
-                    { name: 'Role', value: `${role}`, inline: true },
-                    { name: 'Duration', value: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds, duration.isForever), inline: true }
-                ).setTimestamp()],
-            flags: [MessageFlags.Ephemeral]
-        });
-    }
-
-    else if (commandName === 'config_view') {
-        const config = guildConfigs[guildId];
-        if (!config || Object.keys(config.levels).length === 0) return interaction.reply({ content: '📋 No warning levels configured yet. Use /config to add some.', flags: [MessageFlags.Ephemeral] });
-        const embed = new EmbedBuilder().setColor('#0099ff').setTitle('🚨 Warning Configuration').setTimestamp();
-        for (const [level, data] of Object.entries(config.levels))
-            embed.addFields({ name: `Level ${level}`, value: `Role: <@&${data.roleId}>\nDuration: ${data.durationDisplay}`, inline: true });
-        await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'set') {
+            const level = interaction.options.getInteger('level');
+            const role = interaction.options.getRole('role');
+            const durationStr = interaction.options.getString('duration');
+            if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
+            const duration = parseDuration(durationStr);
+            if (!duration) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, `d:h:m:s`, or `forever`. Max 365 days.', flags: [MessageFlags.Ephemeral] });
+            guildConfigs[guildId].levels[level] = {
+                roleId: role.id, roleName: role.name,
+                durationMs: duration.totalMs, isForever: duration.isForever,
+                durationDisplay: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds, duration.isForever)
+            };
+            saveConfigs();
+            console.log(`🔒 [AUDIT] ${interaction.user.tag} configured Level ${level} → ${role.name} in ${interaction.guild.name}`);
+            await interaction.reply({
+                embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('🚨 Warning Level Configured')
+                    .addFields(
+                        { name: 'Level', value: `${level}`, inline: true },
+                        { name: 'Role', value: `${role}`, inline: true },
+                        { name: 'Duration', value: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds, duration.isForever), inline: true }
+                    ).setTimestamp()],
+                flags: [MessageFlags.Ephemeral]
+            });
+        } else if (sub === 'view') {
+            const config = guildConfigs[guildId];
+            if (!config || Object.keys(config.levels).length === 0) return interaction.reply({ content: '📋 No warning levels configured yet. Use /config set to add some.', flags: [MessageFlags.Ephemeral] });
+            const embed = new EmbedBuilder().setColor('#0099ff').setTitle('🚨 Warning Configuration').setTimestamp();
+            for (const [level, data] of Object.entries(config.levels))
+                embed.addFields({ name: `Level ${level}`, value: `Role: <@&${data.roleId}>
+Duration: ${data.durationDisplay}`, inline: true });
+            await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+        }
     }
 
     else if (commandName === 'warn') {
