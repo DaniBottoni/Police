@@ -353,6 +353,81 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isButton()) {
         const { customId } = interaction;
 
+        if (customId.startsWith('help_')) {
+            const pages = {
+                help_warn: new EmbedBuilder().setColor('#ff0000').setTitle('Warning Commands')
+                    .addFields(
+                        { name: '/warn', value: 'Issue a warning to a user at a configured level. Requires a reason. Triggers escalation checks automatically.' },
+                        { name: '/unwarn', value: 'Remove a warning role from a user. Shows a confirm/cancel prompt before executing.' },
+                        { name: '/timeout', value: 'Apply a Discord native timeout to a user. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` format (max 28 days).' },
+                        { name: '/mywarnings', value: 'Check your own active warnings and how long is left on each one.' },
+                        { name: '/warnlist', value: 'View all active warnings in the server, paginated 10 users per page.' },
+                        { name: '/history', value: 'View the last 10 warning history entries for a specific user, including expired and manually removed warnings.' }
+                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
+                help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands')
+                    .addFields(
+                        { name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' },
+                        { name: '/config view', value: 'View all configured warning levels and their roles and durations.' },
+                        { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access regardless.' }
+                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
+                help_escalation: new EmbedBuilder().setColor('#ff9900').setTitle('Escalation Commands')
+                    .addFields(
+                        { name: '/escalation set', value: 'Set a threshold: once a user reaches N warnings at level X, they are auto-escalated to level X+1.' },
+                        { name: '/escalation remove', value: 'Remove a threshold for a specific warning level.' },
+                        { name: '/escalation setcap / removecap', value: 'Set or remove a maximum warning level. Escalation will not go beyond the cap.' },
+                        { name: '/escalation settimeout', value: 'Configure a self-contained timeout escalation: N warnings at level X → auto level X+1 + a timeout. Fully independent from `/escalation set`.' },
+                        { name: '/escalation removetimeout', value: 'Remove a timeout escalation rule for a level.' },
+                        { name: '/escalation view', value: 'View all active escalation rules, thresholds, timeouts, and the level cap.' }
+                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
+                help_storage: new EmbedBuilder().setColor('#5865F2').setTitle('GitHub Storage')
+                    .setDescription('Police Bot uses your GitHub repository as persistent storage, so no data is lost when the bot restarts on Render\'s free tier.')
+                    .addFields(
+                        { name: 'warnings.json', value: 'All active warnings with expiry timestamps, user IDs, role IDs, and channel IDs for timer restoration.' },
+                        { name: 'history.json', value: 'Full warning history per server — every warn ever issued, including expired and manually removed ones.' },
+                        { name: 'config.json', value: 'All per-server configuration: warning levels, roles, durations, escalation rules, timeout configs, and the access role.' },
+                        { name: 'Auto-save', value: 'Every write operation saves locally and pushes to GitHub in the background. Set `GITHUB_TOKEN`, `GITHUB_OWNER`, and `GITHUB_REPO` in your environment variables.' }
+                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
+                help_features: new EmbedBuilder().setColor('#9b59b6').setTitle('Other Features')
+                    .addFields(
+                        { name: 'Warning expiry DMs', value: 'Users are DM\'d when a warning is issued and again when it expires and the role is removed.' },
+                        { name: 'Rejoin protection', value: 'If a warned user leaves and rejoins the server, their warning roles are automatically reapplied and they are DM\'d.' },
+                        { name: 'Timer restoration', value: 'On bot restart, all active warning timers are restored from saved data so no warning expires silently.' },
+                        { name: 'Keep-alive', value: 'The bot pings itself every 14 minutes to prevent Render\'s free tier from putting it to sleep.' },
+                        { name: 'Audit logging', value: 'Sensitive commands (warn, unwarn, timeout, config) are logged to console with the moderator\'s tag.' },
+                        { name: '/help', value: 'This interactive help menu.' }
+                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
+            };
+            const embed = pages[customId];
+            if (!embed) return;
+            const helpButtons = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('help_warn').setLabel('Warnings').setStyle(customId === 'help_warn' ? ButtonStyle.Success : ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('help_config').setLabel('Config').setStyle(customId === 'help_config' ? ButtonStyle.Success : ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('help_escalation').setLabel('Escalation').setStyle(customId === 'help_escalation' ? ButtonStyle.Success : ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(customId === 'help_storage' ? ButtonStyle.Success : ButtonStyle.Secondary)
+            );
+            const helpButtons2 = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('help_features').setLabel('Features').setStyle(customId === 'help_features' ? ButtonStyle.Success : ButtonStyle.Secondary),
+                new ButtonBuilder().setCustomId('help_back').setLabel('Back').setStyle(ButtonStyle.Secondary)
+            );
+            return interaction.update({ embeds: [embed], components: [helpButtons, helpButtons2] });
+        }
+
+        if (customId === 'help_back') {
+            const helpOverview = new EmbedBuilder().setColor('#5865F2').setTitle('Police Bot')
+                .setDescription("I\'m just your friendly neighbourhood policemen, but I do have some tricks up my sleeve. Press the buttons below to learn about my commands.")
+                .setFooter({ text: 'Mod commands require the configured access role or Administrator' });
+            const helpButtons = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('help_warn').setLabel('Warnings').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('help_config').setLabel('Config').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('help_escalation').setLabel('Escalation').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(ButtonStyle.Secondary)
+            );
+            const helpButtons2 = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('help_features').setLabel('Features').setStyle(ButtonStyle.Secondary)
+            );
+            return interaction.update({ embeds: [helpOverview], components: [helpButtons, helpButtons2] });
+        }
+
         if (customId.startsWith('wl_')) {
             if (!hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
             const parts = customId.split('_');
@@ -427,16 +502,19 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (commandName === 'help') {
-        await interaction.reply({
-            embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('📖 Police Bot — Commands')
-                .addFields(
-                    { name: '⚠️ Warn', value: '`/warn` — warn a user at a configured level\n`/unwarn` — remove a warning (with confirmation)\n`/timeout` — apply a Discord timeout\n`/mywarnings` — check your own active warnings\n`/warnlist` — see all active warnings\n`/history` — view a user\'s full warning history' },
-                    { name: '⚙️ Config', value: '`/config set` — set up a warning level (role + duration)\n`/config view` — view all configured levels\n`/config access` — set the moderator role' },
-                    { name: '⬆️ Escalation', value: '`/escalation set` — set a threshold to auto-escalate\n`/escalation remove` — remove a threshold\n`/escalation setcap` / `removecap` — set/remove the level cap\n`/escalation settimeout` — timeout on escalation to a level\n`/escalation removetimeout` — remove that timeout\n`/escalation view` — view all rules' },
-                    { name: '❓ Other', value: '`/help` — this menu' }
-                ).setFooter({ text: 'Mod commands require the configured access role or Administrator' })],
-            flags: [MessageFlags.Ephemeral]
-        });
+        const helpOverview = new EmbedBuilder().setColor('#5865F2').setTitle('Police Bot')
+            .setDescription("I\'m just your friendly neighbourhood policemen, but I do have some tricks up my sleeve. Press the buttons below to learn about my commands.")
+            .setFooter({ text: 'Mod commands require the configured access role or Administrator' });
+        const helpButtons = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('help_warn').setLabel('Warnings').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('help_config').setLabel('Config').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('help_escalation').setLabel('Escalation').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(ButtonStyle.Secondary)
+        );
+        const helpButtons2 = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('help_features').setLabel('Features').setStyle(ButtonStyle.Secondary)
+        );
+        await interaction.reply({ embeds: [helpOverview], components: [helpButtons, helpButtons2], flags: [MessageFlags.Ephemeral] });
     }
 
     else if (commandName === 'config') {
