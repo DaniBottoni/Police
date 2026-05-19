@@ -60,7 +60,13 @@
         "2": 2
       },
       "cap": 4,
-      "timeouts": {}
+      "timeouts": {
+        "4": {
+          "durationMs": 3600000,
+          "durationDisplay": "1h",
+          "threshold": 2
+        }
+      }
     }
   },
   "1490648060727001168": {
