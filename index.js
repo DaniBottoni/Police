@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, ActivityType, MessageFlags } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -30,17 +30,14 @@ function saveConfigs() {
     fs.writeFileSync(configPath, JSON.stringify(guildConfigs, null, 2));
     saveFileToGitHub(configPath, 'config.json', 'Auto-save: Update config.json').catch(e => console.error('Config GitHub save failed:', e.message));
 }
-
 function saveWarnings() {
     fs.writeFileSync(warningsPath, JSON.stringify(activeWarnings, null, 2));
     saveFileToGitHub(warningsPath, 'warnings.json', 'Auto-save: Update warnings.json').catch(e => console.error('Warning GitHub save failed:', e.message));
 }
-
 function saveHistory() {
     fs.writeFileSync(historyPath, JSON.stringify(warnHistory, null, 2));
     saveFileToGitHub(historyPath, 'history.json', 'Auto-save: Update history.json').catch(e => console.error('History GitHub save failed:', e.message));
 }
-
 function addHistory(guildId, entry) {
     warnHistory[guildId] ??= [];
     warnHistory[guildId].push(entry);
@@ -50,7 +47,7 @@ function addHistory(guildId, entry) {
 
 async function saveFileToGitHub(filePath, fileName, commitMessage) {
     const { GITHUB_TOKEN: token, GITHUB_OWNER: owner, GITHUB_REPO: repo } = process.env;
-    if (!token || !owner || !repo) { console.warn(`⚠️ GitHub save skipped for ${fileName}: missing env vars (token=${!!token}, owner=${!!owner}, repo=${!!repo})`); return false; }
+    if (!token || !owner || !repo) { console.warn(`⚠️ GitHub save skipped for ${fileName}`); return false; }
     try {
         const base64Content = Buffer.from(fs.readFileSync(filePath, 'utf8')).toString('base64');
         const getRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${fileName}`, {
@@ -65,16 +62,12 @@ async function saveFileToGitHub(filePath, fileName, commitMessage) {
         if (updateRes.ok) { console.log(`💾 ${fileName} saved to GitHub`); return true; }
         console.error(`❌ GitHub save failed:`, (await updateRes.json()).message);
         return false;
-    } catch (e) {
-        console.error(`❌ GitHub save error:`, e.message);
-        return false;
-    }
+    } catch (e) { console.error(`❌ GitHub save error:`, e.message); return false; }
 }
 
 async function showAccessControlConfig(interaction, guildId) {
-    const embed = new EmbedBuilder()
-        .setColor('#5865F2').setTitle('🔒 Access Configuration')
-        .setDescription('Select which role should have access to moderation commands:\n\n**Commands affected:**\n• `/warn` `/unwarn` `/config` `/viewconfig`\n• `/accessconfig` `/warnlist` `/history` `/escalation`\n\n**Note:** Server administrators always have access.')
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle('🔒 Access Configuration')
+        .setDescription('Select which role should have access to moderation commands:\n\n**Commands affected:**\n• `/warn` `/unwarn` `/timeout` `/config` `/viewconfig`\n• `/accessconfig` `/warnlist` `/history` `/escalation`\n\n**Note:** Server administrators always have access.')
         .setFooter({ text: 'Select a role from the dropdown below' });
     const row = new ActionRowBuilder().addComponents(
         new RoleSelectMenuBuilder().setCustomId(`access_role_${guildId}`).setPlaceholder('Select a role for command access').setMinValues(1).setMaxValues(1)
@@ -89,13 +82,9 @@ function hasCommandPermission(interaction, guildId) {
     return accessRoleId ? member.roles.cache.has(accessRoleId) : false;
 }
 
-// Supports: m:s | h:m:s | d:h:m:s | "forever"
 function parseDuration(durationStr) {
     if (durationStr.toLowerCase() === 'forever') return { days: 0, hours: 0, minutes: 0, seconds: 0, totalMs: null, isForever: true };
-    const parts = durationStr.split(':').map(p => {
-        const n = parseInt(p.trim());
-        return (n < 0 || n > 9999) ? NaN : n;
-    });
+    const parts = durationStr.split(':').map(p => { const n = parseInt(p.trim()); return (n < 0 || n > 9999) ? NaN : n; });
     if (parts.some(isNaN) || parts.length < 2 || parts.length > 4) return null;
     let days = 0, hours = 0, minutes = 0, seconds = 0;
     if (parts.length === 2) [minutes, seconds] = parts;
@@ -111,6 +100,8 @@ function formatDuration(days, hours, minutes, seconds, isForever = false) {
 }
 
 const warningTimers = new Map();
+const pendingUnwarns = new Map();
+const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000;
 
 async function handleWarningExpiry(warningKey, guildId, userId, roleId, channelId) {
     const w = activeWarnings[warningKey];
@@ -121,6 +112,13 @@ async function handleWarningExpiry(warningKey, guildId, userId, roleId, channelI
         const role = guild.roles.cache.get(roleId);
         if (member && role && member.roles.cache.has(roleId)) {
             await member.roles.remove(role);
+            member.user.send({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('✅ Warning Expired')
+                .setDescription(`Your warning in **${guild.name}** has expired and the role has been removed.`)
+                .addFields(
+                    { name: 'Warning Level', value: `${w?.level ?? 'Unknown'}`, inline: true },
+                    { name: 'Role Removed', value: role.name, inline: true }
+                ).setFooter({ text: 'You no longer carry this warning role' }).setTimestamp()]
+            }).catch(() => {});
             const channel = guild.channels.cache.get(channelId);
             if (channel) await channel.send({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('✅ Warning Expired').setDescription(`<@${userId}>'s warning has expired and the role has been removed.`).setTimestamp()] });
         }
@@ -128,7 +126,7 @@ async function handleWarningExpiry(warningKey, guildId, userId, roleId, channelI
         console.error(`Failed to remove role: ${error}`);
         try {
             const channel = client.guilds.cache.get(guildId)?.channels.cache.get(channelId);
-            if (channel) await channel.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('❌ Warning Removal Failed').setDescription(`Could not remove role from <@${userId}>. Check bot permissions and role hierarchy.`).addFields({ name: 'Error', value: error.message || 'Unknown error' }).setTimestamp()] });
+            if (channel) await channel.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('❌ Warning Removal Failed').setDescription(`Could not remove role from <@${userId}>. Check bot permissions.`).setTimestamp()] });
         } catch {}
     }
     if (w) addHistory(guildId, { ...w, endedAt: Date.now(), endReason: 'expired' });
@@ -143,28 +141,22 @@ async function scheduleWarningRemoval(warningKey, guildId, userId, roleId, expir
     warningTimers.set(warningKey, setTimeout(() => handleWarningExpiry(warningKey, guildId, userId, roleId, channelId), timeLeft));
 }
 
-// Core warn logic — used by /warn and auto-escalation
 async function applyWarning(guild, member, user, guildId, level, reason, channelId, issuedByTag) {
     const config = guildConfigs[guildId].levels[level];
     const role = guild.roles.cache.get(config?.roleId);
     if (!config || !role) return { error: `Level ${level} config or role not found.` };
-
     const botMember = guild.members.me;
     if (role.position >= botMember.roles.highest.position) return { error: `Role hierarchy: my role must be above ${role.name}.` };
-
     await member.roles.add(role);
-
     user.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ You Received a Warning')
         .setDescription(`You have been warned in **${guild.name}**.`)
         .addFields(
             { name: 'Warning Level', value: `${level}`, inline: true },
             { name: 'Duration', value: config.durationDisplay || 'Unknown', inline: true },
             { name: 'Reason', value: reason }
-        ).setFooter({ text: `Use /timeleft in ${guild.name} to check when this warning expires` }).setTimestamp()]
+        ).setFooter({ text: `Use /mywarnings in ${guild.name} to check when this warning expires` }).setTimestamp()]
     }).catch(() => {});
-
     const baseEntry = { guildId, userId: user.id, userTag: user.tag, roleId: role.id, roleName: role.name, level, reason, issuedBy: issuedByTag, issuedAt: Date.now() };
-
     if (!config.isForever) {
         const warningKey = `${guildId}-${user.id}-${level}-${Date.now()}`;
         const expiresAt = Date.now() + config.durationMs;
@@ -174,33 +166,32 @@ async function applyWarning(guild, member, user, guildId, level, reason, channel
     } else {
         addHistory(guildId, { ...baseEntry, expiresAt: null, isForever: true, endedAt: null, endReason: null });
     }
-
     return { success: true, role, config };
 }
 
-// Check escalation after a manual warn — auto-applies next level if threshold is hit
-// Counts only currently active warnings for this user+level
 async function checkEscalation(guild, member, user, guildId, level, channelId, issuedByTag) {
     const esc = guildConfigs[guildId].escalation ?? {};
     const threshold = esc.thresholds?.[level];
     if (!threshold) return null;
-
     const count = Object.values(activeWarnings).filter(w => w.guildId === guildId && w.userId === user.id && w.level === level).length;
-
     if (count < threshold) return { counted: true, count, threshold };
-
     const nextLevel = level + 1;
     const cap = esc.cap;
-
     if (cap != null && nextLevel > cap) return { atCap: true, cap };
-
     if (!guildConfigs[guildId].levels[nextLevel]) return { noNextLevel: true, nextLevel };
-
     const result = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
     if (result.error) return { escalationError: result.error };
-
+    const timeoutCfg = esc.timeouts?.[nextLevel];
+    if (timeoutCfg && member) {
+        await member.timeout(timeoutCfg.durationMs, `Auto-escalated to Level ${nextLevel}`).catch(e => console.error('Escalation timeout failed:', e.message));
+        user.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('🔇 You Have Been Timed Out')
+            .setDescription(`You were auto-timed-out in **${guild.name}** upon reaching Warning Level ${nextLevel}.`)
+            .addFields({ name: 'Timeout Duration', value: timeoutCfg.durationDisplay, inline: true })
+            .setTimestamp()]
+        }).catch(() => {});
+    }
     const hitCap = cap != null && nextLevel === cap;
-    return { escalated: true, nextLevel, role: result.role, config: result.config, hitCap };
+    return { escalated: true, nextLevel, role: result.role, config: result.config, hitCap, timedOut: !!timeoutCfg, timeoutDisplay: timeoutCfg?.durationDisplay };
 }
 
 function keepAlive() {
@@ -216,13 +207,36 @@ function keepAlive() {
     setInterval(ping, 14 * 60 * 1000);
 }
 
+const WARN_PAGE_SIZE = 10;
+
+function buildWarnlistEmbed(guildId, page) {
+    const allWarnings = Object.values(activeWarnings).filter(w => w.guildId === guildId);
+    const byUser = {};
+    for (const w of allWarnings) { byUser[w.userId] ??= []; byUser[w.userId].push(w); }
+    const userIds = Object.keys(byUser);
+    const totalPages = Math.max(1, Math.ceil(userIds.length / WARN_PAGE_SIZE));
+    page = Math.max(0, Math.min(page, totalPages - 1));
+    const embed = new EmbedBuilder().setColor('#FFA500').setTitle(`⚠️ Active Warnings (${allWarnings.length})`).setTimestamp()
+        .setFooter({ text: totalPages > 1 ? `Page ${page + 1} of ${totalPages}` : `${userIds.length} user(s) warned` });
+    if (!userIds.length) return { embed: embed.setDescription('No active warnings in this server.'), totalPages, page };
+    for (const uid of userIds.slice(page * WARN_PAGE_SIZE, (page + 1) * WARN_PAGE_SIZE))
+        embed.addFields({ name: `<@${uid}>`, value: byUser[uid].map(w => `• Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') });
+    return { embed, totalPages, page };
+}
+
+function warnlistRow(page, totalPages, guildId) {
+    if (totalPages <= 1) return [];
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`wl_${page - 1}_${guildId}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+        new ButtonBuilder().setCustomId(`wl_${page + 1}_${guildId}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(page === totalPages - 1)
+    )];
+}
+
 client.once('ready', () => {
     console.log(`✅ Police bot is online as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: 'Monitoring the security cameras', type: ActivityType.Watching }], status: 'online' });
-
     console.log(`🔄 Restoring ${Object.keys(activeWarnings).length} active warnings...`);
     for (const [key, w] of Object.entries(activeWarnings)) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
-
     keepAlive();
     console.log('🏓 Keep-alive system started');
 
@@ -234,26 +248,36 @@ client.once('ready', () => {
         new SlashCommandBuilder().setName('unwarn').setDescription('Manually remove a warning role from a user')
             .addUserOption(o => o.setName('user').setDescription('User to remove warning from').setRequired(true))
             .addIntegerOption(o => o.setName('level').setDescription('Warning level to remove').setRequired(true)),
+        new SlashCommandBuilder().setName('timeout').setDescription('Apply a Discord timeout to a user')
+            .addUserOption(o => o.setName('user').setDescription('User to timeout').setRequired(true))
+            .addStringOption(o => o.setName('duration').setDescription('Duration (m:s / h:m:s / d:h:m:s, max 28 days)').setRequired(true))
+            .addStringOption(o => o.setName('reason').setDescription('Reason for the timeout')),
         new SlashCommandBuilder().setName('config').setDescription('Configure warning levels')
-            .addIntegerOption(o => o.setName('level').setDescription('What level (1, 2, 3, etc.)').setRequired(true))
-            .addRoleOption(o => o.setName('role').setDescription('Which role to assign').setRequired(true))
+            .addIntegerOption(o => o.setName('level').setDescription('Warning level (1, 2, 3...)').setRequired(true))
+            .addRoleOption(o => o.setName('role').setDescription('Role to assign').setRequired(true))
             .addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)),
         new SlashCommandBuilder().setName('viewconfig').setDescription('View current warning configuration'),
         new SlashCommandBuilder().setName('accessconfig').setDescription('Configure which role can access moderation commands'),
-        new SlashCommandBuilder().setName('timeleft').setDescription('Check how much time is left on your warnings'),
+        new SlashCommandBuilder().setName('mywarnings').setDescription('Check how much time is left on your warnings'),
         new SlashCommandBuilder().setName('warnlist').setDescription('View all active warnings in this server'),
         new SlashCommandBuilder().setName('history').setDescription('View warning history for a user')
             .addUserOption(o => o.setName('user').setDescription('User to look up').setRequired(true)),
         new SlashCommandBuilder().setName('escalation').setDescription('Configure auto-escalation rules')
-            .addSubcommand(s => s.setName('set').setDescription('Set threshold: how many level-N warns trigger escalation to level N+1')
-                .addIntegerOption(o => o.setName('level').setDescription('Warning level to set threshold for').setRequired(true))
-                .addIntegerOption(o => o.setName('threshold').setDescription('Number of warnings needed to escalate').setRequired(true)))
+            .addSubcommand(s => s.setName('set').setDescription('Set threshold: how many level-N warns trigger escalation')
+                .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true))
+                .addIntegerOption(o => o.setName('threshold').setDescription('Number of warnings to trigger escalation').setRequired(true)))
             .addSubcommand(s => s.setName('remove').setDescription('Remove escalation threshold for a level')
                 .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)))
-            .addSubcommand(s => s.setName('setcap').setDescription('Set a maximum warning level (escalation stops here)')
+            .addSubcommand(s => s.setName('setcap').setDescription('Set maximum warning level for escalation')
                 .addIntegerOption(o => o.setName('level').setDescription('Cap level').setRequired(true)))
             .addSubcommand(s => s.setName('removecap').setDescription('Remove the level cap'))
-            .addSubcommand(s => s.setName('view').setDescription('View current escalation configuration'))
+            .addSubcommand(s => s.setName('settimeout').setDescription('Apply a timeout when auto-escalating TO a level')
+                .addIntegerOption(o => o.setName('level').setDescription('Escalation target level').setRequired(true))
+                .addStringOption(o => o.setName('duration').setDescription('Timeout duration (m:s / h:m:s / d:h:m:s, max 28 days)').setRequired(true)))
+            .addSubcommand(s => s.setName('removetimeout').setDescription('Remove timeout from an escalation level')
+                .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)))
+            .addSubcommand(s => s.setName('view').setDescription('View current escalation configuration')),
+        new SlashCommandBuilder().setName('help').setDescription('View all available commands'),
     ].map(c => c.toJSON());
 
     client.application.commands.set(commands);
@@ -268,25 +292,22 @@ client.on('guildCreate', async guild => {
         const inviterId = entry?.executor?.id;
         if (guild.systemChannel) {
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle('👋 Thanks for adding Police Bot!')
-                .setDescription(`${inviterId ? `<@${inviterId}>, please` : 'An administrator should'} run \`/accessconfig\` to set up command permissions.\n\n**Quick Start:**\n1. Run \`/accessconfig\` to choose which role can use moderation commands\n2. Run \`/config\` to set up warning levels\n3. Start using \`/warn\` to moderate your server!`)
-                .setFooter({ text: 'Use /accessconfig to configure role-based access control' });
+                .setDescription(`${inviterId ? `<@${inviterId}>, please` : 'An administrator should'} run \`/accessconfig\` to set up command permissions.\n\n**Quick Start:**\n1. \`/accessconfig\` — set the moderator role\n2. \`/config\` — set up warning levels\n3. \`/warn\` — start moderating!`)
+                .setFooter({ text: 'Use /help to see all commands' });
             await guild.systemChannel.send({ embeds: [embed] }).catch(e => console.log(`⚠️ Could not send setup message: ${e.message}`));
         }
     } catch (e) { console.error('Error in guildCreate:', e); }
 });
 
-// Reapply active warnings to users who left and rejoined
 client.on('guildMemberAdd', async member => {
     const { guild, id: userId } = member;
     const userWarnings = Object.entries(activeWarnings).filter(([, w]) => w.guildId === guild.id && w.userId === userId);
     if (!userWarnings.length) return;
-
     console.log(`🔄 Reapplying ${userWarnings.length} warning(s) to rejoining user ${member.user.tag}`);
     for (const [, w] of userWarnings) {
         const role = guild.roles.cache.get(w.roleId);
         if (role) await member.roles.add(role).catch(e => console.error(`Failed to reapply warning role: ${e.message}`));
     }
-
     member.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ Warning Reinstated')
         .setDescription(`Your active warning(s) in **${guild.name}** have been reapplied because you rejoined.`)
         .addFields({ name: 'Active Warnings', value: userWarnings.map(([, w]) => `Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') })
@@ -295,12 +316,13 @@ client.on('guildMemberAdd', async member => {
 });
 
 client.on('interactionCreate', async interaction => {
+
     if (interaction.isRoleSelectMenu()) {
         if (!interaction.customId.startsWith('access_role_')) return;
         const guildId = interaction.customId.replace('access_role_', '');
         if (guildId !== interaction.guild.id) return interaction.reply({ content: '❌ Invalid interaction. Please run /accessconfig again.', flags: [MessageFlags.Ephemeral] });
         const selectedRole = interaction.roles.first();
-        if (!selectedRole) return interaction.reply({ content: '❌ No role selected. Please try again.', flags: [MessageFlags.Ephemeral] });
+        if (!selectedRole) return interaction.reply({ content: '❌ No role selected.', flags: [MessageFlags.Ephemeral] });
         if (selectedRole.id === interaction.guild.id) return interaction.update({ content: '❌ Cannot use @everyone as access role.', components: [] });
         if (selectedRole.managed) return interaction.update({ content: '❌ Cannot use managed/bot roles as access role.', components: [] });
         guildConfigs[guildId] ??= { levels: {} };
@@ -312,7 +334,67 @@ client.on('interactionCreate', async interaction => {
                 .setTimestamp()],
             components: []
         });
-        console.log(`🔒 Access role set to ${selectedRole.name} in ${interaction.guild.name}`);
+        console.log(`🔒 [AUDIT] Access role set to ${selectedRole.name} in ${interaction.guild.name}`);
+        return;
+    }
+
+    if (interaction.isButton()) {
+        const { customId } = interaction;
+
+        if (customId.startsWith('wl_')) {
+            if (!hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            const parts = customId.split('_');
+            const page = parseInt(parts[1]);
+            const guildId = parts.slice(2).join('_');
+            const { embed, totalPages, page: newPage } = buildWarnlistEmbed(guildId, page);
+            return interaction.update({ embeds: [embed], components: warnlistRow(newPage, totalPages, guildId) });
+        }
+
+        if (customId.startsWith('unwarn_confirm_') || customId.startsWith('unwarn_cancel_')) {
+            const isConfirm = customId.startsWith('unwarn_confirm_');
+            const pendingId = customId.slice(isConfirm ? 15 : 13);
+            const pending = pendingUnwarns.get(pendingId);
+            if (!pending) return interaction.update({ content: '❌ This confirmation has expired. Please run `/unwarn` again.', embeds: [], components: [] });
+            if (interaction.user.id !== pending.modId) return interaction.reply({ content: '❌ Only the moderator who ran this command can confirm.', flags: [MessageFlags.Ephemeral] });
+            if (!isConfirm) {
+                pendingUnwarns.delete(pendingId);
+                return interaction.update({ content: '✅ Unwarn cancelled.', embeds: [], components: [] });
+            }
+            pendingUnwarns.delete(pendingId);
+            const { targetUserId, targetUserTag, level, guildId, roleId } = pending;
+            try {
+                const member = interaction.guild.members.cache.get(targetUserId);
+                const role = interaction.guild.roles.cache.get(roleId);
+                if (!member) return interaction.update({ content: '❌ User is no longer in this server.', embeds: [], components: [] });
+                if (!role) return interaction.update({ content: '❌ Configured role not found.', embeds: [], components: [] });
+                await member.roles.remove(role);
+                console.log(`🔒 [AUDIT] ${interaction.user.tag} unwarned ${targetUserTag} (Level ${level}) in ${interaction.guild.name}`);
+                const warningKeys = Object.keys(activeWarnings).filter(k => {
+                    const w = activeWarnings[k];
+                    return w.userId === targetUserId && w.guildId === guildId && w.level === level;
+                });
+                warningKeys.forEach(k => {
+                    addHistory(guildId, { ...activeWarnings[k], endedAt: Date.now(), endReason: 'manual' });
+                    clearTimeout(warningTimers.get(k));
+                    warningTimers.delete(k);
+                    delete activeWarnings[k];
+                });
+                if (warningKeys.length > 0) saveWarnings();
+                await interaction.update({
+                    embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('✅ Warning Removed')
+                        .addFields(
+                            { name: 'User', value: `<@${targetUserId}>`, inline: true },
+                            { name: 'Level', value: `${level}`, inline: true },
+                            { name: 'Role', value: `${role}`, inline: true },
+                            { name: 'Removed by', value: `${interaction.user}` }
+                        ).setTimestamp()],
+                    components: []
+                });
+            } catch (error) {
+                console.error(error);
+                await interaction.update({ content: '❌ Failed to remove warning. Check bot permissions.', embeds: [], components: [] });
+            }
+        }
         return;
     }
 
@@ -323,16 +405,29 @@ client.on('interactionCreate', async interaction => {
 
     guildConfigs[guildId] ??= { levels: {} };
 
-    const restrictedCommands = ['config', 'warn', 'unwarn', 'viewconfig', 'accessconfig', 'warnlist', 'history', 'escalation'];
+    const restrictedCommands = ['config', 'warn', 'unwarn', 'timeout', 'viewconfig', 'accessconfig', 'warnlist', 'history', 'escalation'];
     if (restrictedCommands.includes(commandName) && !hasCommandPermission(interaction, guildId)) {
         const accessRole = guildConfigs[guildId]?.accessRoleId;
         return interaction.reply({
-            content: `❌ You don't have permission to use this command.\n\n**Required:** Administrator permission OR ${accessRole ? `<@&${accessRole}>` : 'not configured'}\n\nAsk a server administrator to run \`/accessconfig\` to set up command access.`,
+            content: `❌ You don't have permission to use this command.\n\n**Required:** Administrator OR ${accessRole ? `<@&${accessRole}>` : 'no access role configured'}\n\nAsk an admin to run \`/accessconfig\`.`,
             flags: [MessageFlags.Ephemeral]
         });
     }
 
-    if (commandName === 'accessconfig') {
+    if (commandName === 'help') {
+        await interaction.reply({
+            embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('📖 Police Bot — Commands')
+                .addFields(
+                    { name: '⚠️ Warn', value: '`/warn` — warn a user at a configured level\n`/unwarn` — remove a warning (with confirmation)\n`/timeout` — apply a Discord timeout\n`/mywarnings` — check your own active warnings\n`/warnlist` — see all active warnings\n`/history` — view a user\'s full warning history' },
+                    { name: '⚙️ Config', value: '`/config` — set up a warning level (role + duration)\n`/viewconfig` — view all configured levels\n`/accessconfig` — set the moderator role' },
+                    { name: '⬆️ Escalation', value: '`/escalation set` — set a threshold to auto-escalate\n`/escalation remove` — remove a threshold\n`/escalation setcap` / `removecap` — set/remove the level cap\n`/escalation settimeout` — timeout on escalation to a level\n`/escalation removetimeout` — remove that timeout\n`/escalation view` — view all rules' },
+                    { name: '❓ Other', value: '`/help` — this menu' }
+                ).setFooter({ text: 'Mod commands require the configured access role or Administrator' })],
+            flags: [MessageFlags.Ephemeral]
+        });
+    }
+
+    else if (commandName === 'accessconfig') {
         await showAccessControlConfig(interaction, guildId);
     }
 
@@ -340,25 +435,21 @@ client.on('interactionCreate', async interaction => {
         const level = interaction.options.getInteger('level');
         const role = interaction.options.getRole('role');
         const durationStr = interaction.options.getString('duration');
-
         if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
-
         const duration = parseDuration(durationStr);
         if (!duration) return interaction.reply({
-            content: '❌ Invalid duration format. Use:\n• `m:s` (e.g. `30:0` = 30 minutes)\n• `h:m:s` (e.g. `1:30:0` = 1 hour 30 minutes)\n• `d:h:m:s` (e.g. `2:1:30:0` = 2 days 1 hour 30 minutes)\n• `forever` (permanent warning)\n\n**Note:** Maximum duration is 365 days.',
+            content: '❌ Invalid duration. Use `m:s`, `h:m:s`, `d:h:m:s`, or `forever`. Max 365 days.',
             flags: [MessageFlags.Ephemeral]
         });
-
         guildConfigs[guildId].levels[level] = {
             roleId: role.id, roleName: role.name,
             durationMs: duration.totalMs, isForever: duration.isForever,
             durationDisplay: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds, duration.isForever)
         };
         saveConfigs();
-        console.log(`🔒 [AUDIT] ${interaction.user.tag} configured warning level ${level} with role ${role.name} in ${interaction.guild.name}`);
-
+        console.log(`🔒 [AUDIT] ${interaction.user.tag} configured Level ${level} → ${role.name} in ${interaction.guild.name}`);
         await interaction.reply({
-            embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('🚨 Warning Configuration Updated')
+            embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('🚨 Warning Level Configured')
                 .addFields(
                     { name: 'Level', value: `${level}`, inline: true },
                     { name: 'Role', value: `${role}`, inline: true },
@@ -373,23 +464,18 @@ client.on('interactionCreate', async interaction => {
         const member = interaction.guild.members.cache.get(user.id);
         const level = interaction.options.getInteger('level');
         const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0, 1000).replace(/[\x00-\x1F\x7F]/g, '');
-
         if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
         if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
-        if (!guildConfigs[guildId].levels[level]) return interaction.reply({ content: `❌ Warning level ${level} is not configured. Use /config to set it up.`, flags: [MessageFlags.Ephemeral] });
-
+        if (!guildConfigs[guildId].levels[level]) return interaction.reply({ content: `❌ Level ${level} is not configured. Use /config first.`, flags: [MessageFlags.Ephemeral] });
         const botMember = interaction.guild.members.me;
         const configRole = interaction.guild.roles.cache.get(guildConfigs[guildId].levels[level].roleId);
-        if (!configRole) return interaction.reply({ content: '❌ Configured role not found. Please update the configuration.', flags: [MessageFlags.Ephemeral] });
-        if (configRole.position >= botMember.roles.highest.position) return interaction.reply({ content: `❌ I cannot manage the ${configRole} role. My highest role must be **above** the warning role.\n\n**Fix:** Drag my role higher than ${configRole} in Server Settings → Roles.`, flags: [MessageFlags.Ephemeral] });
-        if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) return interaction.reply({ content: '❌ I don\'t have the "Manage Roles" permission.', flags: [MessageFlags.Ephemeral] });
-
+        if (!configRole) return interaction.reply({ content: '❌ Configured role not found. Please re-run /config.', flags: [MessageFlags.Ephemeral] });
+        if (configRole.position >= botMember.roles.highest.position) return interaction.reply({ content: `❌ My role must be above ${configRole} in the role list.`, flags: [MessageFlags.Ephemeral] });
+        if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) return interaction.reply({ content: '❌ I need the "Manage Roles" permission.', flags: [MessageFlags.Ephemeral] });
         try {
             const result = await applyWarning(interaction.guild, member, user, guildId, level, reason, interaction.channel.id, interaction.user.tag);
             if (result.error) return interaction.reply({ content: `❌ ${result.error}`, flags: [MessageFlags.Ephemeral] });
-
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} warned ${user.tag} (Level ${level}) in ${interaction.guild.name} - Reason: ${reason.slice(0, 100)}`);
-
+            console.log(`🔒 [AUDIT] ${interaction.user.tag} warned ${user.tag} (Level ${level}) in ${interaction.guild.name}`);
             await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ Warning Issued')
                 .addFields(
                     { name: 'User', value: `${user}`, inline: true },
@@ -400,38 +486,30 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Issued by', value: `${interaction.user}` }
                 ).setTimestamp()]
             });
-
-            // Notify if this is already the cap level
             const cap = guildConfigs[guildId].escalation?.cap;
-            if (cap && level === cap) {
-                await interaction.followUp({ content: `🚨 ${user} has been warned at the cap level (Level ${cap}). No further auto-escalation is possible.`, flags: [MessageFlags.Ephemeral] });
-            }
-
-            // Check escalation
+            if (cap && level === cap) await interaction.followUp({ content: `🚨 ${user} is at the cap level (Level ${cap}). No further auto-escalation.`, flags: [MessageFlags.Ephemeral] });
             const esc = await checkEscalation(interaction.guild, member, user, guildId, level, interaction.channel.id, interaction.user.tag);
             if (esc?.escalated) {
-                await interaction.followUp({ content: `⬆️ ${user} has been auto-escalated to **Level ${esc.nextLevel}** (${esc.role}) after hitting the threshold.${esc.hitCap ? `\n🚨 They've now reached the cap (Level ${esc.hitCap ?? esc.nextLevel}).` : ''}`, flags: [MessageFlags.Ephemeral] });
+                await interaction.followUp({ content: `⬆️ ${user} auto-escalated to **Level ${esc.nextLevel}** (${esc.role}).${esc.timedOut ? ` 🔇 Timeout: **${esc.timeoutDisplay}**.` : ''}${esc.hitCap ? `\n🚨 Reached cap (Level ${esc.nextLevel}).` : ''}`, flags: [MessageFlags.Ephemeral] });
             } else if (esc?.atCap) {
-                await interaction.followUp({ content: `🚨 ${user} has hit the escalation threshold for Level ${level}, but cannot be escalated past the cap (Level ${esc.cap}).`, flags: [MessageFlags.Ephemeral] });
+                await interaction.followUp({ content: `🚨 Escalation threshold hit for Level ${level}, but Level ${esc.cap} cap prevents further escalation.`, flags: [MessageFlags.Ephemeral] });
             } else if (esc?.noNextLevel) {
-                await interaction.followUp({ content: `ℹ️ Escalation threshold hit for Level ${level}, but Level ${esc.nextLevel} is not configured.`, flags: [MessageFlags.Ephemeral] });
+                await interaction.followUp({ content: `ℹ️ Escalation threshold hit for Level ${level}, but Level ${esc.nextLevel} isn't configured.`, flags: [MessageFlags.Ephemeral] });
             } else if (esc?.counted) {
                 await interaction.followUp({ content: `📊 Escalation: ${esc.count}/${esc.threshold} warnings at Level ${level}.`, flags: [MessageFlags.Ephemeral] });
             }
-
         } catch (error) {
             console.error(error);
-            await interaction.reply({ content: '❌ Failed to assign warning. Make sure the bot has proper permissions.', flags: [MessageFlags.Ephemeral] });
+            await interaction.reply({ content: '❌ Failed to assign warning. Check permissions.', flags: [MessageFlags.Ephemeral] });
         }
     }
 
     else if (commandName === 'viewconfig') {
         const config = guildConfigs[guildId];
         if (!config || Object.keys(config.levels).length === 0) return interaction.reply({ content: '📋 No warning levels configured yet. Use /config to set them up.', flags: [MessageFlags.Ephemeral] });
-        const embed = new EmbedBuilder().setColor('#0099ff').setTitle('🚨 Police Bot Configuration').setDescription('Current warning level settings:').setTimestamp();
-        for (const [level, data] of Object.entries(config.levels)) {
+        const embed = new EmbedBuilder().setColor('#0099ff').setTitle('🚨 Warning Configuration').setTimestamp();
+        for (const [level, data] of Object.entries(config.levels))
             embed.addFields({ name: `Level ${level}`, value: `Role: <@&${data.roleId}>\nDuration: ${data.durationDisplay}`, inline: true });
-        }
         await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     }
 
@@ -439,65 +517,85 @@ client.on('interactionCreate', async interaction => {
         const user = interaction.options.getUser('user');
         const member = interaction.guild.members.cache.get(user.id);
         const level = interaction.options.getInteger('level');
-
         if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
         if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
-        if (!guildConfigs[guildId].levels[level]) return interaction.reply({ content: `❌ Warning level ${level} is not configured.`, flags: [MessageFlags.Ephemeral] });
-
+        if (!guildConfigs[guildId].levels[level]) return interaction.reply({ content: `❌ Level ${level} is not configured.`, flags: [MessageFlags.Ephemeral] });
         const config = guildConfigs[guildId].levels[level];
         const role = interaction.guild.roles.cache.get(config.roleId);
         if (!role) return interaction.reply({ content: '❌ Configured role not found.', flags: [MessageFlags.Ephemeral] });
         if (!member.roles.cache.has(role.id)) return interaction.reply({ content: `❌ ${user} doesn't have the ${role} role.`, flags: [MessageFlags.Ephemeral] });
+        const pendingId = interaction.id;
+        pendingUnwarns.set(pendingId, { targetUserId: user.id, targetUserTag: user.tag, level, guildId, roleId: role.id, modId: interaction.user.id });
+        setTimeout(() => pendingUnwarns.delete(pendingId), 60_000);
+        await interaction.reply({
+            embeds: [new EmbedBuilder().setColor('#FFA500').setTitle('⚠️ Confirm Unwarn')
+                .setDescription(`Remove **Level ${level}** warning from ${user}?`)
+                .addFields({ name: 'Role to remove', value: `${role}`, inline: true })
+                .setFooter({ text: 'Expires in 60 seconds' })],
+            components: [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`unwarn_confirm_${pendingId}`).setLabel('Confirm').setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId(`unwarn_cancel_${pendingId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+            )],
+            flags: [MessageFlags.Ephemeral]
+        });
+    }
 
+    else if (commandName === 'timeout') {
+        const user = interaction.options.getUser('user');
+        const member = interaction.guild.members.cache.get(user.id);
+        const durationStr = interaction.options.getString('duration');
+        const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0, 512).replace(/[\x00-\x1F\x7F]/g, '');
+        if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
+        const duration = parseDuration(durationStr);
+        if (!duration || duration.isForever) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.', flags: [MessageFlags.Ephemeral] });
+        if (duration.totalMs > MAX_TIMEOUT_MS) return interaction.reply({ content: '❌ Discord timeouts cannot exceed 28 days.', flags: [MessageFlags.Ephemeral] });
+        const botMember = interaction.guild.members.me;
+        if (!botMember.permissions.has(PermissionFlagsBits.ModerateMembers)) return interaction.reply({ content: '❌ I need the "Moderate Members" permission for timeouts.', flags: [MessageFlags.Ephemeral] });
+        if (member.roles.highest.position >= botMember.roles.highest.position) return interaction.reply({ content: '❌ I cannot timeout this user — their role is equal to or above mine.', flags: [MessageFlags.Ephemeral] });
         try {
-            await member.roles.remove(role);
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} unwarned ${user.tag} (Level ${level}) in ${interaction.guild.name}`);
-
-            const warningKeys = Object.keys(activeWarnings).filter(key => {
-                const w = activeWarnings[key];
-                return w.userId === user.id && w.guildId === guildId && w.level === level;
-            });
-            warningKeys.forEach(key => {
-                addHistory(guildId, { ...activeWarnings[key], endedAt: Date.now(), endReason: 'manual' });
-                clearTimeout(warningTimers.get(key));
-                warningTimers.delete(key);
-                delete activeWarnings[key];
-            });
-            if (warningKeys.length > 0) saveWarnings();
-
-            await interaction.reply({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('✅ Warning Removed')
+            await member.timeout(duration.totalMs, reason);
+            const durationDisplay = formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds);
+            const expiresTs = Math.floor((Date.now() + duration.totalMs) / 1000);
+            console.log(`🔒 [AUDIT] ${interaction.user.tag} timed out ${user.tag} for ${durationDisplay} in ${interaction.guild.name}`);
+            user.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('🔇 You Have Been Timed Out')
+                .setDescription(`You were timed out in **${interaction.guild.name}**.`)
+                .addFields(
+                    { name: 'Duration', value: durationDisplay, inline: true },
+                    { name: 'Expires', value: `<t:${expiresTs}:R>`, inline: true },
+                    { name: 'Reason', value: reason }
+                ).setTimestamp()]
+            }).catch(() => {});
+            await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('🔇 Timeout Applied')
                 .addFields(
                     { name: 'User', value: `${user}`, inline: true },
-                    { name: 'Level', value: `${level}`, inline: true },
-                    { name: 'Role', value: `${role}`, inline: true },
-                    { name: 'Removed by', value: `${interaction.user}` }
+                    { name: 'Duration', value: durationDisplay, inline: true },
+                    { name: 'Expires', value: `<t:${expiresTs}:R>`, inline: true },
+                    { name: 'Reason', value: reason },
+                    { name: 'Issued by', value: `${interaction.user}` }
                 ).setTimestamp()]
             });
         } catch (error) {
             console.error(error);
-            await interaction.reply({ content: '❌ Failed to remove warning. Make sure the bot has proper permissions.', flags: [MessageFlags.Ephemeral] });
+            await interaction.reply({ content: '❌ Failed to apply timeout. Check permissions and role hierarchy.', flags: [MessageFlags.Ephemeral] });
         }
     }
 
-    else if (commandName === 'timeleft') {
+    else if (commandName === 'mywarnings') {
         const userId = interaction.user.id;
         const userWarnings = Object.entries(activeWarnings).filter(([, w]) => w.guildId === guildId && w.userId === userId);
         if (userWarnings.length === 0) return interaction.reply({ content: '✅ You have no active warnings!', flags: [MessageFlags.Ephemeral] });
-
         const embed = new EmbedBuilder().setColor('#FFA500').setTitle('⏰ Your Active Warnings')
-            .setDescription(`You currently have ${userWarnings.length} active warning${userWarnings.length > 1 ? 's' : ''}:`)
-            .setFooter({ text: 'Warnings are automatically removed when they expire' })
-            .setTimestamp();
-
+            .setDescription(`You have ${userWarnings.length} active warning${userWarnings.length > 1 ? 's' : ''}:`)
+            .setFooter({ text: 'Warnings are automatically removed when they expire' }).setTimestamp();
         for (const [, warning] of userWarnings) {
             const config = guildConfigs[guildId]?.levels[warning.level];
-            const fieldName = `Level ${warning.level} - ${config?.roleName || 'Unknown Role'}`;
+            const fieldName = `Level ${warning.level} — ${config?.roleName || 'Unknown Role'}`;
             if (config?.isForever) {
-                embed.addFields({ name: fieldName, value: '⏳ **Duration:** Forever\n🔒 **Status:** Permanent (use `/unwarn` to remove)' });
+                embed.addFields({ name: fieldName, value: '⏳ **Duration:** Forever\n🔒 **Status:** Permanent' });
             } else {
                 const timeLeft = warning.expiresAt - Date.now();
                 if (timeLeft <= 0) {
-                    embed.addFields({ name: fieldName, value: '⏳ **Time Left:** Expired (will be removed shortly)' });
+                    embed.addFields({ name: fieldName, value: '⏳ Expired (will be removed shortly)' });
                 } else {
                     const s = Math.floor(timeLeft / 1000);
                     embed.addFields({ name: fieldName, value: `⏳ **Time Left:** ${formatDuration(Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60), s % 60)}\n📅 **Expires:** <t:${Math.floor(warning.expiresAt / 1000)}:F>` });
@@ -508,41 +606,23 @@ client.on('interactionCreate', async interaction => {
     }
 
     else if (commandName === 'warnlist') {
-        const guildWarnings = Object.values(activeWarnings).filter(w => w.guildId === guildId);
-        if (!guildWarnings.length) return interaction.reply({ content: '✅ No active warnings in this server.', flags: [MessageFlags.Ephemeral] });
-
-        const embed = new EmbedBuilder().setColor('#FFA500').setTitle(`⚠️ Active Warnings (${guildWarnings.length})`).setTimestamp();
-
-        const byUser = {};
-        for (const w of guildWarnings) { byUser[w.userId] ??= []; byUser[w.userId].push(w); }
-        for (const [userId, warnings] of Object.entries(byUser)) {
-            embed.addFields({ name: `<@${userId}>`, value: warnings.map(w => `• Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') });
-            if (embed.data.fields.length >= 25) break;
-        }
-        if (Object.keys(byUser).length > 25) embed.setFooter({ text: `Showing first 25 users of ${Object.keys(byUser).length} total` });
-
-        await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+        const { embed, totalPages, page } = buildWarnlistEmbed(guildId, 0);
+        await interaction.reply({ embeds: [embed], components: warnlistRow(page, totalPages, guildId), flags: [MessageFlags.Ephemeral] });
     }
 
     else if (commandName === 'history') {
         const user = interaction.options.getUser('user');
         const entries = (warnHistory[guildId] || []).filter(e => e.userId === user.id);
         if (!entries.length) return interaction.reply({ content: `📋 No warning history found for ${user}.`, flags: [MessageFlags.Ephemeral] });
-
         const embed = new EmbedBuilder().setColor('#5865F2')
             .setTitle(`📋 Warning History — ${user.tag}`)
             .setDescription(`${entries.length} total warning${entries.length > 1 ? 's' : ''} on record.`)
             .setTimestamp();
-
         for (const e of entries.slice(-10)) {
             const status = e.endReason === 'expired' ? '✅ Expired' : e.endReason === 'manual' ? '🔓 Removed' : '⏳ Active';
-            embed.addFields({
-                name: `Level ${e.level} — ${e.roleName} — <t:${Math.floor(e.issuedAt / 1000)}:d>`,
-                value: `${status} • by ${e.issuedBy}\n${e.reason}`
-            });
+            embed.addFields({ name: `Level ${e.level} — ${e.roleName} — <t:${Math.floor(e.issuedAt / 1000)}:d>`, value: `${status} • by ${e.issuedBy}\n${e.reason}` });
         }
         if (entries.length > 10) embed.setFooter({ text: `Showing last 10 of ${entries.length} entries` });
-
         await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     }
 
@@ -558,51 +638,60 @@ client.on('interactionCreate', async interaction => {
             if (threshold < 2 || threshold > 50) return interaction.reply({ content: '❌ Threshold must be between 2 and 50.', flags: [MessageFlags.Ephemeral] });
             esc.thresholds[level] = threshold;
             saveConfigs();
-            await interaction.reply({ content: `✅ Escalation set: **${threshold}** Level ${level} warnings → auto Level ${level + 1}.`, flags: [MessageFlags.Ephemeral] });
-        }
-
-        else if (sub === 'remove') {
+            await interaction.reply({ content: `✅ **${threshold}x** Level ${level} warnings → auto Level ${level + 1}.`, flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'remove') {
             const level = interaction.options.getInteger('level');
-            if (!esc.thresholds[level]) return interaction.reply({ content: `❌ No escalation threshold set for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
+            if (!esc.thresholds[level]) return interaction.reply({ content: `❌ No threshold set for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
             delete esc.thresholds[level];
             saveConfigs();
             await interaction.reply({ content: `✅ Removed escalation threshold for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
-        }
-
-        else if (sub === 'setcap') {
+        } else if (sub === 'setcap') {
             const level = interaction.options.getInteger('level');
-            if (level < 1 || level > 100) return interaction.reply({ content: '❌ Cap level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
+            if (level < 1 || level > 100) return interaction.reply({ content: '❌ Cap must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
             esc.cap = level;
             saveConfigs();
-            await interaction.reply({ content: `✅ Level cap set to **${level}**. Escalation will not go beyond this level.`, flags: [MessageFlags.Ephemeral] });
-        }
-
-        else if (sub === 'removecap') {
-            if (!esc.cap) return interaction.reply({ content: '❌ No level cap is currently set.', flags: [MessageFlags.Ephemeral] });
+            await interaction.reply({ content: `✅ Level cap set to **${level}**.`, flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'removecap') {
+            if (!esc.cap) return interaction.reply({ content: '❌ No level cap is set.', flags: [MessageFlags.Ephemeral] });
             delete esc.cap;
             saveConfigs();
-            await interaction.reply({ content: '✅ Level cap removed. Escalation is now uncapped.', flags: [MessageFlags.Ephemeral] });
-        }
-
-        else if (sub === 'view') {
+            await interaction.reply({ content: '✅ Level cap removed.', flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'settimeout') {
+            const level = interaction.options.getInteger('level');
+            const durationStr = interaction.options.getString('duration');
+            if (level < 1 || level > 100) return interaction.reply({ content: '❌ Level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
+            const duration = parseDuration(durationStr);
+            if (!duration || duration.isForever) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.', flags: [MessageFlags.Ephemeral] });
+            if (duration.totalMs > MAX_TIMEOUT_MS) return interaction.reply({ content: '❌ Discord timeouts cannot exceed 28 days.', flags: [MessageFlags.Ephemeral] });
+            esc.timeouts ??= {};
+            esc.timeouts[level] = { durationMs: duration.totalMs, durationDisplay: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds) };
+            saveConfigs();
+            await interaction.reply({ content: `✅ Escalating to Level ${level} will now apply a **${esc.timeouts[level].durationDisplay}** timeout.`, flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'removetimeout') {
+            const level = interaction.options.getInteger('level');
+            if (!esc.timeouts?.[level]) return interaction.reply({ content: `❌ No escalation timeout for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
+            delete esc.timeouts[level];
+            saveConfigs();
+            await interaction.reply({ content: `✅ Removed escalation timeout for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'view') {
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle('⬆️ Escalation Configuration').setTimestamp();
             const thresholds = esc.thresholds ?? {};
-
-            if (Object.keys(thresholds).length === 0 && !esc.cap) {
-                embed.setDescription('No escalation rules configured.\nUse `/escalation set` to add thresholds.');
+            const timeouts = esc.timeouts ?? {};
+            if (!Object.keys(thresholds).length && !esc.cap && !Object.keys(timeouts).length) {
+                embed.setDescription('No escalation rules configured. Use `/escalation set` to add thresholds.');
             } else {
-                if (Object.keys(thresholds).length > 0) {
+                if (Object.keys(thresholds).length)
                     embed.addFields({ name: 'Thresholds', value: Object.entries(thresholds).sort(([a], [b]) => a - b).map(([lvl, t]) => `• **${t}x** Level ${lvl} → auto Level ${parseInt(lvl) + 1}`).join('\n') });
-                }
-                embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}** (escalation stops here)` : 'None (uncapped)' });
+                if (Object.keys(timeouts).length)
+                    embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(timeouts).sort(([a], [b]) => a - b).map(([lvl, t]) => `• Escalate to Level ${lvl} → **${t.durationDisplay}** timeout`).join('\n') });
+                embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
             }
-
             await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
         }
     }
 });
 
-process.on('unhandledRejection', error => console.error('⚠️ Unhandled rejection (bot kept alive):', error));
+process.on('unhandledRejection', error => console.error('⚠️ Unhandled rejection:', error));
 client.on('error', error => console.error('⚠️ Discord client error:', error));
 
 client.login(process.env.DISCORD_TOKEN);
