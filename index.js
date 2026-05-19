@@ -384,13 +384,15 @@ client.on('interactionCreate', async interaction => {
                     .addFields(
                         { name: 'warnings.json', value: 'All active warnings with expiry timestamps, user IDs, role IDs, and channel IDs for timer restoration.' },
                         { name: 'history.json', value: 'Full warning history per server — every warn ever issued, including expired and manually removed ones.' },
-                        { name: 'config.json', value: 'All per-server configuration: warning levels, roles, durations, escalation rules, timeout configs, and the access role.' }
+                        { name: 'config.json', value: 'All per-server configuration: warning levels, roles, durations, escalation rules, timeout configs, and the access role.' },
+                        { name: 'Auto-save', value: 'Every write operation saves locally and pushes to GitHub in the background. Set `GITHUB_TOKEN`, `GITHUB_OWNER`, and `GITHUB_REPO` in your environment variables.' }
                     ).setFooter({ text: 'Use the buttons to explore other categories' }),
                 help_features: new EmbedBuilder().setColor('#9b59b6').setTitle('Other Features')
                     .addFields(
                         { name: 'Warning expiry DMs', value: 'Users are DM\'d when a warning is issued and again when it expires and the role is removed.' },
                         { name: 'Rejoin protection', value: 'If a warned user leaves and rejoins the server, their warning roles are automatically reapplied and they are DM\'d.' },
                         { name: 'Timer restoration', value: 'On bot restart, all active warning timers are restored from saved data so no warning expires silently.' },
+                        { name: 'Keep-alive', value: 'The bot pings itself every 14 minutes to prevent Render\'s free tier from putting it to sleep.' },
                         { name: 'Audit logging', value: 'Sensitive commands (warn, unwarn, timeout, config) are logged to console with the moderator\'s tag.' },
                         { name: '/help', value: 'This interactive help menu.' }
                     ).setFooter({ text: 'Use the buttons to explore other categories' }),
