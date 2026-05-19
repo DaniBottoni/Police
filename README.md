@@ -26,3 +26,5 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 ## Moderation:
 - **/history:** Shows the warning history of a specific user.
 - **/warnlist:** Shows all active warning in the server.
+
+- **/help:** Shows all commands available.
