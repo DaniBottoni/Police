@@ -6,6 +6,7 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 ## Warning:
 - **/warn:** Gives a warning to a user.
 - **/unwarn:** Manually removes a warning from the user.
+- **/timeout:** Gives a configurable length timeout to a user.
 - **/mywarnings:** Shows you how much time is left on your warnings.
 
 ## Config:
