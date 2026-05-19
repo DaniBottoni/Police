@@ -171,27 +171,36 @@ async function applyWarning(guild, member, user, guildId, level, reason, channel
 
 async function checkEscalation(guild, member, user, guildId, level, channelId, issuedByTag) {
     const esc = guildConfigs[guildId].escalation ?? {};
-    const threshold = esc.thresholds?.[level];
-    if (!threshold) return null;
-    const count = Object.values(activeWarnings).filter(w => w.guildId === guildId && w.userId === user.id && w.level === level).length;
-    if (count < threshold) return { counted: true, count, threshold };
-    const nextLevel = level + 1;
     const cap = esc.cap;
+    const nextLevel = level + 1;
     if (cap != null && nextLevel > cap) return { atCap: true, cap };
-    if (!guildConfigs[guildId].levels[nextLevel]) return { noNextLevel: true, nextLevel };
-    const result = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
-    if (result.error) return { escalationError: result.error };
+
+    const count = Object.values(activeWarnings).filter(w => w.guildId === guildId && w.userId === user.id && w.level === level).length;
+
+    // Timeout-escalation: self-contained with its own threshold stored in timeouts[nextLevel].threshold
     const timeoutCfg = esc.timeouts?.[nextLevel];
-    if (timeoutCfg && member) {
+    if (timeoutCfg?.threshold != null) {
+        if (count < timeoutCfg.threshold) return { counted: true, count, threshold: timeoutCfg.threshold };
+        if (!guildConfigs[guildId].levels[nextLevel]) return { noNextLevel: true, nextLevel };
+        const result = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
+        if (result.error) return { escalationError: result.error };
         await member.timeout(timeoutCfg.durationMs, `Auto-escalated to Level ${nextLevel}`).catch(e => console.error('Escalation timeout failed:', e.message));
         user.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('🔇 You Have Been Timed Out')
             .setDescription(`You were auto-timed-out in **${guild.name}** upon reaching Warning Level ${nextLevel}.`)
             .addFields({ name: 'Timeout Duration', value: timeoutCfg.durationDisplay, inline: true })
             .setTimestamp()]
         }).catch(() => {});
+        return { escalated: true, nextLevel, role: result.role, config: result.config, hitCap: cap != null && nextLevel === cap, timedOut: true, timeoutDisplay: timeoutCfg.durationDisplay };
     }
-    const hitCap = cap != null && nextLevel === cap;
-    return { escalated: true, nextLevel, role: result.role, config: result.config, hitCap, timedOut: !!timeoutCfg, timeoutDisplay: timeoutCfg?.durationDisplay };
+
+    // Regular threshold escalation (no timeout)
+    const threshold = esc.thresholds?.[level];
+    if (!threshold) return null;
+    if (count < threshold) return { counted: true, count, threshold };
+    if (!guildConfigs[guildId].levels[nextLevel]) return { noNextLevel: true, nextLevel };
+    const result = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
+    if (result.error) return { escalationError: result.error };
+    return { escalated: true, nextLevel, role: result.role, config: result.config, hitCap: cap != null && nextLevel === cap, timedOut: false };
 }
 
 function keepAlive() {
@@ -271,8 +280,9 @@ client.once('ready', () => {
             .addSubcommand(s => s.setName('setcap').setDescription('Set maximum warning level for escalation')
                 .addIntegerOption(o => o.setName('level').setDescription('Cap level').setRequired(true)))
             .addSubcommand(s => s.setName('removecap').setDescription('Remove the level cap'))
-            .addSubcommand(s => s.setName('settimeout').setDescription('Apply a timeout when auto-escalating TO a level')
-                .addIntegerOption(o => o.setName('level').setDescription('Escalation target level').setRequired(true))
+            .addSubcommand(s => s.setName('settimeout').setDescription('Configure a timeout-escalation: N warnings at level X → escalate to X+1 with a timeout')
+                .addIntegerOption(o => o.setName('level').setDescription('Target level to escalate TO (must be ≥2)').setRequired(true))
+                .addIntegerOption(o => o.setName('threshold').setDescription('How many level (target-1) warnings trigger this (2–50)').setRequired(true))
                 .addStringOption(o => o.setName('duration').setDescription('Timeout duration (m:s / h:m:s / d:h:m:s, max 28 days)').setRequired(true)))
             .addSubcommand(s => s.setName('removetimeout').setDescription('Remove timeout from an escalation level')
                 .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)))
@@ -658,15 +668,17 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ content: '✅ Level cap removed.', flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'settimeout') {
             const level = interaction.options.getInteger('level');
+            const threshold = interaction.options.getInteger('threshold');
             const durationStr = interaction.options.getString('duration');
-            if (level < 1 || level > 100) return interaction.reply({ content: '❌ Level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
+            if (level < 2 || level > 100) return interaction.reply({ content: '❌ Target level must be between 2 and 100 (level 1 has no previous level to escalate from).', flags: [MessageFlags.Ephemeral] });
+            if (threshold < 2 || threshold > 50) return interaction.reply({ content: '❌ Threshold must be between 2 and 50.', flags: [MessageFlags.Ephemeral] });
             const duration = parseDuration(durationStr);
             if (!duration || duration.isForever) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.', flags: [MessageFlags.Ephemeral] });
             if (duration.totalMs > MAX_TIMEOUT_MS) return interaction.reply({ content: '❌ Discord timeouts cannot exceed 28 days.', flags: [MessageFlags.Ephemeral] });
             esc.timeouts ??= {};
-            esc.timeouts[level] = { durationMs: duration.totalMs, durationDisplay: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds) };
+            esc.timeouts[level] = { durationMs: duration.totalMs, durationDisplay: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds), threshold };
             saveConfigs();
-            await interaction.reply({ content: `✅ Escalating to Level ${level} will now apply a **${esc.timeouts[level].durationDisplay}** timeout.`, flags: [MessageFlags.Ephemeral] });
+            await interaction.reply({ content: `✅ Timeout escalation set: **${threshold}x** Level ${level - 1} warnings → auto Level ${level} + **${esc.timeouts[level].durationDisplay}** timeout.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'removetimeout') {
             const level = interaction.options.getInteger('level');
             if (!esc.timeouts?.[level]) return interaction.reply({ content: `❌ No escalation timeout for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
@@ -683,7 +695,7 @@ client.on('interactionCreate', async interaction => {
                 if (Object.keys(thresholds).length)
                     embed.addFields({ name: 'Thresholds', value: Object.entries(thresholds).sort(([a], [b]) => a - b).map(([lvl, t]) => `• **${t}x** Level ${lvl} → auto Level ${parseInt(lvl) + 1}`).join('\n') });
                 if (Object.keys(timeouts).length)
-                    embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(timeouts).sort(([a], [b]) => a - b).map(([lvl, t]) => `• Escalate to Level ${lvl} → **${t.durationDisplay}** timeout`).join('\n') });
+                    embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(timeouts).sort(([a], [b]) => a - b).map(([lvl, t]) => `• ${t.threshold}x Level ${parseInt(lvl)-1} → auto Level ${lvl} + **${t.durationDisplay}** timeout`).join('\n') });
                 embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
             }
             await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
