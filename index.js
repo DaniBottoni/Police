@@ -9,6 +9,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 const configPath   = path.join(__dirname, 'config.json');
 const warningsPath = path.join(__dirname, 'warnings.json');
 const historyPath  = path.join(__dirname, 'history.json');
+const notesPath    = path.join(__dirname, 'notes.json');
 
 function loadJSON(filePath, label, fallback) {
     if (!fs.existsSync(filePath)) return fallback;
@@ -25,6 +26,7 @@ function loadJSON(filePath, label, fallback) {
 let guildConfigs   = loadJSON(configPath,   'config.json',   {});
 let activeWarnings = loadJSON(warningsPath, 'warnings.json', {});
 let warnHistory    = loadJSON(historyPath,  'history.json',  {});
+let modNotes       = loadJSON(notesPath,    'notes.json',    {});
 
 function saveConfigs() {
     fs.writeFileSync(configPath, JSON.stringify(guildConfigs, null, 2));
@@ -37,6 +39,17 @@ function saveWarnings() {
 function saveHistory() {
     fs.writeFileSync(historyPath, JSON.stringify(warnHistory, null, 2));
     saveFileToGitHub(historyPath, 'history.json', 'Auto-save: Update history.json').catch(e => console.error('History GitHub save failed:', e.message));
+}
+function saveNotes() {
+    fs.writeFileSync(notesPath, JSON.stringify(modNotes, null, 2));
+    saveFileToGitHub(notesPath, 'notes.json', 'Auto-save: Update notes.json').catch(e => console.error('Notes GitHub save failed:', e.message));
+}
+
+async function logMod(guild, guildId, embed) {
+    const channelId = guildConfigs[guildId]?.logChannelId;
+    if (!channelId) return;
+    const channel = guild.channels.cache.get(channelId);
+    if (channel) await channel.send({ embeds: [embed] }).catch(e => console.error('Log channel send failed:', e.message));
 }
 function addHistory(guildId, entry) {
     warnHistory[guildId] ??= [];
@@ -262,13 +275,7 @@ client.once('ready', () => {
             .addUserOption(o => o.setName('user').setDescription('User to timeout').setRequired(true))
             .addStringOption(o => o.setName('duration').setDescription('Duration (m:s / h:m:s / d:h:m:s, max 28 days)').setRequired(true))
             .addStringOption(o => o.setName('reason').setDescription('Reason for the timeout')),
-        new SlashCommandBuilder().setName('config').setDescription('Configure warning levels')
-            .addSubcommand(s => s.setName('set').setDescription('Set up a warning level')
-                .addIntegerOption(o => o.setName('level').setDescription('Warning level (1, 2, 3...)').setRequired(true))
-                .addRoleOption(o => o.setName('role').setDescription('Role to assign').setRequired(true))
-                .addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)))
-            .addSubcommand(s => s.setName('view').setDescription('View all configured warning levels'))
-            .addSubcommand(s => s.setName('access').setDescription('Set which role can use moderation commands')),
+
         new SlashCommandBuilder().setName('mywarnings').setDescription('Check how much time is left on your warnings'),
         new SlashCommandBuilder().setName('warnlist').setDescription('View all active warnings in this server'),
         new SlashCommandBuilder().setName('history').setDescription('View warning history for a user')
@@ -289,6 +296,32 @@ client.once('ready', () => {
             .addSubcommand(s => s.setName('removetimeout').setDescription('Remove timeout from an escalation level')
                 .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View current escalation configuration')),
+        new SlashCommandBuilder().setName('kick').setDescription('Kick a user from the server')
+            .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
+            .addStringOption(o => o.setName('reason').setDescription('Reason for the kick').setRequired(true)),
+        new SlashCommandBuilder().setName('ban').setDescription('Ban a user from the server')
+            .addUserOption(o => o.setName('user').setDescription('User to ban').setRequired(true))
+            .addStringOption(o => o.setName('reason').setDescription('Reason for the ban').setRequired(true))
+            .addIntegerOption(o => o.setName('delete_days').setDescription('Days of messages to delete (0-7)').setMinValue(0).setMaxValue(7)),
+        new SlashCommandBuilder().setName('note').setDescription('Manage mod notes on a user')
+            .addSubcommand(s => s.setName('add').setDescription('Add a note to a user')
+                .addUserOption(o => o.setName('user').setDescription('User to note').setRequired(true))
+                .addStringOption(o => o.setName('text').setDescription('Note content').setRequired(true)))
+            .addSubcommand(s => s.setName('view').setDescription('View all notes for a user')
+                .addUserOption(o => o.setName('user').setDescription('User to look up').setRequired(true)))
+            .addSubcommand(s => s.setName('delete').setDescription('Delete a note by ID')
+                .addUserOption(o => o.setName('user').setDescription('User the note belongs to').setRequired(true))
+                .addIntegerOption(o => o.setName('id').setDescription('Note ID to delete').setRequired(true))),
+        new SlashCommandBuilder().setName('config').setDescription('Configure the bot')
+            .addSubcommand(s => s.setName('set').setDescription('Set up a warning level')
+                .addIntegerOption(o => o.setName('level').setDescription('Warning level (1, 2, 3...)').setRequired(true))
+                .addRoleOption(o => o.setName('role').setDescription('Role to assign').setRequired(true))
+                .addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)))
+            .addSubcommand(s => s.setName('view').setDescription('View all configured warning levels'))
+            .addSubcommand(s => s.setName('access').setDescription('Set which role can use moderation commands'))
+            .addSubcommand(s => s.setName('logchannel').setDescription('Set the mod-log channel')
+                .addChannelOption(o => o.setName('channel').setDescription('Channel to send mod logs to').setRequired(true)))
+            .addSubcommand(s => s.setName('removelogchannel').setDescription('Remove the mod-log channel')),
         new SlashCommandBuilder().setName('help').setDescription('View all commands and features of the bot'),
     ].map(c => c.toJSON());
 
@@ -368,7 +401,9 @@ client.on('interactionCreate', async interaction => {
                     .addFields(
                         { name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' },
                         { name: '/config view', value: 'View all configured warning levels and their roles and durations.' },
-                        { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access regardless.' }
+                        { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access regardless.' },
+                        { name: '/config logchannel', value: 'Set a channel where every mod action (warn, kick, ban, timeout) is automatically logged.' },
+                        { name: '/config removelogchannel', value: 'Remove the mod-log channel.' }
                     ).setFooter({ text: 'Use the buttons to explore other categories' }),
                 help_escalation: new EmbedBuilder().setColor('#ff9900').setTitle('Escalation Commands')
                     .addFields(
@@ -387,6 +422,18 @@ client.on('interactionCreate', async interaction => {
                         { name: 'config.json', value: 'All per-server configuration: warning levels, roles, durations, escalation rules, timeout configs, and the access role.' },
                         { name: 'Auto-save', value: 'Every write operation saves locally and pushes to GitHub in the background.' }
                     ).setFooter({ text: 'Use the buttons to explore other categories' }),
+                help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands')
+                    .addFields(
+                        { name: '/kick', value: 'Kick a user from the server. Sends a DM, logs to history, and posts to the mod-log channel.' },
+                        { name: '/ban', value: 'Ban a user. Optionally delete their recent messages (0–7 days). Sends a DM if they are still in the server.' },
+                        { name: '/timeout', value: 'Apply a Discord native timeout. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }
+                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
+                help_notes: new EmbedBuilder().setColor('#9b59b6').setTitle('Note Commands')
+                    .addFields(
+                        { name: '/note add', value: 'Add a private mod note to a user. Not visible to the user — for internal tracking only.' },
+                        { name: '/note view', value: 'View all notes on a user, with timestamps and which mod added them.' },
+                        { name: '/note delete', value: 'Delete a note by its ID (shown in `/note view`).' }
+                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
                 help_features: new EmbedBuilder().setColor('#9b59b6').setTitle('Other Features')
                     .addFields(
                         { name: 'Warning expiry DMs', value: 'Users are DM\'d when a warning is issued and again when it expires and the role is removed.' },
@@ -400,11 +447,13 @@ client.on('interactionCreate', async interaction => {
             if (!embed) return;
             const helpButtons = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('help_warn').setLabel('Warnings').setStyle(customId === 'help_warn' ? ButtonStyle.Success : ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('help_mod').setLabel('Moderation').setStyle(customId === 'help_mod' ? ButtonStyle.Success : ButtonStyle.Primary),
                 new ButtonBuilder().setCustomId('help_config').setLabel('Config').setStyle(customId === 'help_config' ? ButtonStyle.Success : ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('help_escalation').setLabel('Escalation').setStyle(customId === 'help_escalation' ? ButtonStyle.Success : ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(customId === 'help_storage' ? ButtonStyle.Success : ButtonStyle.Secondary)
+                new ButtonBuilder().setCustomId('help_escalation').setLabel('Escalation').setStyle(customId === 'help_escalation' ? ButtonStyle.Success : ButtonStyle.Primary)
             );
             const helpButtons2 = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('help_notes').setLabel('Notes').setStyle(customId === 'help_notes' ? ButtonStyle.Success : ButtonStyle.Secondary),
+                new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(customId === 'help_storage' ? ButtonStyle.Success : ButtonStyle.Secondary),
                 new ButtonBuilder().setCustomId('help_features').setLabel('Features').setStyle(customId === 'help_features' ? ButtonStyle.Success : ButtonStyle.Secondary),
                 new ButtonBuilder().setCustomId('help_back').setLabel('Back').setStyle(ButtonStyle.Secondary)
             );
@@ -417,11 +466,13 @@ client.on('interactionCreate', async interaction => {
                 .setFooter({ text: 'Mod commands require the configured access role or Administrator' });
             const helpButtons = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('help_warn').setLabel('Warnings').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('help_mod').setLabel('Moderation').setStyle(ButtonStyle.Primary),
                 new ButtonBuilder().setCustomId('help_config').setLabel('Config').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('help_escalation').setLabel('Escalation').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(ButtonStyle.Secondary)
+                new ButtonBuilder().setCustomId('help_escalation').setLabel('Escalation').setStyle(ButtonStyle.Primary)
             );
             const helpButtons2 = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('help_notes').setLabel('Notes').setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(ButtonStyle.Secondary),
                 new ButtonBuilder().setCustomId('help_features').setLabel('Features').setStyle(ButtonStyle.Secondary)
             );
             return interaction.update({ embeds: [helpOverview], components: [helpButtons, helpButtons2] });
@@ -491,7 +542,7 @@ client.on('interactionCreate', async interaction => {
 
     guildConfigs[guildId] ??= { levels: {} };
 
-    const restrictedCommands = ['config', 'warn', 'unwarn', 'timeout', 'warnlist', 'history', 'escalation'];
+    const restrictedCommands = ['config', 'warn', 'unwarn', 'timeout', 'kick', 'ban', 'note', 'warnlist', 'history', 'escalation'];
     if (restrictedCommands.includes(commandName) && !hasCommandPermission(interaction, guildId)) {
         const accessRole = guildConfigs[guildId]?.accessRoleId;
         return interaction.reply({
@@ -506,11 +557,13 @@ client.on('interactionCreate', async interaction => {
             .setFooter({ text: 'Mod commands require the configured access role or Administrator' });
         const helpButtons = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId('help_warn').setLabel('Warnings').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('help_mod').setLabel('Moderation').setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId('help_config').setLabel('Config').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId('help_escalation').setLabel('Escalation').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(ButtonStyle.Secondary)
+            new ButtonBuilder().setCustomId('help_escalation').setLabel('Escalation').setStyle(ButtonStyle.Primary)
         );
         const helpButtons2 = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('help_notes').setLabel('Notes').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId('help_features').setLabel('Features').setStyle(ButtonStyle.Secondary)
         );
         await interaction.reply({ embeds: [helpOverview], components: [helpButtons, helpButtons2], flags: [MessageFlags.Ephemeral] });
@@ -571,6 +624,14 @@ Duration: ${data.durationDisplay}`, inline: true });
             const result = await applyWarning(interaction.guild, member, user, guildId, level, reason, interaction.channel.id, interaction.user.tag);
             if (result.error) return interaction.reply({ content: `❌ ${result.error}`, flags: [MessageFlags.Ephemeral] });
             console.log(`🔒 [AUDIT] ${interaction.user.tag} warned ${user.tag} (Level ${level}) in ${interaction.guild.name}`);
+            await logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#ff0000').setTitle('Warning Issued')
+                .addFields(
+                    { name: 'User', value: `${user} (${user.tag})`, inline: true },
+                    { name: 'Level', value: `${level}`, inline: true },
+                    { name: 'Duration', value: result.config.durationDisplay || 'Unknown', inline: true },
+                    { name: 'Reason', value: reason },
+                    { name: 'Moderator', value: `${interaction.user}` }
+                ).setTimestamp());
             await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ Warning Issued')
                 .addFields(
                     { name: 'User', value: `${user}`, inline: true },
@@ -643,6 +704,14 @@ Duration: ${data.durationDisplay}`, inline: true });
             const durationDisplay = formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds);
             const expiresTs = Math.floor((Date.now() + duration.totalMs) / 1000);
             console.log(`🔒 [AUDIT] ${interaction.user.tag} timed out ${user.tag} for ${durationDisplay} in ${interaction.guild.name}`);
+            await logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#ff6600').setTitle('Member Timed Out')
+                .addFields(
+                    { name: 'User', value: `${user} (${user.tag})`, inline: true },
+                    { name: 'Duration', value: durationDisplay, inline: true },
+                    { name: 'Expires', value: `<t:${expiresTs}:R>`, inline: true },
+                    { name: 'Reason', value: reason },
+                    { name: 'Moderator', value: `${interaction.user}` }
+                ).setTimestamp());
             user.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('🔇 You Have Been Timed Out')
                 .setDescription(`You were timed out in **${interaction.guild.name}**.`)
                 .addFields(
@@ -705,11 +774,127 @@ Duration: ${data.durationDisplay}`, inline: true });
             .setDescription(`${entries.length} total warning${entries.length > 1 ? 's' : ''} on record.`)
             .setTimestamp();
         for (const e of entries.slice(-10)) {
-            const status = e.endReason === 'expired' ? '✅ Expired' : e.endReason === 'manual' ? '🔓 Removed' : '⏳ Active';
-            embed.addFields({ name: `Level ${e.level} — ${e.roleName} — <t:${Math.floor(e.issuedAt / 1000)}:d>`, value: `${status} • by ${e.issuedBy}\n${e.reason}` });
+            if (e.type === 'kick') {
+                embed.addFields({ name: `Kick — <t:${Math.floor(e.issuedAt / 1000)}:d>`, value: `by ${e.issuedBy}\n${e.reason}` });
+            } else if (e.type === 'ban') {
+                embed.addFields({ name: `Ban — <t:${Math.floor(e.issuedAt / 1000)}:d>`, value: `by ${e.issuedBy}\n${e.reason}` });
+            } else {
+                const status = e.endReason === 'expired' ? '✅ Expired' : e.endReason === 'manual' ? '🔓 Removed' : '⏳ Active';
+                embed.addFields({ name: `Level ${e.level} — ${e.roleName} — <t:${Math.floor(e.issuedAt / 1000)}:d>`, value: `${status} • by ${e.issuedBy}\n${e.reason}` });
+            }
         }
         if (entries.length > 10) embed.setFooter({ text: `Showing last 10 of ${entries.length} entries` });
         await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+    }
+
+    else if (commandName === 'kick') {
+        const user = interaction.options.getUser('user');
+        const member = interaction.guild.members.cache.get(user.id);
+        const reason = interaction.options.getString('reason').slice(0, 512).replace(/[\x00-\x1F\x7F]/g, '');
+        if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
+        const botMember = interaction.guild.members.me;
+        if (!botMember.permissions.has(PermissionFlagsBits.KickMembers)) return interaction.reply({ content: '❌ I need the "Kick Members" permission.', flags: [MessageFlags.Ephemeral] });
+        if (member.roles.highest.position >= botMember.roles.highest.position) return interaction.reply({ content: '❌ I cannot kick this user — their role is equal to or above mine.', flags: [MessageFlags.Ephemeral] });
+        try {
+            user.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('You have been kicked')
+                .setDescription(`You were kicked from **${interaction.guild.name}**.`)
+                .addFields({ name: 'Reason', value: reason }).setTimestamp()]
+            }).catch(() => {});
+            await member.kick(reason);
+            const histEntry = { guildId, userId: user.id, userTag: user.tag, type: 'kick', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() };
+            addHistory(guildId, histEntry);
+            console.log(`🔒 [AUDIT] ${interaction.user.tag} kicked ${user.tag} from ${interaction.guild.name}`);
+            const logEmbed = new EmbedBuilder().setColor('#ff6600').setTitle('Member Kicked')
+                .addFields(
+                    { name: 'User', value: `${user} (${user.tag})`, inline: true },
+                    { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                    { name: 'Reason', value: reason }
+                ).setTimestamp();
+            await logMod(interaction.guild, guildId, logEmbed);
+            await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('Member Kicked')
+                .addFields(
+                    { name: 'User', value: `${user}`, inline: true },
+                    { name: 'Reason', value: reason },
+                    { name: 'Kicked by', value: `${interaction.user}` }
+                ).setTimestamp()]
+            });
+        } catch (error) {
+            console.error(error);
+            await interaction.reply({ content: '❌ Failed to kick user. Check permissions.', flags: [MessageFlags.Ephemeral] });
+        }
+    }
+
+    else if (commandName === 'ban') {
+        const user = interaction.options.getUser('user');
+        const member = interaction.guild.members.cache.get(user.id);
+        const reason = interaction.options.getString('reason').slice(0, 512).replace(/[\x00-\x1F\x7F]/g, '');
+        const deleteDays = interaction.options.getInteger('delete_days') ?? 0;
+        const botMember = interaction.guild.members.me;
+        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) return interaction.reply({ content: '❌ I need the "Ban Members" permission.', flags: [MessageFlags.Ephemeral] });
+        if (member && member.roles.highest.position >= botMember.roles.highest.position) return interaction.reply({ content: '❌ I cannot ban this user — their role is equal to or above mine.', flags: [MessageFlags.Ephemeral] });
+        try {
+            if (member) {
+                user.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('You have been banned')
+                    .setDescription(`You were banned from **${interaction.guild.name}**.`)
+                    .addFields({ name: 'Reason', value: reason }).setTimestamp()]
+                }).catch(() => {});
+            }
+            await interaction.guild.members.ban(user, { reason, deleteMessageDays: deleteDays });
+            const histEntry = { guildId, userId: user.id, userTag: user.tag, type: 'ban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), deleteDays };
+            addHistory(guildId, histEntry);
+            console.log(`🔒 [AUDIT] ${interaction.user.tag} banned ${user.tag} from ${interaction.guild.name}`);
+            const logEmbed = new EmbedBuilder().setColor('#ff0000').setTitle('Member Banned')
+                .addFields(
+                    { name: 'User', value: `${user} (${user.tag})`, inline: true },
+                    { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                    { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true },
+                    { name: 'Reason', value: reason }
+                ).setTimestamp();
+            await logMod(interaction.guild, guildId, logEmbed);
+            await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Member Banned')
+                .addFields(
+                    { name: 'User', value: `${user}`, inline: true },
+                    { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true },
+                    { name: 'Reason', value: reason },
+                    { name: 'Banned by', value: `${interaction.user}` }
+                ).setTimestamp()]
+            });
+        } catch (error) {
+            console.error(error);
+            await interaction.reply({ content: '❌ Failed to ban user. Check permissions.', flags: [MessageFlags.Ephemeral] });
+        }
+    }
+
+    else if (commandName === 'note') {
+        const sub = interaction.options.getSubcommand();
+        const user = interaction.options.getUser('user');
+        modNotes[guildId] ??= {};
+        modNotes[guildId][user.id] ??= [];
+        const notes = modNotes[guildId][user.id];
+
+        if (sub === 'add') {
+            const text = interaction.options.getString('text').slice(0, 1000).replace(/[\x00-\x1F\x7F]/g, '');
+            const note = { id: Date.now(), text, addedBy: interaction.user.tag, addedAt: Date.now() };
+            notes.push(note);
+            saveNotes();
+            console.log(`🔒 [AUDIT] ${interaction.user.tag} added note to ${user.tag} in ${interaction.guild.name}`);
+            await interaction.reply({ content: `✅ Note added to ${user} (ID: \`${note.id}\`).`, flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'view') {
+            if (!notes.length) return interaction.reply({ content: `📋 No notes found for ${user}.`, flags: [MessageFlags.Ephemeral] });
+            const embed = new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`)
+                .setDescription(`${notes.length} note${notes.length > 1 ? 's' : ''} on record.`).setTimestamp();
+            for (const n of notes.slice(-10))
+                embed.addFields({ name: `ID: ${n.id} — <t:${Math.floor(n.addedAt / 1000)}:d> — ${n.addedBy}`, value: n.text });
+            if (notes.length > 10) embed.setFooter({ text: `Showing last 10 of ${notes.length} notes` });
+            await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'delete') {
+            const id = interaction.options.getInteger('id');
+            const idx = notes.findIndex(n => n.id === id);
+            if (idx === -1) return interaction.reply({ content: `❌ Note ID \`${id}\` not found for ${user}.`, flags: [MessageFlags.Ephemeral] });
+            notes.splice(idx, 1);
+            saveNotes();
+            await interaction.reply({ content: `✅ Note \`${id}\` deleted.`, flags: [MessageFlags.Ephemeral] });
+        }
     }
 
     else if (commandName === 'escalation') {
