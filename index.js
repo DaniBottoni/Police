@@ -712,6 +712,4 @@ const server = http.createServer((req, res) => {
     res.writeHead(ok ? 200 : 404, { 'Content-Type': 'text/plain' });
     res.end(ok ? 'Police bot is running!' : 'Not found');
 });
-server.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));s.end(ok ? 'Police bot is running!' : 'Not found');
-});
 server.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
