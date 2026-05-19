@@ -67,7 +67,7 @@ async function saveFileToGitHub(filePath, fileName, commitMessage) {
 
 async function showAccessControlConfig(interaction, guildId) {
     const embed = new EmbedBuilder().setColor('#5865F2').setTitle('🔒 Access Configuration')
-        .setDescription('Select which role should have access to moderation commands:\n\n**Commands affected:**\n• `/warn` `/unwarn` `/timeout` `/config set/view`\n• `/accessconfig` `/warnlist` `/history` `/escalation`\n\n**Note:** Server administrators always have access.')
+        .setDescription('Select which role should have access to moderation commands:\n\n**Commands affected:**\n• `/warn` `/unwarn` `/timeout` `/config set/view`\n• `/config access` `/warnlist` `/history` `/escalation`\n\n**Note:** Server administrators always have access.')
         .setFooter({ text: 'Select a role from the dropdown below' });
     const row = new ActionRowBuilder().addComponents(
         new RoleSelectMenuBuilder().setCustomId(`access_role_${guildId}`).setPlaceholder('Select a role for command access').setMinValues(1).setMaxValues(1)
@@ -267,8 +267,8 @@ client.once('ready', () => {
                 .addIntegerOption(o => o.setName('level').setDescription('Warning level (1, 2, 3...)').setRequired(true))
                 .addRoleOption(o => o.setName('role').setDescription('Role to assign').setRequired(true))
                 .addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)))
-            .addSubcommand(s => s.setName('view').setDescription('View all configured warning levels')),
-        new SlashCommandBuilder().setName('accessconfig').setDescription('Configure which role can access moderation commands'),
+            .addSubcommand(s => s.setName('view').setDescription('View all configured warning levels'))
+            .addSubcommand(s => s.setName('access').setDescription('Set which role can use moderation commands')),
         new SlashCommandBuilder().setName('mywarnings').setDescription('Check how much time is left on your warnings'),
         new SlashCommandBuilder().setName('warnlist').setDescription('View all active warnings in this server'),
         new SlashCommandBuilder().setName('history').setDescription('View warning history for a user')
@@ -304,7 +304,7 @@ client.on('guildCreate', async guild => {
         const inviterId = entry?.executor?.id;
         if (guild.systemChannel) {
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle('👋 Thanks for adding Police Bot!')
-                .setDescription(`${inviterId ? `<@${inviterId}>, please` : 'An administrator should'} run \`/accessconfig\` to set up command permissions.\n\n**Quick Start:**\n1. \`/accessconfig\` — set the moderator role\n2. \`/config\` — set up warning levels\n3. \`/warn\` — start moderating!`)
+                .setDescription(`${inviterId ? `<@${inviterId}>, please` : 'An administrator should'} run \`/config access\` to set up command permissions.\n\n**Quick Start:**\n1. \`/config access\` — set the moderator role\n2. \`/config\` — set up warning levels\n3. \`/warn\` — start moderating!`)
                 .setFooter({ text: 'Use /help to see all commands' });
             await guild.systemChannel.send({ embeds: [embed] }).catch(e => console.log(`⚠️ Could not send setup message: ${e.message}`));
         }
@@ -332,7 +332,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isRoleSelectMenu()) {
         if (!interaction.customId.startsWith('access_role_')) return;
         const guildId = interaction.customId.replace('access_role_', '');
-        if (guildId !== interaction.guild.id) return interaction.reply({ content: '❌ Invalid interaction. Please run /accessconfig again.', flags: [MessageFlags.Ephemeral] });
+        if (guildId !== interaction.guild.id) return interaction.reply({ content: '❌ Invalid interaction. Please run /config access again.', flags: [MessageFlags.Ephemeral] });
         const selectedRole = interaction.roles.first();
         if (!selectedRole) return interaction.reply({ content: '❌ No role selected.', flags: [MessageFlags.Ephemeral] });
         if (selectedRole.id === interaction.guild.id) return interaction.update({ content: '❌ Cannot use @everyone as access role.', components: [] });
@@ -417,11 +417,11 @@ client.on('interactionCreate', async interaction => {
 
     guildConfigs[guildId] ??= { levels: {} };
 
-    const restrictedCommands = ['config', 'warn', 'unwarn', 'timeout', 'accessconfig', 'warnlist', 'history', 'escalation'];
+    const restrictedCommands = ['config', 'warn', 'unwarn', 'timeout', 'warnlist', 'history', 'escalation'];
     if (restrictedCommands.includes(commandName) && !hasCommandPermission(interaction, guildId)) {
         const accessRole = guildConfigs[guildId]?.accessRoleId;
         return interaction.reply({
-            content: `❌ You don't have permission to use this command.\n\n**Required:** Administrator OR ${accessRole ? `<@&${accessRole}>` : 'no access role configured'}\n\nAsk an admin to run \`/accessconfig\`.`,
+            content: `❌ You don't have permission to use this command.\n\n**Required:** Administrator OR ${accessRole ? `<@&${accessRole}>` : 'no access role configured'}\n\nAsk an admin to run \`/config access\`.`,
             flags: [MessageFlags.Ephemeral]
         });
     }
@@ -431,7 +431,7 @@ client.on('interactionCreate', async interaction => {
             embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('📖 Police Bot — Commands')
                 .addFields(
                     { name: '⚠️ Warn', value: '`/warn` — warn a user at a configured level\n`/unwarn` — remove a warning (with confirmation)\n`/timeout` — apply a Discord timeout\n`/mywarnings` — check your own active warnings\n`/warnlist` — see all active warnings\n`/history` — view a user\'s full warning history' },
-                    { name: '⚙️ Config', value: '`/config` — set up a warning level (role + duration)\n`/config view` — view all configured levels\n`/accessconfig` — set the moderator role' },
+                    { name: '⚙️ Config', value: '`/config` — set up a warning level (role + duration)\n`/config view` — view all configured levels\n`/config access` — set the moderator role' },
                     { name: '⬆️ Escalation', value: '`/escalation set` — set a threshold to auto-escalate\n`/escalation remove` — remove a threshold\n`/escalation setcap` / `removecap` — set/remove the level cap\n`/escalation settimeout` — timeout on escalation to a level\n`/escalation removetimeout` — remove that timeout\n`/escalation view` — view all rules' },
                     { name: '❓ Other', value: '`/help` — this menu' }
                 ).setFooter({ text: 'Mod commands require the configured access role or Administrator' })],
@@ -439,13 +439,11 @@ client.on('interactionCreate', async interaction => {
         });
     }
 
-    else if (commandName === 'accessconfig') {
-        await showAccessControlConfig(interaction, guildId);
-    }
-
     else if (commandName === 'config') {
         const sub = interaction.options.getSubcommand();
-        if (sub === 'set') {
+        if (sub === 'access') {
+            await showAccessControlConfig(interaction, guildId);
+        } else if (sub === 'set') {
             const level = interaction.options.getInteger('level');
             const role = interaction.options.getRole('role');
             const durationStr = interaction.options.getString('duration');
