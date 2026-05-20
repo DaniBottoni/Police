@@ -1040,6 +1040,7 @@ client.on('interactionCreate', async interaction => {
     }
 
   } catch (error) {
+      if (error?.code === 40060) return; // already acknowledged, ignore
       console.error('❌ Interaction error:', error);
       try {
           const msg = { content: '❌ Something went wrong. Please try again.', flags: [MessageFlags.Ephemeral] };
