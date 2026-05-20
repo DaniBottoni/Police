@@ -1,81 +1,133 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle } = require('discord.js');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 const http = require('http');
 const https = require('https');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-const configPath   = path.join(__dirname, 'config.json');
-const warningsPath = path.join(__dirname, 'warnings.json');
-const historyPath  = path.join(__dirname, 'history.json');
-const notesPath    = path.join(__dirname, 'notes.json');
-
-function loadJSON(filePath, label, fallback) {
-    if (!fs.existsSync(filePath)) return fallback;
-    try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-        console.log(`✅ Loaded ${label} successfully`);
-        return data;
-    } catch (e) {
-        console.error(`❌ Failed to load ${label}:`, e.message);
-        return fallback;
-    }
+// ── DB init ────────────────────────────────────────────────────────────────
+async function initDB() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS configs (
+            guild_id TEXT PRIMARY KEY,
+            data JSONB NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE IF NOT EXISTS warnings (
+            key TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            data JSONB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS history (
+            id SERIAL PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            data JSONB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS notes (
+            id BIGINT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            data JSONB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS warnings_guild_user ON warnings(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS history_guild_user  ON history(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS notes_guild_user    ON notes(guild_id, user_id);
+    `);
+    console.log('✅ Database initialised');
 }
 
-let guildConfigs   = loadJSON(configPath,   'config.json',   {});
-let activeWarnings = loadJSON(warningsPath, 'warnings.json', {});
-let warnHistory    = loadJSON(historyPath,  'history.json',  {});
-let modNotes       = loadJSON(notesPath,    'notes.json',    {});
+// ── Config helpers ─────────────────────────────────────────────────────────
+const configCache = new Map();
 
-function saveConfigs() {
-    fs.writeFileSync(configPath, JSON.stringify(guildConfigs, null, 2));
-    saveFileToGitHub(configPath, 'config.json', 'Auto-save: Update config.json').catch(e => console.error('Config GitHub save failed:', e.message));
+async function getConfig(guildId) {
+    if (configCache.has(guildId)) return configCache.get(guildId);
+    const res = await pool.query('SELECT data FROM configs WHERE guild_id = $1', [guildId]);
+    const data = res.rows[0]?.data ?? { levels: {} };
+    configCache.set(guildId, data);
+    return data;
 }
-function saveWarnings() {
-    fs.writeFileSync(warningsPath, JSON.stringify(activeWarnings, null, 2));
-    saveFileToGitHub(warningsPath, 'warnings.json', 'Auto-save: Update warnings.json').catch(e => console.error('Warning GitHub save failed:', e.message));
-}
-function saveHistory() {
-    fs.writeFileSync(historyPath, JSON.stringify(warnHistory, null, 2));
-    saveFileToGitHub(historyPath, 'history.json', 'Auto-save: Update history.json').catch(e => console.error('History GitHub save failed:', e.message));
-}
-function saveNotes() {
-    fs.writeFileSync(notesPath, JSON.stringify(modNotes, null, 2));
-    saveFileToGitHub(notesPath, 'notes.json', 'Auto-save: Update notes.json').catch(e => console.error('Notes GitHub save failed:', e.message));
+async function saveConfig(guildId, data) {
+    configCache.set(guildId, data);
+    await pool.query(
+        'INSERT INTO configs (guild_id, data) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET data = $2',
+        [guildId, data]
+    );
 }
 
+// ── Warning helpers ────────────────────────────────────────────────────────
+const activeWarnings = new Map(); // key → data (in-memory for fast timer access)
+
+async function loadAllWarnings() {
+    const res = await pool.query('SELECT key, data FROM warnings');
+    for (const { key, data } of res.rows) activeWarnings.set(key, data);
+    console.log(`🔄 Loaded ${activeWarnings.size} active warnings from DB`);
+}
+async function saveWarning(key, data) {
+    activeWarnings.set(key, data);
+    await pool.query(
+        'INSERT INTO warnings (key, guild_id, user_id, data) VALUES ($1, $2, $3, $4) ON CONFLICT (key) DO UPDATE SET data = $4',
+        [key, data.guildId, data.userId, data]
+    );
+}
+async function deleteWarning(key) {
+    activeWarnings.delete(key);
+    await pool.query('DELETE FROM warnings WHERE key = $1', [key]);
+}
+
+// ── History helpers ────────────────────────────────────────────────────────
+async function addHistory(guildId, userId, entry) {
+    await pool.query(
+        'INSERT INTO history (guild_id, user_id, data) VALUES ($1, $2, $3)',
+        [guildId, userId, entry]
+    );
+}
+async function getHistory(guildId, userId) {
+    const res = await pool.query(
+        'SELECT data FROM history WHERE guild_id = $1 AND user_id = $2 ORDER BY id DESC LIMIT 10',
+        [guildId, userId]
+    );
+    return res.rows.map(r => r.data).reverse();
+}
+
+// ── Notes helpers ──────────────────────────────────────────────────────────
+async function getNotes(guildId, userId) {
+    const res = await pool.query(
+        'SELECT data FROM notes WHERE guild_id = $1 AND user_id = $2 ORDER BY id',
+        [guildId, userId]
+    );
+    return res.rows.map(r => r.data);
+}
+async function addNote(guildId, userId, note) {
+    await pool.query(
+        'INSERT INTO notes (id, guild_id, user_id, data) VALUES ($1, $2, $3, $4)',
+        [note.id, guildId, userId, note]
+    );
+}
+async function deleteNote(guildId, userId, id) {
+    const res = await pool.query(
+        'DELETE FROM notes WHERE guild_id = $1 AND user_id = $2 AND id = $3',
+        [guildId, userId, id]
+    );
+    return res.rowCount > 0;
+}
+
+// ── Mod log ────────────────────────────────────────────────────────────────
 async function logMod(guild, guildId, embed) {
-    const channelId = guildConfigs[guildId]?.logChannelId;
+    const config = await getConfig(guildId);
+    const channelId = config.logChannelId;
     if (!channelId) return;
     const channel = guild.channels.cache.get(channelId);
     if (channel) await channel.send({ embeds: [embed] }).catch(e => console.error('Log channel send failed:', e.message));
 }
-function addHistory(guildId, entry) {
-    warnHistory[guildId] ??= [];
-    warnHistory[guildId].push(entry);
-    if (warnHistory[guildId].length > 1000) warnHistory[guildId] = warnHistory[guildId].slice(-1000);
-    saveHistory();
-}
 
-async function saveFileToGitHub(filePath, fileName, commitMessage) {
-    const { GITHUB_TOKEN: token, GITHUB_OWNER: owner, GITHUB_REPO: repo } = process.env;
-    if (!token || !owner || !repo) { console.warn(`⚠️ GitHub save skipped for ${fileName}`); return false; }
-    try {
-        const base64Content = Buffer.from(fs.readFileSync(filePath, 'utf8')).toString('base64');
-        const getRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${fileName}`, {
-            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'Police-Discord-Bot' }
-        });
-        const sha = getRes.ok ? (await getRes.json()).sha : null;
-        const updateRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${fileName}`, {
-            method: 'PUT',
-            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json', 'User-Agent': 'Police-Discord-Bot' },
-            body: JSON.stringify({ message: commitMessage, content: base64Content, branch: 'main', ...(sha && { sha }) })
-        });
-        if (updateRes.ok) { console.log(`💾 ${fileName} saved to GitHub`); return true; }
-        console.error(`❌ GitHub save failed:`, (await updateRes.json()).message);
-        return false;
-    } catch (e) { console.error(`❌ GitHub save error:`, e.message); return false; }
+// ── Permission check ───────────────────────────────────────────────────────
+async function hasCommandPermission(interaction, guildId) {
+    const member = interaction.member;
+    if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+    const config = await getConfig(guildId);
+    return config.accessRoleId ? member.roles.cache.has(config.accessRoleId) : false;
 }
 
 async function showAccessControlConfig(interaction, guildId) {
@@ -88,13 +140,7 @@ async function showAccessControlConfig(interaction, guildId) {
     await interaction.reply({ embeds: [embed], components: [row], flags: [MessageFlags.Ephemeral] });
 }
 
-function hasCommandPermission(interaction, guildId) {
-    const member = interaction.member;
-    if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-    const accessRoleId = guildConfigs[guildId]?.accessRoleId;
-    return accessRoleId ? member.roles.cache.has(accessRoleId) : false;
-}
-
+// ── Duration helpers ───────────────────────────────────────────────────────
 function parseDuration(durationStr) {
     if (durationStr.toLowerCase() === 'forever') return { days: 0, hours: 0, minutes: 0, seconds: 0, totalMs: null, isForever: true };
     const parts = durationStr.split(':').map(p => { const n = parseInt(p.trim()); return (n < 0 || n > 9999) ? NaN : n; });
@@ -106,18 +152,18 @@ function parseDuration(durationStr) {
     const totalMs = (days * 86400 + hours * 3600 + minutes * 60 + seconds) * 1000;
     return (totalMs <= 0 || totalMs > 365 * 86400 * 1000) ? null : { days, hours, minutes, seconds, totalMs, isForever: false };
 }
-
 function formatDuration(days, hours, minutes, seconds, isForever = false) {
     if (isForever) return 'Forever';
     return [days && `${days}d`, hours && `${hours}h`, minutes && `${minutes}m`, seconds && `${seconds}s`].filter(Boolean).join(' ') || '0s';
 }
 
+// ── Warning timers ─────────────────────────────────────────────────────────
 const warningTimers = new Map();
 const pendingUnwarns = new Map();
 const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000;
 
 async function handleWarningExpiry(warningKey, guildId, userId, roleId, channelId) {
-    const w = activeWarnings[warningKey];
+    const w = activeWarnings.get(warningKey);
     try {
         const guild = client.guilds.cache.get(guildId);
         if (!guild) return;
@@ -142,22 +188,22 @@ async function handleWarningExpiry(warningKey, guildId, userId, roleId, channelI
             if (channel) await channel.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('❌ Warning Removal Failed').setDescription(`Could not remove role from <@${userId}>. Check bot permissions.`).setTimestamp()] });
         } catch {}
     }
-    if (w) addHistory(guildId, { ...w, endedAt: Date.now(), endReason: 'expired' });
+    if (w) await addHistory(guildId, userId, { ...w, endedAt: Date.now(), endReason: 'expired' });
     warningTimers.delete(warningKey);
-    delete activeWarnings[warningKey];
-    saveWarnings();
+    await deleteWarning(warningKey);
 }
 
-async function scheduleWarningRemoval(warningKey, guildId, userId, roleId, expiresAt, channelId) {
+function scheduleWarningRemoval(warningKey, guildId, userId, roleId, expiresAt, channelId) {
     const timeLeft = expiresAt - Date.now();
     if (timeLeft <= 0) return handleWarningExpiry(warningKey, guildId, userId, roleId, channelId);
     warningTimers.set(warningKey, setTimeout(() => handleWarningExpiry(warningKey, guildId, userId, roleId, channelId), timeLeft));
 }
 
 async function applyWarning(guild, member, user, guildId, level, reason, channelId, issuedByTag) {
-    const config = guildConfigs[guildId].levels[level];
-    const role = guild.roles.cache.get(config?.roleId);
-    if (!config || !role) return { error: `Level ${level} config or role not found.` };
+    const config = await getConfig(guildId);
+    const levelConfig = config.levels[level];
+    const role = guild.roles.cache.get(levelConfig?.roleId);
+    if (!levelConfig || !role) return { error: `Level ${level} config or role not found.` };
     const botMember = guild.members.me;
     if (role.position >= botMember.roles.highest.position) return { error: `Role hierarchy: my role must be above ${role.name}.` };
     await member.roles.add(role);
@@ -165,58 +211,56 @@ async function applyWarning(guild, member, user, guildId, level, reason, channel
         .setDescription(`You have been warned in **${guild.name}**.`)
         .addFields(
             { name: 'Warning Level', value: `${level}`, inline: true },
-            { name: 'Duration', value: config.durationDisplay || 'Unknown', inline: true },
+            { name: 'Duration', value: levelConfig.durationDisplay || 'Unknown', inline: true },
             { name: 'Reason', value: reason }
         ).setFooter({ text: `Use /mywarnings in ${guild.name} to check when this warning expires` }).setTimestamp()]
     }).catch(() => {});
     const baseEntry = { guildId, userId: user.id, userTag: user.tag, roleId: role.id, roleName: role.name, level, reason, issuedBy: issuedByTag, issuedAt: Date.now() };
     const warningKey = `${guildId}-${user.id}-${level}-${Date.now()}`;
-    if (!config.isForever) {
-        const expiresAt = Date.now() + config.durationMs;
-        activeWarnings[warningKey] = { ...baseEntry, expiresAt, channelId, isForever: false };
-        saveWarnings();
+    if (!levelConfig.isForever) {
+        const expiresAt = Date.now() + levelConfig.durationMs;
+        const warnData = { ...baseEntry, expiresAt, channelId, isForever: false };
+        await saveWarning(warningKey, warnData);
         scheduleWarningRemoval(warningKey, guildId, user.id, role.id, expiresAt, channelId);
     } else {
-        activeWarnings[warningKey] = { ...baseEntry, expiresAt: null, channelId, isForever: true };
-        saveWarnings();
+        await saveWarning(warningKey, { ...baseEntry, expiresAt: null, channelId, isForever: true });
     }
-    return { success: true, role, config };
+    return { success: true, role, config: levelConfig };
 }
 
 async function checkEscalation(guild, member, user, guildId, level, channelId, issuedByTag) {
-    const esc = guildConfigs[guildId].escalation ?? {};
+    const config = await getConfig(guildId);
+    const esc = config.escalation ?? {};
     const cap = esc.cap;
     const nextLevel = level + 1;
     if (cap != null && nextLevel > cap) return { atCap: true, cap };
 
-    const count = Object.values(activeWarnings).filter(w => w.guildId === guildId && w.userId === user.id && w.level === level).length;
+    const count = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === user.id && w.level === level).length;
 
-    // Timeout-escalation: self-contained with its own threshold stored in timeouts[nextLevel].threshold
     const timeoutCfg = esc.timeouts?.[nextLevel];
     if (timeoutCfg?.threshold != null) {
         if (count < timeoutCfg.threshold) return { counted: true, count, threshold: timeoutCfg.threshold };
-        if (!guildConfigs[guildId].levels[nextLevel]) return { noNextLevel: true, nextLevel };
+        if (!config.levels[nextLevel]) return { noNextLevel: true, nextLevel };
         const result = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
         if (result.error) return { escalationError: result.error };
         await member.timeout(timeoutCfg.durationMs, `Auto-escalated to Level ${nextLevel}`).catch(e => console.error('Escalation timeout failed:', e.message));
         user.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('🔇 You Have Been Timed Out')
             .setDescription(`You were auto-timed-out in **${guild.name}** upon reaching Warning Level ${nextLevel}.`)
-            .addFields({ name: 'Timeout Duration', value: timeoutCfg.durationDisplay, inline: true })
-            .setTimestamp()]
+            .addFields({ name: 'Timeout Duration', value: timeoutCfg.durationDisplay, inline: true }).setTimestamp()]
         }).catch(() => {});
         return { escalated: true, nextLevel, role: result.role, config: result.config, hitCap: cap != null && nextLevel === cap, timedOut: true, timeoutDisplay: timeoutCfg.durationDisplay };
     }
 
-    // Regular threshold escalation (no timeout)
     const threshold = esc.thresholds?.[level];
     if (!threshold) return null;
     if (count < threshold) return { counted: true, count, threshold };
-    if (!guildConfigs[guildId].levels[nextLevel]) return { noNextLevel: true, nextLevel };
+    if (!config.levels[nextLevel]) return { noNextLevel: true, nextLevel };
     const result = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
     if (result.error) return { escalationError: result.error };
     return { escalated: true, nextLevel, role: result.role, config: result.config, hitCap: cap != null && nextLevel === cap, timedOut: false };
 }
 
+// ── Keep-alive ─────────────────────────────────────────────────────────────
 function keepAlive() {
     const ping = () => {
         const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
@@ -230,10 +274,11 @@ function keepAlive() {
     setInterval(ping, 14 * 60 * 1000);
 }
 
+// ── Warnlist helpers ───────────────────────────────────────────────────────
 const WARN_PAGE_SIZE = 10;
 
 function buildWarnlistEmbed(guildId, page) {
-    const allWarnings = Object.values(activeWarnings).filter(w => w.guildId === guildId);
+    const allWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId);
     const byUser = {};
     for (const w of allWarnings) { byUser[w.userId] ??= []; byUser[w.userId].push(w); }
     const userIds = Object.keys(byUser);
@@ -246,7 +291,6 @@ function buildWarnlistEmbed(guildId, page) {
         embed.addFields({ name: `<@${uid}>`, value: byUser[uid].map(w => `• Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') });
     return { embed, totalPages, page };
 }
-
 function warnlistRow(page, totalPages, guildId) {
     if (totalPages <= 1) return [];
     return [new ActionRowBuilder().addComponents(
@@ -255,13 +299,16 @@ function warnlistRow(page, totalPages, guildId) {
     )];
 }
 
-client.once('ready', () => {
+// ── Bot ready ──────────────────────────────────────────────────────────────
+client.once('ready', async () => {
     console.log(`✅ Police bot is online as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: 'Monitoring the security cameras', type: ActivityType.Watching }], status: 'online' });
-    console.log(`🔄 Restoring ${Object.keys(activeWarnings).length} active warnings...`);
-    for (const [key, w] of Object.entries(activeWarnings)) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
+    await initDB();
+    await loadAllWarnings();
+    for (const [key, w] of activeWarnings.entries()) {
+        if (!w.isForever) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
+    }
     keepAlive();
-    console.log('🏓 Keep-alive system started');
 
     const commands = [
         new SlashCommandBuilder().setName('warn').setDescription('Give a warning to a user')
@@ -275,7 +322,6 @@ client.once('ready', () => {
             .addUserOption(o => o.setName('user').setDescription('User to timeout').setRequired(true))
             .addStringOption(o => o.setName('duration').setDescription('Duration (m:s / h:m:s / d:h:m:s, max 28 days)').setRequired(true))
             .addStringOption(o => o.setName('reason').setDescription('Reason for the timeout')),
-
         new SlashCommandBuilder().setName('mywarnings').setDescription('Check how much time is left on your warnings'),
         new SlashCommandBuilder().setName('warnlist').setDescription('View all active warnings in this server'),
         new SlashCommandBuilder().setName('history').setDescription('View warning history for a user')
@@ -326,27 +372,31 @@ client.once('ready', () => {
     ].map(c => c.toJSON());
 
     client.application.commands.set(commands);
+    console.log('✅ Commands registered');
 });
 
+// ── Guild join ─────────────────────────────────────────────────────────────
 client.on('guildCreate', async guild => {
     console.log(`Bot joined: ${guild.name} (${guild.id})`);
-    if (!guildConfigs[guild.id]) { guildConfigs[guild.id] = { levels: {} }; saveConfigs(); }
+    const existing = await getConfig(guild.id);
+    if (!existing.levels) await saveConfig(guild.id, { levels: {} });
     try {
         const logs = await guild.fetchAuditLogs({ type: 28, limit: 5 });
         const entry = logs.entries.find(e => e.target?.id === client.user.id && Date.now() - e.createdTimestamp < 60000);
         const inviterId = entry?.executor?.id;
         if (guild.systemChannel) {
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle('👋 Thanks for adding Police Bot!')
-                .setDescription(`${inviterId ? `<@${inviterId}>, please` : 'An administrator should'} run \`/config access\` to set up command permissions.\n\n**Quick Start:**\n1. \`/config access\` — set the moderator role\n2. \`/config\` — set up warning levels\n3. \`/warn\` — start moderating!`)
+                .setDescription(`${inviterId ? `<@${inviterId}>, please` : 'An administrator should'} run \`/config access\` to set up command permissions.\n\n**Quick Start:**\n1. \`/config access\` — set the moderator role\n2. \`/config set\` — set up warning levels\n3. \`/warn\` — start moderating!`)
                 .setFooter({ text: 'Use /help to see all commands' });
             await guild.systemChannel.send({ embeds: [embed] }).catch(e => console.log(`⚠️ Could not send setup message: ${e.message}`));
         }
     } catch (e) { console.error('Error in guildCreate:', e); }
 });
 
+// ── Rejoin protection ──────────────────────────────────────────────────────
 client.on('guildMemberAdd', async member => {
     const { guild, id: userId } = member;
-    const userWarnings = Object.entries(activeWarnings).filter(([, w]) => w.guildId === guild.id && w.userId === userId);
+    const userWarnings = [...activeWarnings.entries()].filter(([, w]) => w.guildId === guild.id && w.userId === userId);
     if (!userWarnings.length) return;
     console.log(`🔄 Reapplying ${userWarnings.length} warning(s) to rejoining user ${member.user.tag}`);
     for (const [, w] of userWarnings) {
@@ -360,8 +410,10 @@ client.on('guildMemberAdd', async member => {
     }).catch(() => {});
 });
 
+// ── Interactions ───────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
 
+    // Role select (config access)
     if (interaction.isRoleSelectMenu()) {
         if (!interaction.customId.startsWith('access_role_')) return;
         const guildId = interaction.customId.replace('access_role_', '');
@@ -370,9 +422,9 @@ client.on('interactionCreate', async interaction => {
         if (!selectedRole) return interaction.reply({ content: '❌ No role selected.', flags: [MessageFlags.Ephemeral] });
         if (selectedRole.id === interaction.guild.id) return interaction.update({ content: '❌ Cannot use @everyone as access role.', components: [] });
         if (selectedRole.managed) return interaction.update({ content: '❌ Cannot use managed/bot roles as access role.', components: [] });
-        guildConfigs[guildId] ??= { levels: {} };
-        guildConfigs[guildId].accessRoleId = selectedRole.id;
-        saveConfigs();
+        const config = await getConfig(guildId);
+        config.accessRoleId = selectedRole.id;
+        await saveConfig(guildId, config);
         await interaction.update({
             embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('✅ Access Control Updated')
                 .setDescription(`Members with the ${selectedRole} role can now use moderation commands.\n\n*Server administrators always have access.*`)
@@ -383,6 +435,7 @@ client.on('interactionCreate', async interaction => {
         return;
     }
 
+    // Buttons
     if (interaction.isButton()) {
         const { customId } = interaction;
 
@@ -396,6 +449,12 @@ client.on('interactionCreate', async interaction => {
                         { name: '/mywarnings', value: 'Check your own active warnings and how long is left on each one.' },
                         { name: '/warnlist', value: 'View all active warnings in the server, paginated 10 users per page.' },
                         { name: '/history', value: 'View the last 10 warning history entries for a specific user, including expired and manually removed warnings.' }
+                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
+                help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands')
+                    .addFields(
+                        { name: '/kick', value: 'Kick a user from the server. Sends a DM, logs to history, and posts to the mod-log channel.' },
+                        { name: '/ban', value: 'Ban a user. Optionally delete their recent messages (0–7 days). Sends a DM if they are still in the server.' },
+                        { name: '/timeout', value: 'Apply a Discord native timeout. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }
                     ).setFooter({ text: 'Use the buttons to explore other categories' }),
                 help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands')
                     .addFields(
@@ -414,31 +473,25 @@ client.on('interactionCreate', async interaction => {
                         { name: '/escalation removetimeout', value: 'Remove a timeout escalation rule for a level.' },
                         { name: '/escalation view', value: 'View all active escalation rules, thresholds, timeouts, and the level cap.' }
                     ).setFooter({ text: 'Use the buttons to explore other categories' }),
-                help_storage: new EmbedBuilder().setColor('#5865F2').setTitle('GitHub Storage')
-                    .setDescription('Police Bot uses your GitHub repository as persistent storage, so no data is lost when the bot restarts.')
-                    .addFields(
-                        { name: 'warnings.json', value: 'All active warnings with expiry timestamps, user IDs, role IDs, and channel IDs for timer restoration.' },
-                        { name: 'history.json', value: 'Full warning history per server — every warn ever issued, including expired and manually removed ones.' },
-                        { name: 'config.json', value: 'All per-server configuration: warning levels, roles, durations, escalation rules, timeout configs, and the access role.' },
-                        { name: 'Auto-save', value: 'Every write operation saves locally and pushes to GitHub in the background.' }
-                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
-                help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands')
-                    .addFields(
-                        { name: '/kick', value: 'Kick a user from the server. Sends a DM, logs to history, and posts to the mod-log channel.' },
-                        { name: '/ban', value: 'Ban a user. Optionally delete their recent messages (0–7 days). Sends a DM if they are still in the server.' },
-                        { name: '/timeout', value: 'Apply a Discord native timeout. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }
-                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
                 help_notes: new EmbedBuilder().setColor('#9b59b6').setTitle('Note Commands')
                     .addFields(
                         { name: '/note add', value: 'Add a private mod note to a user. Not visible to the user — for internal tracking only.' },
                         { name: '/note view', value: 'View all notes on a user, with timestamps and which mod added them.' },
                         { name: '/note delete', value: 'Delete a note by its ID (shown in `/note view`).' }
                     ).setFooter({ text: 'Use the buttons to explore other categories' }),
+                help_storage: new EmbedBuilder().setColor('#5865F2').setTitle('Database Storage')
+                    .setDescription('Police Bot uses PostgreSQL to store all data persistently. Nothing is lost on restarts.')
+                    .addFields(
+                        { name: 'warnings', value: 'All active warnings with expiry timestamps, user IDs, role IDs, and channel IDs for timer restoration.' },
+                        { name: 'history', value: 'Full warning history per server — every warn, kick, and ban ever issued.' },
+                        { name: 'configs', value: 'All per-server configuration: warning levels, roles, durations, escalation rules, and the access role.' },
+                        { name: 'notes', value: 'Private mod notes per user, stored separately from the warning history.' }
+                    ).setFooter({ text: 'Use the buttons to explore other categories' }),
                 help_features: new EmbedBuilder().setColor('#9b59b6').setTitle('Other Features')
                     .addFields(
                         { name: 'Warning expiry DMs', value: 'Users are DM\'d when a warning is issued and again when it expires and the role is removed.' },
                         { name: 'Rejoin protection', value: 'If a warned user leaves and rejoins the server, their warning roles are automatically reapplied and they are DM\'d.' },
-                        { name: 'Timer restoration', value: 'On bot restart, all active warning timers are restored from saved data so no warning expires silently.' },
+                        { name: 'Timer restoration', value: 'On bot restart, all active warning timers are restored from the database so no warning expires silently.' },
                         { name: 'Audit logging', value: 'Sensitive commands (warn, unwarn, timeout, config) are logged to console with the moderator\'s tag.' },
                         { name: '/help', value: 'This interactive help menu.' }
                     ).setFooter({ text: 'Use the buttons to explore other categories' }),
@@ -462,7 +515,7 @@ client.on('interactionCreate', async interaction => {
 
         if (customId === 'help_back') {
             const helpOverview = new EmbedBuilder().setColor('#5865F2').setTitle('Police Bot')
-                .setDescription("I\'m just your friendly neighbourhood policemen, but I do have some tricks up my sleeve. Press the buttons below to learn about my commands.")
+                .setDescription("I'm just your friendly neighbourhood policemen, but I do have some tricks up my sleeve. Press the buttons below to learn about my commands.")
                 .setFooter({ text: 'Mod commands require the configured access role or Administrator' });
             const helpButtons = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('help_warn').setLabel('Warnings').setStyle(ButtonStyle.Primary),
@@ -479,7 +532,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (customId.startsWith('wl_')) {
-            if (!hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
             const parts = customId.split('_');
             const page = parseInt(parts[1]);
             const guildId = parts.slice(2).join('_');
@@ -506,17 +559,15 @@ client.on('interactionCreate', async interaction => {
                 if (!role) return interaction.update({ content: '❌ Configured role not found.', embeds: [], components: [] });
                 await member.roles.remove(role);
                 console.log(`🔒 [AUDIT] ${interaction.user.tag} unwarned ${targetUserTag} (Level ${level}) in ${interaction.guild.name}`);
-                const warningKeys = Object.keys(activeWarnings).filter(k => {
-                    const w = activeWarnings[k];
-                    return w.userId === targetUserId && w.guildId === guildId && w.level === level;
-                });
-                warningKeys.forEach(k => {
-                    addHistory(guildId, { ...activeWarnings[k], endedAt: Date.now(), endReason: 'manual' });
+                const keysToRemove = [...activeWarnings.entries()]
+                    .filter(([, w]) => w.userId === targetUserId && w.guildId === guildId && w.level === level)
+                    .map(([k]) => k);
+                for (const k of keysToRemove) {
+                    await addHistory(guildId, targetUserId, { ...activeWarnings.get(k), endedAt: Date.now(), endReason: 'manual' });
                     clearTimeout(warningTimers.get(k));
                     warningTimers.delete(k);
-                    delete activeWarnings[k];
-                });
-                if (warningKeys.length > 0) saveWarnings();
+                    await deleteWarning(k);
+                }
                 await interaction.update({
                     embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('✅ Warning Removed')
                         .addFields(
@@ -540,20 +591,19 @@ client.on('interactionCreate', async interaction => {
     const { commandName, guildId } = interaction;
     if (!interaction.guild) return interaction.reply({ content: '❌ This command can only be used in a server.', flags: [MessageFlags.Ephemeral] });
 
-    guildConfigs[guildId] ??= { levels: {} };
-
     const restrictedCommands = ['config', 'warn', 'unwarn', 'timeout', 'kick', 'ban', 'note', 'warnlist', 'history', 'escalation'];
-    if (restrictedCommands.includes(commandName) && !hasCommandPermission(interaction, guildId)) {
-        const accessRole = guildConfigs[guildId]?.accessRoleId;
+    if (restrictedCommands.includes(commandName) && !await hasCommandPermission(interaction, guildId)) {
+        const config = await getConfig(guildId);
         return interaction.reply({
-            content: `❌ You don't have permission to use this command.\n\n**Required:** Administrator OR ${accessRole ? `<@&${accessRole}>` : 'no access role configured'}\n\nAsk an admin to run \`/config access\`.`,
+            content: `❌ You don't have permission to use this command.\n\n**Required:** Administrator OR ${config.accessRoleId ? `<@&${config.accessRoleId}>` : 'no access role configured'}\n\nAsk an admin to run \`/config access\`.`,
             flags: [MessageFlags.Ephemeral]
         });
     }
 
+    // ── /help ──────────────────────────────────────────────────────────────
     if (commandName === 'help') {
         const helpOverview = new EmbedBuilder().setColor('#5865F2').setTitle('Police Bot')
-            .setDescription("I\'m just your friendly neighbourhood policemen, but I do have some tricks up my sleeve. Press the buttons below to learn about my commands.")
+            .setDescription("I'm just your friendly neighbourhood policemen, but I do have some tricks up my sleeve. Press the buttons below to learn about my commands.")
             .setFooter({ text: 'Mod commands require the configured access role or Administrator' });
         const helpButtons = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId('help_warn').setLabel('Warnings').setStyle(ButtonStyle.Primary),
@@ -569,6 +619,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [helpOverview], components: [helpButtons, helpButtons2], flags: [MessageFlags.Ephemeral] });
     }
 
+    // ── /config ────────────────────────────────────────────────────────────
     else if (commandName === 'config') {
         const sub = interaction.options.getSubcommand();
         if (sub === 'access') {
@@ -580,12 +631,14 @@ client.on('interactionCreate', async interaction => {
             if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
             const duration = parseDuration(durationStr);
             if (!duration) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, `d:h:m:s`, or `forever`. Max 365 days.', flags: [MessageFlags.Ephemeral] });
-            guildConfigs[guildId].levels[level] = {
+            const config = await getConfig(guildId);
+            config.levels ??= {};
+            config.levels[level] = {
                 roleId: role.id, roleName: role.name,
                 durationMs: duration.totalMs, isForever: duration.isForever,
                 durationDisplay: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds, duration.isForever)
             };
-            saveConfigs();
+            await saveConfig(guildId, config);
             console.log(`🔒 [AUDIT] ${interaction.user.tag} configured Level ${level} → ${role.name} in ${interaction.guild.name}`);
             await interaction.reply({
                 embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('🚨 Warning Level Configured')
@@ -597,8 +650,8 @@ client.on('interactionCreate', async interaction => {
                 flags: [MessageFlags.Ephemeral]
             });
         } else if (sub === 'view') {
-            const config = guildConfigs[guildId];
-            if (!config || Object.keys(config.levels).length === 0) return interaction.reply({ content: '📋 No warning levels configured yet. Use /config set to add some.', flags: [MessageFlags.Ephemeral] });
+            const config = await getConfig(guildId);
+            if (!config.levels || Object.keys(config.levels).length === 0) return interaction.reply({ content: '📋 No warning levels configured yet. Use /config set to add some.', flags: [MessageFlags.Ephemeral] });
             const embed = new EmbedBuilder().setColor('#0099ff').setTitle('🚨 Warning Configuration').setTimestamp();
             for (const [level, data] of Object.entries(config.levels))
                 embed.addFields({ name: `Level ${level}`, value: `Role: <@&${data.roleId}>\nDuration: ${data.durationDisplay}`, inline: true });
@@ -606,28 +659,32 @@ client.on('interactionCreate', async interaction => {
         } else if (sub === 'logchannel') {
             const channel = interaction.options.getChannel('channel');
             if (!channel.isTextBased()) return interaction.reply({ content: '❌ Please select a text channel.', flags: [MessageFlags.Ephemeral] });
-            guildConfigs[guildId].logChannelId = channel.id;
-            saveConfigs();
+            const config = await getConfig(guildId);
+            config.logChannelId = channel.id;
+            await saveConfig(guildId, config);
             await interaction.reply({ content: `✅ Mod-log channel set to ${channel}.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'removelogchannel') {
-            if (!guildConfigs[guildId].logChannelId) return interaction.reply({ content: '❌ No log channel is currently set.', flags: [MessageFlags.Ephemeral] });
-            delete guildConfigs[guildId].logChannelId;
-            saveConfigs();
+            const config = await getConfig(guildId);
+            if (!config.logChannelId) return interaction.reply({ content: '❌ No log channel is currently set.', flags: [MessageFlags.Ephemeral] });
+            delete config.logChannelId;
+            await saveConfig(guildId, config);
             await interaction.reply({ content: '✅ Mod-log channel removed.', flags: [MessageFlags.Ephemeral] });
         }
     }
 
+    // ── /warn ──────────────────────────────────────────────────────────────
     else if (commandName === 'warn') {
         const user = interaction.options.getUser('user');
         const member = interaction.guild.members.cache.get(user.id);
         const level = interaction.options.getInteger('level');
-        const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0, 1000).replace(/[\x00-\x1F\x7F]/g, '');
+        const reason = interaction.options.getString('reason').slice(0, 1000).replace(/[\x00-\x1F\x7F]/g, '');
         if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
         if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
-        if (!guildConfigs[guildId].levels[level]) return interaction.reply({ content: `❌ Level ${level} is not configured. Use /config first.`, flags: [MessageFlags.Ephemeral] });
+        const config = await getConfig(guildId);
+        if (!config.levels?.[level]) return interaction.reply({ content: `❌ Level ${level} is not configured. Use /config set first.`, flags: [MessageFlags.Ephemeral] });
         const botMember = interaction.guild.members.me;
-        const configRole = interaction.guild.roles.cache.get(guildConfigs[guildId].levels[level].roleId);
-        if (!configRole) return interaction.reply({ content: '❌ Configured role not found. Please re-run /config.', flags: [MessageFlags.Ephemeral] });
+        const configRole = interaction.guild.roles.cache.get(config.levels[level].roleId);
+        if (!configRole) return interaction.reply({ content: '❌ Configured role not found. Please re-run /config set.', flags: [MessageFlags.Ephemeral] });
         if (configRole.position >= botMember.roles.highest.position) return interaction.reply({ content: `❌ My role must be above ${configRole} in the role list.`, flags: [MessageFlags.Ephemeral] });
         if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) return interaction.reply({ content: '❌ I need the "Manage Roles" permission.', flags: [MessageFlags.Ephemeral] });
         try {
@@ -652,8 +709,6 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Issued by', value: `${interaction.user}` }
                 ).setTimestamp()]
             });
-            const cap = guildConfigs[guildId].escalation?.cap;
-            if (cap && level === cap) await interaction.followUp({ content: `🚨 ${user} is at the cap level (Level ${cap}). No further auto-escalation.`, flags: [MessageFlags.Ephemeral] });
             const esc = await checkEscalation(interaction.guild, member, user, guildId, level, interaction.channel.id, interaction.user.tag);
             if (esc?.escalated) {
                 await interaction.followUp({ content: `⬆️ ${user} auto-escalated to **Level ${esc.nextLevel}** (${esc.role}).${esc.timedOut ? ` 🔇 Timeout: **${esc.timeoutDisplay}**.` : ''}${esc.hitCap ? `\n🚨 Reached cap (Level ${esc.nextLevel}).` : ''}`, flags: [MessageFlags.Ephemeral] });
@@ -670,15 +725,16 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // ── /unwarn ────────────────────────────────────────────────────────────
     else if (commandName === 'unwarn') {
         const user = interaction.options.getUser('user');
         const member = interaction.guild.members.cache.get(user.id);
         const level = interaction.options.getInteger('level');
         if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
         if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
-        if (!guildConfigs[guildId].levels[level]) return interaction.reply({ content: `❌ Level ${level} is not configured.`, flags: [MessageFlags.Ephemeral] });
-        const config = guildConfigs[guildId].levels[level];
-        const role = interaction.guild.roles.cache.get(config.roleId);
+        const config = await getConfig(guildId);
+        if (!config.levels?.[level]) return interaction.reply({ content: `❌ Level ${level} is not configured.`, flags: [MessageFlags.Ephemeral] });
+        const role = interaction.guild.roles.cache.get(config.levels[level].roleId);
         if (!role) return interaction.reply({ content: '❌ Configured role not found.', flags: [MessageFlags.Ephemeral] });
         if (!member.roles.cache.has(role.id)) return interaction.reply({ content: `❌ ${user} doesn't have the ${role} role.`, flags: [MessageFlags.Ephemeral] });
         const pendingId = interaction.id;
@@ -697,6 +753,7 @@ client.on('interactionCreate', async interaction => {
         });
     }
 
+    // ── /timeout ───────────────────────────────────────────────────────────
     else if (commandName === 'timeout') {
         const user = interaction.options.getUser('user');
         const member = interaction.guild.members.cache.get(user.id);
@@ -745,17 +802,19 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // ── /mywarnings ────────────────────────────────────────────────────────
     else if (commandName === 'mywarnings') {
         const userId = interaction.user.id;
-        const userWarnings = Object.entries(activeWarnings).filter(([, w]) => w.guildId === guildId && w.userId === userId);
-        if (userWarnings.length === 0) return interaction.reply({ content: '✅ You have no active warnings!', flags: [MessageFlags.Ephemeral] });
+        const userWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === userId);
+        if (!userWarnings.length) return interaction.reply({ content: '✅ You have no active warnings!', flags: [MessageFlags.Ephemeral] });
+        const config = await getConfig(guildId);
         const embed = new EmbedBuilder().setColor('#FFA500').setTitle('⏰ Your Active Warnings')
             .setDescription(`You have ${userWarnings.length} active warning${userWarnings.length > 1 ? 's' : ''}:`)
             .setFooter({ text: 'Warnings are automatically removed when they expire' }).setTimestamp();
-        for (const [, warning] of userWarnings) {
-            const config = guildConfigs[guildId]?.levels[warning.level];
-            const fieldName = `Level ${warning.level} — ${config?.roleName || 'Unknown Role'}`;
-            if (config?.isForever) {
+        for (const warning of userWarnings) {
+            const levelConfig = config.levels?.[warning.level];
+            const fieldName = `Level ${warning.level} — ${levelConfig?.roleName || 'Unknown Role'}`;
+            if (warning.isForever) {
                 embed.addFields({ name: fieldName, value: '⏳ **Duration:** Forever\n🔒 **Status:** Permanent' });
             } else {
                 const timeLeft = warning.expiresAt - Date.now();
@@ -770,20 +829,22 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     }
 
+    // ── /warnlist ──────────────────────────────────────────────────────────
     else if (commandName === 'warnlist') {
         const { embed, totalPages, page } = buildWarnlistEmbed(guildId, 0);
         await interaction.reply({ embeds: [embed], components: warnlistRow(page, totalPages, guildId), flags: [MessageFlags.Ephemeral] });
     }
 
+    // ── /history ───────────────────────────────────────────────────────────
     else if (commandName === 'history') {
         const user = interaction.options.getUser('user');
-        const entries = (warnHistory[guildId] || []).filter(e => e.userId === user.id);
+        const entries = await getHistory(guildId, user.id);
         if (!entries.length) return interaction.reply({ content: `📋 No warning history found for ${user}.`, flags: [MessageFlags.Ephemeral] });
         const embed = new EmbedBuilder().setColor('#5865F2')
             .setTitle(`📋 Warning History — ${user.tag}`)
-            .setDescription(`${entries.length} total warning${entries.length > 1 ? 's' : ''} on record.`)
+            .setDescription(`Showing last ${entries.length} record${entries.length > 1 ? 's' : ''}.`)
             .setTimestamp();
-        for (const e of entries.slice(-10)) {
+        for (const e of entries) {
             if (e.type === 'kick') {
                 embed.addFields({ name: `Kick — <t:${Math.floor(e.issuedAt / 1000)}:d>`, value: `by ${e.issuedBy}\n${e.reason}` });
             } else if (e.type === 'ban') {
@@ -793,10 +854,10 @@ client.on('interactionCreate', async interaction => {
                 embed.addFields({ name: `Level ${e.level} — ${e.roleName} — <t:${Math.floor(e.issuedAt / 1000)}:d>`, value: `${status} • by ${e.issuedBy}\n${e.reason}` });
             }
         }
-        if (entries.length > 10) embed.setFooter({ text: `Showing last 10 of ${entries.length} entries` });
         await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     }
 
+    // ── /kick ──────────────────────────────────────────────────────────────
     else if (commandName === 'kick') {
         const user = interaction.options.getUser('user');
         const member = interaction.guild.members.cache.get(user.id);
@@ -811,16 +872,14 @@ client.on('interactionCreate', async interaction => {
                 .addFields({ name: 'Reason', value: reason }).setTimestamp()]
             }).catch(() => {});
             await member.kick(reason);
-            const histEntry = { guildId, userId: user.id, userTag: user.tag, type: 'kick', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() };
-            addHistory(guildId, histEntry);
+            await addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'kick', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
             console.log(`🔒 [AUDIT] ${interaction.user.tag} kicked ${user.tag} from ${interaction.guild.name}`);
-            const logEmbed = new EmbedBuilder().setColor('#ff6600').setTitle('Member Kicked')
+            await logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#ff6600').setTitle('Member Kicked')
                 .addFields(
                     { name: 'User', value: `${user} (${user.tag})`, inline: true },
                     { name: 'Moderator', value: `${interaction.user}`, inline: true },
                     { name: 'Reason', value: reason }
-                ).setTimestamp();
-            await logMod(interaction.guild, guildId, logEmbed);
+                ).setTimestamp());
             await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('Member Kicked')
                 .addFields(
                     { name: 'User', value: `${user}`, inline: true },
@@ -834,6 +893,7 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // ── /ban ───────────────────────────────────────────────────────────────
     else if (commandName === 'ban') {
         const user = interaction.options.getUser('user');
         const member = interaction.guild.members.cache.get(user.id);
@@ -850,17 +910,15 @@ client.on('interactionCreate', async interaction => {
                 }).catch(() => {});
             }
             await interaction.guild.members.ban(user, { reason, deleteMessageDays: deleteDays });
-            const histEntry = { guildId, userId: user.id, userTag: user.tag, type: 'ban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), deleteDays };
-            addHistory(guildId, histEntry);
+            await addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'ban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), deleteDays });
             console.log(`🔒 [AUDIT] ${interaction.user.tag} banned ${user.tag} from ${interaction.guild.name}`);
-            const logEmbed = new EmbedBuilder().setColor('#ff0000').setTitle('Member Banned')
+            await logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#ff0000').setTitle('Member Banned')
                 .addFields(
                     { name: 'User', value: `${user} (${user.tag})`, inline: true },
                     { name: 'Moderator', value: `${interaction.user}`, inline: true },
                     { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true },
                     { name: 'Reason', value: reason }
-                ).setTimestamp();
-            await logMod(interaction.guild, guildId, logEmbed);
+                ).setTimestamp());
             await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Member Banned')
                 .addFields(
                     { name: 'User', value: `${user}`, inline: true },
@@ -875,21 +933,19 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // ── /note ──────────────────────────────────────────────────────────────
     else if (commandName === 'note') {
         const sub = interaction.options.getSubcommand();
         const user = interaction.options.getUser('user');
-        modNotes[guildId] ??= {};
-        modNotes[guildId][user.id] ??= [];
-        const notes = modNotes[guildId][user.id];
 
         if (sub === 'add') {
             const text = interaction.options.getString('text').slice(0, 1000).replace(/[\x00-\x1F\x7F]/g, '');
             const note = { id: Date.now(), text, addedBy: interaction.user.tag, addedAt: Date.now() };
-            notes.push(note);
-            saveNotes();
+            await addNote(guildId, user.id, note);
             console.log(`🔒 [AUDIT] ${interaction.user.tag} added note to ${user.tag} in ${interaction.guild.name}`);
             await interaction.reply({ content: `✅ Note added to ${user} (ID: \`${note.id}\`).`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'view') {
+            const notes = await getNotes(guildId, user.id);
             if (!notes.length) return interaction.reply({ content: `📋 No notes found for ${user}.`, flags: [MessageFlags.Ephemeral] });
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`)
                 .setDescription(`${notes.length} note${notes.length > 1 ? 's' : ''} on record.`).setTimestamp();
@@ -899,18 +955,18 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'delete') {
             const id = interaction.options.getInteger('id');
-            const idx = notes.findIndex(n => n.id === id);
-            if (idx === -1) return interaction.reply({ content: `❌ Note ID \`${id}\` not found for ${user}.`, flags: [MessageFlags.Ephemeral] });
-            notes.splice(idx, 1);
-            saveNotes();
+            const deleted = await deleteNote(guildId, user.id, id);
+            if (!deleted) return interaction.reply({ content: `❌ Note ID \`${id}\` not found for ${user}.`, flags: [MessageFlags.Ephemeral] });
             await interaction.reply({ content: `✅ Note \`${id}\` deleted.`, flags: [MessageFlags.Ephemeral] });
         }
     }
 
+    // ── /escalation ────────────────────────────────────────────────────────
     else if (commandName === 'escalation') {
         const sub = interaction.options.getSubcommand();
-        guildConfigs[guildId].escalation ??= { thresholds: {} };
-        const esc = guildConfigs[guildId].escalation;
+        const config = await getConfig(guildId);
+        config.escalation ??= { thresholds: {} };
+        const esc = config.escalation;
 
         if (sub === 'set') {
             const level = interaction.options.getInteger('level');
@@ -918,43 +974,43 @@ client.on('interactionCreate', async interaction => {
             if (level < 1 || level > 100) return interaction.reply({ content: '❌ Level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
             if (threshold < 2 || threshold > 50) return interaction.reply({ content: '❌ Threshold must be between 2 and 50.', flags: [MessageFlags.Ephemeral] });
             esc.thresholds[level] = threshold;
-            saveConfigs();
+            await saveConfig(guildId, config);
             await interaction.reply({ content: `✅ **${threshold}x** Level ${level} warnings → auto Level ${level + 1}.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'remove') {
             const level = interaction.options.getInteger('level');
             if (!esc.thresholds[level]) return interaction.reply({ content: `❌ No threshold set for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
             delete esc.thresholds[level];
-            saveConfigs();
+            await saveConfig(guildId, config);
             await interaction.reply({ content: `✅ Removed escalation threshold for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'setcap') {
             const level = interaction.options.getInteger('level');
             if (level < 1 || level > 100) return interaction.reply({ content: '❌ Cap must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
             esc.cap = level;
-            saveConfigs();
+            await saveConfig(guildId, config);
             await interaction.reply({ content: `✅ Level cap set to **${level}**.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'removecap') {
             if (!esc.cap) return interaction.reply({ content: '❌ No level cap is set.', flags: [MessageFlags.Ephemeral] });
             delete esc.cap;
-            saveConfigs();
+            await saveConfig(guildId, config);
             await interaction.reply({ content: '✅ Level cap removed.', flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'settimeout') {
             const level = interaction.options.getInteger('level');
             const threshold = interaction.options.getInteger('threshold');
             const durationStr = interaction.options.getString('duration');
-            if (level < 2 || level > 100) return interaction.reply({ content: '❌ Target level must be between 2 and 100 (level 1 has no previous level to escalate from).', flags: [MessageFlags.Ephemeral] });
+            if (level < 2 || level > 100) return interaction.reply({ content: '❌ Target level must be between 2 and 100.', flags: [MessageFlags.Ephemeral] });
             if (threshold < 2 || threshold > 50) return interaction.reply({ content: '❌ Threshold must be between 2 and 50.', flags: [MessageFlags.Ephemeral] });
             const duration = parseDuration(durationStr);
             if (!duration || duration.isForever) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.', flags: [MessageFlags.Ephemeral] });
             if (duration.totalMs > MAX_TIMEOUT_MS) return interaction.reply({ content: '❌ Discord timeouts cannot exceed 28 days.', flags: [MessageFlags.Ephemeral] });
             esc.timeouts ??= {};
             esc.timeouts[level] = { durationMs: duration.totalMs, durationDisplay: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds), threshold };
-            saveConfigs();
+            await saveConfig(guildId, config);
             await interaction.reply({ content: `✅ Timeout escalation set: **${threshold}x** Level ${level - 1} warnings → auto Level ${level} + **${esc.timeouts[level].durationDisplay}** timeout.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'removetimeout') {
             const level = interaction.options.getInteger('level');
             if (!esc.timeouts?.[level]) return interaction.reply({ content: `❌ No escalation timeout for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
             delete esc.timeouts[level];
-            saveConfigs();
+            await saveConfig(guildId, config);
             await interaction.reply({ content: `✅ Removed escalation timeout for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'view') {
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle('⬆️ Escalation Configuration').setTimestamp();
@@ -966,7 +1022,7 @@ client.on('interactionCreate', async interaction => {
                 if (Object.keys(thresholds).length)
                     embed.addFields({ name: 'Thresholds', value: Object.entries(thresholds).sort(([a], [b]) => a - b).map(([lvl, t]) => `• **${t}x** Level ${lvl} → auto Level ${parseInt(lvl) + 1}`).join('\n') });
                 if (Object.keys(timeouts).length)
-                    embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(timeouts).sort(([a], [b]) => a - b).map(([lvl, t]) => `• ${t.threshold}x Level ${parseInt(lvl)-1} → auto Level ${lvl} + **${t.durationDisplay}** timeout`).join('\n') });
+                    embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(timeouts).sort(([a], [b]) => a - b).map(([lvl, t]) => `• ${t.threshold}x Level ${parseInt(lvl) - 1} → auto Level ${lvl} + **${t.durationDisplay}** timeout`).join('\n') });
                 embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
             }
             await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
@@ -985,4 +1041,4 @@ const server = http.createServer((req, res) => {
     res.writeHead(ok ? 200 : 404, { 'Content-Type': 'text/plain' });
     res.end(ok ? 'Police bot is running!' : 'Not found');
 });
-server.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
+server.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
