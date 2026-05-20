@@ -4,7 +4,7 @@ const http = require('http');
 const https = require('https');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, family: 4 });
 
 // ── DB init ────────────────────────────────────────────────────────────────
 async function initDB() {
@@ -417,6 +417,7 @@ client.on('guildMemberAdd', async member => {
 
 // ── Interactions ───────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
+  try {
 
     // Role select (config access)
     if (interaction.isRoleSelectMenu()) {
@@ -968,6 +969,7 @@ client.on('interactionCreate', async interaction => {
 
     // ── /escalation ────────────────────────────────────────────────────────
     else if (commandName === 'escalation') {
+
         const sub = interaction.options.getSubcommand();
         const config = await getConfig(guildId);
         config.escalation ??= { thresholds: {} };
@@ -1033,6 +1035,15 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
         }
     }
+
+  } catch (error) {
+      console.error('❌ Interaction error:', error);
+      try {
+          const msg = { content: '❌ Something went wrong. Please try again.', flags: [MessageFlags.Ephemeral] };
+          if (interaction.replied || interaction.deferred) await interaction.followUp(msg);
+          else await interaction.reply(msg);
+      } catch {}
+  }
 });
 
 process.on('unhandledRejection', error => console.error('⚠️ Unhandled rejection:', error));
