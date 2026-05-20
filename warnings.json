@@ -12,5 +12,19 @@
     "expiresAt": 1779873286951,
     "channelId": "1465638829443645440",
     "isForever": false
+  },
+  "1486307648218468392-832608129874526259-1-1779277795507": {
+    "guildId": "1486307648218468392",
+    "userId": "832608129874526259",
+    "userTag": "cyb3r_byte",
+    "roleId": "1486801949310582904",
+    "roleName": "Warning 1",
+    "level": 1,
+    "reason": "cuz i can hehe",
+    "issuedBy": "sleepyturtler",
+    "issuedAt": 1779277795507,
+    "expiresAt": 1779277855507,
+    "channelId": "1486307649111851010",
+    "isForever": false
   }
 }
