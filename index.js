@@ -303,12 +303,6 @@ function warnlistRow(page, totalPages, guildId) {
 client.once('ready', async () => {
     console.log(`✅ Police bot is online as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: 'Monitoring the security cameras', type: ActivityType.Watching }], status: 'online' });
-    await initDB();
-    await loadAllWarnings();
-    for (const [key, w] of activeWarnings.entries()) {
-        if (!w.isForever) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
-    }
-    keepAlive();
 
     const commands = [
         new SlashCommandBuilder().setName('warn').setDescription('Give a warning to a user')
@@ -373,6 +367,17 @@ client.once('ready', async () => {
 
     client.application.commands.set(commands);
     console.log('✅ Commands registered');
+
+    try {
+        await initDB();
+        await loadAllWarnings();
+        for (const [key, w] of activeWarnings.entries()) {
+            if (!w.isForever) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
+        }
+    } catch (e) {
+        console.error('❌ DB init failed:', e.message);
+    }
+    keepAlive();
 });
 
 // ── Guild join ─────────────────────────────────────────────────────────────
@@ -1041,4 +1046,4 @@ const server = http.createServer((req, res) => {
     res.writeHead(ok ? 200 : 404, { 'Content-Type': 'text/plain' });
     res.end(ok ? 'Police bot is running!' : 'Not found');
 });
-server.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
+server.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
