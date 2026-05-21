@@ -49,6 +49,10 @@ async function getHistory(guildId, userId) {
     const res = await pool.query('SELECT data FROM history WHERE guild_id = $1 AND user_id = $2 ORDER BY id DESC LIMIT 10', [guildId, userId]);
     return res.rows.map(r => r.data).reverse();
 }
+async function getAllHistory(guildId, userId) {
+    const res = await pool.query('SELECT data FROM history WHERE guild_id = $1 AND user_id = $2 ORDER BY id', [guildId, userId]);
+    return res.rows.map(r => r.data);
+}
 async function getNotes(guildId, userId) {
     const res = await pool.query('SELECT data FROM notes WHERE guild_id = $1 AND user_id = $2 ORDER BY id', [guildId, userId]);
     return res.rows.map(r => r.data);
@@ -217,6 +221,7 @@ function warnlistRow(page, total, guildId) {
 const helpPages = {
     help_warn: new EmbedBuilder().setColor('#ff0000').setTitle('Warning Commands').addFields(
         { name: '/warn', value: 'Issue a warning to a user at a configured level. Requires a reason. Triggers escalation checks automatically.' },
+        { name: '/userinfo', value: 'View a user\'s full moderation profile — warnings, kicks, bans, notes, and more.' },
         { name: '/unwarn', value: 'Remove a warning role from a user. Shows a confirm/cancel prompt before executing.' },
         { name: '/timeout', value: 'Apply a Discord native timeout to a user. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` format (max 28 days).' },
         { name: '/mywarnings', value: 'Check your own active warnings and how long is left on each one.' },
@@ -226,14 +231,17 @@ const helpPages = {
     help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands').addFields(
         { name: '/kick', value: 'Kick a user from the server. Sends a DM, logs to history, and posts to the mod-log channel.' },
         { name: '/ban', value: 'Ban a user. Optionally delete their recent messages (0–7 days). Sends a DM if they are still in the server.' },
-        { name: '/timeout', value: 'Apply a Discord native timeout. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }
+        { name: '/unban', value: 'Unban a user by their ID. Logs to history and mod-log channel.' },
+        { name: '/timeout', value: 'Apply a Discord native timeout. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' },
+        { name: '/userinfo', value: 'View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.' }
     ).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands').addFields(
         { name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' },
         { name: '/config view', value: 'View all configured warning levels and their roles and durations.' },
         { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access regardless.' },
         { name: '/config logchannel', value: 'Set a channel where every mod action (warn, kick, ban, timeout) is automatically logged.' },
-        { name: '/config removelogchannel', value: 'Remove the mod-log channel.' }
+        { name: '/config removelogchannel', value: 'Remove the mod-log channel.' },
+        { name: '/config remove', value: 'Remove a warning level from the configuration entirely.' }
     ).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_escalation: new EmbedBuilder().setColor('#ff9900').setTitle('Escalation Commands').addFields(
         { name: '/escalation set', value: 'Set a threshold: once a user reaches N warnings at level X, they are auto-escalated to level X+1.' },
@@ -303,6 +311,11 @@ client.once('ready', async () => {
             .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
             .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true))
             .addIntegerOption(o => o.setName('delete_days').setDescription('Days of messages to delete (0-7)').setMinValue(0).setMaxValue(7)),
+        new SlashCommandBuilder().setName('userinfo').setDescription('View info and moderation history for a user')
+            .addUserOption(o => o.setName('user').setDescription('User to look up').setRequired(true)),
+        new SlashCommandBuilder().setName('unban').setDescription('Unban a user from the server')
+            .addStringOption(o => o.setName('user_id').setDescription('User ID to unban').setRequired(true))
+            .addStringOption(o => o.setName('reason').setDescription('Reason for unban')),
         new SlashCommandBuilder().setName('note').setDescription('Manage mod notes on a user')
             .addSubcommand(s => s.setName('add').setDescription('Add a note').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('text').setDescription('Note content').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View notes').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
@@ -315,7 +328,8 @@ client.once('ready', async () => {
             .addSubcommand(s => s.setName('view').setDescription('View all configured warning levels'))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can use moderation commands'))
             .addSubcommand(s => s.setName('logchannel').setDescription('Set the mod-log channel').addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true)))
-            .addSubcommand(s => s.setName('removelogchannel').setDescription('Remove the mod-log channel')),
+            .addSubcommand(s => s.setName('removelogchannel').setDescription('Remove the mod-log channel'))
+            .addSubcommand(s => s.setName('remove').setDescription('Remove a warning level').addIntegerOption(o => o.setName('level').setDescription('Warning level to remove').setRequired(true))),
         new SlashCommandBuilder().setName('escalation').setDescription('Configure auto-escalation rules')
             .addSubcommand(s => s.setName('set').setDescription('Set escalation threshold')
                 .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true))
@@ -426,7 +440,7 @@ client.on('interactionCreate', async interaction => {
     const { commandName, guildId } = interaction;
     if (!interaction.guild) return interaction.reply({ content: '❌ Server only.', flags: [MessageFlags.Ephemeral] });
 
-    const restricted = ['config','warn','unwarn','timeout','kick','ban','note','warnlist','history','escalation'];
+    const restricted = ['config','warn','unwarn','timeout','kick','ban','unban','note','userinfo','warnlist','history','escalation'];
     if (restricted.includes(commandName) && !await hasCommandPermission(interaction, guildId)) {
         const cfg = await getConfig(guildId);
         return interaction.reply({ content: `❌ No permission.\n\n**Required:** Administrator OR ${cfg.accessRoleId ? `<@&${cfg.accessRoleId}>` : 'no role configured'}\n\nAsk an admin to run \`/config access\`.`, flags: [MessageFlags.Ephemeral] });
@@ -468,6 +482,14 @@ client.on('interactionCreate', async interaction => {
             if (!cfg.logChannelId) return reply('❌ No log channel is currently set.');
             delete cfg.logChannelId; saveConfig(guildId, cfg);
             await reply('✅ Mod-log channel removed.');
+        } else if (sub === 'remove') {
+            const level = interaction.options.getInteger('level');
+            const cfg = await getConfig(guildId);
+            if (!cfg.levels?.[level]) return reply(`❌ Level ${level} is not configured.`);
+            const roleName = cfg.levels[level].roleName;
+            delete cfg.levels[level]; saveConfig(guildId, cfg);
+            console.log(`🔒 [AUDIT] ${interaction.user.tag} removed Level ${level} config in ${interaction.guild.name}`);
+            await reply(`✅ Warning Level ${level} (${roleName}) removed from config.`);
         }
     }
 
@@ -598,6 +620,70 @@ client.on('interactionCreate', async interaction => {
             logMod(interaction.guild, guildId, E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true }, { name: 'Reason', value: reason }));
             await reply({ embeds: [E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true }, { name: 'Reason', value: reason }, { name: 'Banned by', value: `${interaction.user}` })] });
         } catch (e) { console.error(e); await reply('❌ Failed to ban user. Check permissions.'); }
+    }
+
+    else if (commandName === 'userinfo') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const user = interaction.options.getUser('user');
+        const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+        const cfg = await getConfig(guildId);
+        const allHistory = await getAllHistory(guildId, user.id);
+        const activeUserWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === user.id);
+        const notes = await getNotes(guildId, user.id);
+
+        // Stats from history
+        const warnCounts = {}, kicks = allHistory.filter(e => e.type === 'kick').length, bans = allHistory.filter(e => e.type === 'ban').length;
+        for (const e of allHistory.filter(e => !e.type)) { warnCounts[e.level] = (warnCounts[e.level] || 0) + 1; }
+        const timeoutCount = allHistory.filter(e => e.type === 'timeout').length;
+
+        const embed = E('#5865F2', `👤 ${user.tag}`)
+            .setThumbnail(user.displayAvatarURL())
+            .addFields(
+                { name: 'Account Created', value: `<t:${Math.floor(user.createdTimestamp/1000)}:D> (<t:${Math.floor(user.createdTimestamp/1000)}:R>)`, inline: true },
+                { name: 'Joined Server', value: member ? `<t:${Math.floor(member.joinedTimestamp/1000)}:D> (<t:${Math.floor(member.joinedTimestamp/1000)}:R>)` : 'Not in server', inline: true }
+            );
+
+        if (member) {
+            const roles = member.roles.cache.filter(r => r.id !== interaction.guild.id).sort((a,b) => b.position - a.position).map(r => `${r}`).slice(0,10).join(' ');
+            if (roles) embed.addFields({ name: 'Roles', value: roles || 'None' });
+        }
+
+        const warnSummary = Object.keys(warnCounts).length
+            ? Object.entries(warnCounts).sort(([a],[b])=>a-b).map(([l,c]) => `Level ${l}: **${c}**`).join(' • ')
+            : 'None';
+        embed.addFields(
+            { name: 'Active Warnings', value: activeUserWarnings.length ? activeUserWarnings.map(w => { const exp = w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt/1000)}:R>`; return `Level ${w.level} — ${exp}`; }).join('\n') : 'None', inline: true },
+            { name: 'Total Warns (all time)', value: warnSummary, inline: true },
+            { name: 'Kicks', value: `${kicks}`, inline: true },
+            { name: 'Bans', value: `${bans}`, inline: true },
+            { name: 'Notes', value: `${notes.length}`, inline: true }
+        );
+
+        if (allHistory.length) {
+            const last = allHistory[allHistory.length - 1];
+            const typeLabel = last.type === 'kick' ? 'Kick' : last.type === 'ban' ? 'Ban' : `Level ${last.level} warn`;
+            embed.addFields({ name: 'Last Action', value: `${typeLabel} <t:${Math.floor(last.issuedAt/1000)}:R> by ${last.issuedBy}` });
+        }
+
+        await interaction.editReply({ embeds: [embed] });
+    }
+
+    else if (commandName === 'unban') {
+        const userId = interaction.options.getString('user_id').trim();
+        const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
+        if (!/^\d{17,20}$/.test(userId)) return reply('❌ Invalid user ID. Must be a Discord snowflake (17-20 digits).');
+        const botMember = interaction.guild.members.me;
+        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) return reply('❌ I need the "Ban Members" permission.');
+        try {
+            const ban = await interaction.guild.bans.fetch(userId).catch(() => null);
+            if (!ban) return reply('❌ That user is not banned in this server.');
+            await interaction.guild.members.unban(userId, reason);
+            const user = ban.user;
+            addHistory(guildId, userId, { guildId, userId, userTag: user.tag, type: 'unban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
+            console.log(`🔒 [AUDIT] ${interaction.user.tag} unbanned ${user.tag} from ${interaction.guild.name}`);
+            logMod(interaction.guild, guildId, E('#00ff00','Member Unbanned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }));
+            await reply({ embeds: [E('#00ff00','✅ Member Unbanned').addFields({ name: 'User', value: `${user.tag}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Unbanned by', value: `${interaction.user}` })] });
+        } catch (e) { console.error(e); await reply('❌ Failed to unban. Check permissions.'); }
     }
 
     else if (commandName === 'note') {
