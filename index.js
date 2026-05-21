@@ -589,7 +589,9 @@ client.on('interactionCreate', async interaction => {
         const userWarnings = [...activeWarnings.entries()].filter(([, w]) => w.guildId === guildId && w.userId === user.id);
         if (!userWarnings.length) return reply(`❌ ${user} has no active warnings.`);
         const options = userWarnings.slice(0, 25).map(([key, w]) => {
-            const expires = w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt/1000)}:R>`;
+            let expires;
+            if (w.isForever) { expires = 'Permanent'; }
+            else { const s = Math.max(0, Math.floor((w.expiresAt - Date.now()) / 1000)); const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60), sec = s%60; expires = `Expires in ${[d&&`${d}d`,h&&`${h}h`,m&&`${m}m`,(!d&&!h)&&`${sec}s`].filter(Boolean).join(' ')||'<1m'}`; }
             return { label: `Level ${w.level} — ${w.roleName}`, description: `${expires} · ${(w.reason||'No reason').slice(0,50)}`, value: key };
         });
         const pendingId = interaction.id;
