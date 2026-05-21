@@ -198,8 +198,11 @@ function buildWarnlistEmbed(guildId, page) {
     page = Math.max(0, Math.min(page, total - 1));
     const embed = new EmbedBuilder().setColor('#FFA500').setTitle(`⚠️ Active Warnings (${all.length})`).setTimestamp().setFooter({ text: total > 1 ? `Page ${page + 1} of ${total}` : `${userIds.length} user(s) warned` });
     if (!userIds.length) return { embed: embed.setDescription('No active warnings in this server.'), totalPages: total, page };
-    for (const uid of userIds.slice(page * 10, (page + 1) * 10))
-        embed.addFields({ name: `<@${uid}>`, value: byUser[uid].map(w => `• Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') });
+    for (const uid of userIds.slice(page * 10, (page + 1) * 10)) {
+        const w0 = byUser[uid][0];
+        const displayName = w0.userTag || `<@${uid}>`;
+        embed.addFields({ name: displayName, value: byUser[uid].map(w => `• Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') });
+    }
     return { embed, totalPages: total, page };
 }
 function warnlistRow(page, total, guildId) {
