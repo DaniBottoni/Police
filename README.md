@@ -3,22 +3,22 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 
 # Commands
 
-## Warning:
+## Moderation:
 - **/warn:** Gives a warning to a user.
-- **/unwarn:** Manually removes a warning from the user.
+- **/unwarn:** Manually removes the selected warning from a user.
 - **/timeout:** Gives a configurable length timeout to a user.
 - **/kick:** Kicks the user
 - **/ban:** Bans the user and deletes their messages in the last (configurable time). Can also be set to unban after set time.
 - **/unban:** Unbans the user.
-- **/mywarnings:** Shows you how much time is left on your warnings.
 
 ## Config:
 - **/config set:** Config the warning levels by matching them to roles and setting how long they take to expire.
 - **/config access:** Config what role is needed to access mod commands like /warn and /config.
 - **/config view:** Shows your current warning configuration.
-- **/config remove:** SRemoves a warning level.
+- **/config remove:** Removes a warning level.
 - **/config logchannel:** Set the channel where all warning, kick and ban embeds go to.
 - **/config removelogchannel:** Removes the log channel.
+- **/config warndm:** Toggles DM's to users on or off.
 
 ## Escalation:
 - **/escalation set:** Configure how many level X warnings you need to automatically bump up to a level Y.
@@ -34,9 +34,12 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 - **/warnlist:** Shows all active warning in the server.
 - **/userinfo:** View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.
 
-## Other
-
-- **/help:** Shows all commands available.
+## Notes:
 - **/note add:** Adds a note to a user.
 - **/note remove:** Removes a note from a user.
 - **/note view:** Views all of the users notes.
+
+## Other
+- **/help:** Shows all commands available.
+- **/mywarnings:** Shows you how much time is left on your warnings.
+- **/invite:** Creates an invite for the bot with all the permissions the bot needs.
