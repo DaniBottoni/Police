@@ -67,6 +67,12 @@ async function loadAllWarnings() {
     for (const { key, data } of res.rows) activeWarnings.set(key, data);
     console.log(`🔄 Loaded ${activeWarnings.size} active warnings from DB`);
 }
+
+async function warmConfigCache() {
+    const res = await pool.query('SELECT guild_id, data FROM configs');
+    for (const { guild_id, data } of res.rows) configCache.set(guild_id, data);
+    console.log(`🔄 Warmed config cache: ${configCache.size} guild(s)`);
+}
 async function saveWarning(key, data) {
     activeWarnings.set(key, data);
     await pool.query(
@@ -373,6 +379,7 @@ client.once('ready', async () => {
 
     try {
         await initDB();
+        await warmConfigCache();
         await loadAllWarnings();
         for (const [key, w] of activeWarnings.entries()) {
             if (!w.isForever) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
@@ -387,7 +394,10 @@ client.once('ready', async () => {
 client.on('guildCreate', async guild => {
     console.log(`Bot joined: ${guild.name} (${guild.id})`);
     const existing = await getConfig(guild.id);
-    if (!existing.levels) await saveConfig(guild.id, { levels: {} });
+    if (!existing.levels) {
+        const defaultConfig = { levels: {} };
+        await saveConfig(guild.id, defaultConfig);
+    }
     try {
         const logs = await guild.fetchAuditLogs({ type: 28, limit: 5 });
         const entry = logs.entries.find(e => e.target?.id === client.user.id && Date.now() - e.createdTimestamp < 60000);
@@ -600,12 +610,17 @@ client.on('interactionCreate', async interaction => {
     const { commandName, guildId } = interaction;
     if (!interaction.guild) return interaction.reply({ content: '❌ This command can only be used in a server.', flags: [MessageFlags.Ephemeral] });
 
+    // Defer immediately for all commands that touch the DB — prevents Discord timeout
+    const noDefer = ['help'];
+    if (!noDefer.includes(commandName)) {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+    }
+
     const restrictedCommands = ['config', 'warn', 'unwarn', 'timeout', 'kick', 'ban', 'note', 'warnlist', 'history', 'escalation'];
     if (restrictedCommands.includes(commandName) && !await hasCommandPermission(interaction, guildId)) {
         const config = await getConfig(guildId);
-        return interaction.reply({
+        return interaction.editReply({
             content: `❌ You don't have permission to use this command.\n\n**Required:** Administrator OR ${config.accessRoleId ? `<@&${config.accessRoleId}>` : 'no access role configured'}\n\nAsk an admin to run \`/config access\`.`,
-            flags: [MessageFlags.Ephemeral]
         });
     }
 
@@ -625,7 +640,7 @@ client.on('interactionCreate', async interaction => {
             new ButtonBuilder().setCustomId('help_storage').setLabel('Storage').setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId('help_features').setLabel('Features').setStyle(ButtonStyle.Secondary)
         );
-        await interaction.reply({ embeds: [helpOverview], components: [helpButtons, helpButtons2], flags: [MessageFlags.Ephemeral] });
+        await interaction.editReply({ embeds: [helpOverview], components: [helpButtons, helpButtons2] });
     }
 
     // ── /config ────────────────────────────────────────────────────────────
@@ -637,9 +652,9 @@ client.on('interactionCreate', async interaction => {
             const level = interaction.options.getInteger('level');
             const role = interaction.options.getRole('role');
             const durationStr = interaction.options.getString('duration');
-            if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
+            if (level < 1 || level > 100) return interaction.editReply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
             const duration = parseDuration(durationStr);
-            if (!duration) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, `d:h:m:s`, or `forever`. Max 365 days.', flags: [MessageFlags.Ephemeral] });
+            if (!duration) return interaction.editReply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, `d:h:m:s`, or `forever`. Max 365 days.', flags: [MessageFlags.Ephemeral] });
             const config = await getConfig(guildId);
             config.levels ??= {};
             config.levels[level] = {
@@ -649,35 +664,34 @@ client.on('interactionCreate', async interaction => {
             };
             await saveConfig(guildId, config);
             console.log(`🔒 [AUDIT] ${interaction.user.tag} configured Level ${level} → ${role.name} in ${interaction.guild.name}`);
-            await interaction.reply({
+            await interaction.editReply({
                 embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('🚨 Warning Level Configured')
                     .addFields(
                         { name: 'Level', value: `${level}`, inline: true },
                         { name: 'Role', value: `${role}`, inline: true },
                         { name: 'Duration', value: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds, duration.isForever), inline: true }
                     ).setTimestamp()],
-                flags: [MessageFlags.Ephemeral]
             });
         } else if (sub === 'view') {
             const config = await getConfig(guildId);
-            if (!config.levels || Object.keys(config.levels).length === 0) return interaction.reply({ content: '📋 No warning levels configured yet. Use /config set to add some.', flags: [MessageFlags.Ephemeral] });
+            if (!config.levels || Object.keys(config.levels).length === 0) return interaction.editReply({ content: '📋 No warning levels configured yet. Use /config set to add some.', flags: [MessageFlags.Ephemeral] });
             const embed = new EmbedBuilder().setColor('#0099ff').setTitle('🚨 Warning Configuration').setTimestamp();
             for (const [level, data] of Object.entries(config.levels))
                 embed.addFields({ name: `Level ${level}`, value: `Role: <@&${data.roleId}>\nDuration: ${data.durationDisplay}`, inline: true });
-            await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ embeds: [embed] });
         } else if (sub === 'logchannel') {
             const channel = interaction.options.getChannel('channel');
-            if (!channel.isTextBased()) return interaction.reply({ content: '❌ Please select a text channel.', flags: [MessageFlags.Ephemeral] });
+            if (!channel.isTextBased()) return interaction.editReply({ content: '❌ Please select a text channel.', flags: [MessageFlags.Ephemeral] });
             const config = await getConfig(guildId);
             config.logChannelId = channel.id;
             await saveConfig(guildId, config);
-            await interaction.reply({ content: `✅ Mod-log channel set to ${channel}.`, flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: `✅ Mod-log channel set to ${channel}.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'removelogchannel') {
             const config = await getConfig(guildId);
-            if (!config.logChannelId) return interaction.reply({ content: '❌ No log channel is currently set.', flags: [MessageFlags.Ephemeral] });
+            if (!config.logChannelId) return interaction.editReply({ content: '❌ No log channel is currently set.', flags: [MessageFlags.Ephemeral] });
             delete config.logChannelId;
             await saveConfig(guildId, config);
-            await interaction.reply({ content: '✅ Mod-log channel removed.', flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: '✅ Mod-log channel removed.' });
         }
     }
 
@@ -687,18 +701,18 @@ client.on('interactionCreate', async interaction => {
         const member = interaction.guild.members.cache.get(user.id);
         const level = interaction.options.getInteger('level');
         const reason = interaction.options.getString('reason').slice(0, 1000).replace(/[\x00-\x1F\x7F]/g, '');
-        if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
-        if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
+        if (level < 1 || level > 100) return interaction.editReply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
+        if (!member) return interaction.editReply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
         const config = await getConfig(guildId);
-        if (!config.levels?.[level]) return interaction.reply({ content: `❌ Level ${level} is not configured. Use /config set first.`, flags: [MessageFlags.Ephemeral] });
+        if (!config.levels?.[level]) return interaction.editReply({ content: `❌ Level ${level} is not configured. Use /config set first.`, flags: [MessageFlags.Ephemeral] });
         const botMember = interaction.guild.members.me;
         const configRole = interaction.guild.roles.cache.get(config.levels[level].roleId);
-        if (!configRole) return interaction.reply({ content: '❌ Configured role not found. Please re-run /config set.', flags: [MessageFlags.Ephemeral] });
-        if (configRole.position >= botMember.roles.highest.position) return interaction.reply({ content: `❌ My role must be above ${configRole} in the role list.`, flags: [MessageFlags.Ephemeral] });
-        if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) return interaction.reply({ content: '❌ I need the "Manage Roles" permission.', flags: [MessageFlags.Ephemeral] });
+        if (!configRole) return interaction.editReply({ content: '❌ Configured role not found. Please re-run /config set.', flags: [MessageFlags.Ephemeral] });
+        if (configRole.position >= botMember.roles.highest.position) return interaction.editReply({ content: `❌ My role must be above ${configRole} in the role list.`, flags: [MessageFlags.Ephemeral] });
+        if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) return interaction.editReply({ content: '❌ I need the "Manage Roles" permission.', flags: [MessageFlags.Ephemeral] });
         try {
             const result = await applyWarning(interaction.guild, member, user, guildId, level, reason, interaction.channel.id, interaction.user.tag);
-            if (result.error) return interaction.reply({ content: `❌ ${result.error}`, flags: [MessageFlags.Ephemeral] });
+            if (result.error) return interaction.editReply({ content: `❌ ${result.error}`, flags: [MessageFlags.Ephemeral] });
             console.log(`🔒 [AUDIT] ${interaction.user.tag} warned ${user.tag} (Level ${level}) in ${interaction.guild.name}`);
             await logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#ff0000').setTitle('Warning Issued')
                 .addFields(
@@ -708,7 +722,7 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Reason', value: reason },
                     { name: 'Moderator', value: `${interaction.user}` }
                 ).setTimestamp());
-            await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ Warning Issued')
+            await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ Warning Issued')
                 .addFields(
                     { name: 'User', value: `${user}`, inline: true },
                     { name: 'Level', value: `${level}`, inline: true },
@@ -730,7 +744,7 @@ client.on('interactionCreate', async interaction => {
             }
         } catch (error) {
             console.error(error);
-            await interaction.reply({ content: '❌ Failed to assign warning. Check permissions.', flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: '❌ Failed to assign warning. Check permissions.' });
         }
     }
 
@@ -739,17 +753,17 @@ client.on('interactionCreate', async interaction => {
         const user = interaction.options.getUser('user');
         const member = interaction.guild.members.cache.get(user.id);
         const level = interaction.options.getInteger('level');
-        if (level < 1 || level > 100) return interaction.reply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
-        if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
+        if (level < 1 || level > 100) return interaction.editReply({ content: '❌ Warning level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
+        if (!member) return interaction.editReply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
         const config = await getConfig(guildId);
-        if (!config.levels?.[level]) return interaction.reply({ content: `❌ Level ${level} is not configured.`, flags: [MessageFlags.Ephemeral] });
+        if (!config.levels?.[level]) return interaction.editReply({ content: `❌ Level ${level} is not configured.`, flags: [MessageFlags.Ephemeral] });
         const role = interaction.guild.roles.cache.get(config.levels[level].roleId);
-        if (!role) return interaction.reply({ content: '❌ Configured role not found.', flags: [MessageFlags.Ephemeral] });
-        if (!member.roles.cache.has(role.id)) return interaction.reply({ content: `❌ ${user} doesn't have the ${role} role.`, flags: [MessageFlags.Ephemeral] });
+        if (!role) return interaction.editReply({ content: '❌ Configured role not found.', flags: [MessageFlags.Ephemeral] });
+        if (!member.roles.cache.has(role.id)) return interaction.editReply({ content: `❌ ${user} doesn't have the ${role} role.`, flags: [MessageFlags.Ephemeral] });
         const pendingId = interaction.id;
         pendingUnwarns.set(pendingId, { targetUserId: user.id, targetUserTag: user.tag, level, guildId, roleId: role.id, modId: interaction.user.id });
         setTimeout(() => pendingUnwarns.delete(pendingId), 60_000);
-        await interaction.reply({
+        await interaction.editReply({
             embeds: [new EmbedBuilder().setColor('#FFA500').setTitle('⚠️ Confirm Unwarn')
                 .setDescription(`Remove **Level ${level}** warning from ${user}?`)
                 .addFields({ name: 'Role to remove', value: `${role}`, inline: true })
@@ -758,7 +772,6 @@ client.on('interactionCreate', async interaction => {
                 new ButtonBuilder().setCustomId(`unwarn_confirm_${pendingId}`).setLabel('Confirm').setStyle(ButtonStyle.Danger),
                 new ButtonBuilder().setCustomId(`unwarn_cancel_${pendingId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
             )],
-            flags: [MessageFlags.Ephemeral]
         });
     }
 
@@ -768,13 +781,13 @@ client.on('interactionCreate', async interaction => {
         const member = interaction.guild.members.cache.get(user.id);
         const durationStr = interaction.options.getString('duration');
         const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0, 512).replace(/[\x00-\x1F\x7F]/g, '');
-        if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
+        if (!member) return interaction.editReply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
         const duration = parseDuration(durationStr);
-        if (!duration || duration.isForever) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.', flags: [MessageFlags.Ephemeral] });
-        if (duration.totalMs > MAX_TIMEOUT_MS) return interaction.reply({ content: '❌ Discord timeouts cannot exceed 28 days.', flags: [MessageFlags.Ephemeral] });
+        if (!duration || duration.isForever) return interaction.editReply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.', flags: [MessageFlags.Ephemeral] });
+        if (duration.totalMs > MAX_TIMEOUT_MS) return interaction.editReply({ content: '❌ Discord timeouts cannot exceed 28 days.', flags: [MessageFlags.Ephemeral] });
         const botMember = interaction.guild.members.me;
-        if (!botMember.permissions.has(PermissionFlagsBits.ModerateMembers)) return interaction.reply({ content: '❌ I need the "Moderate Members" permission for timeouts.', flags: [MessageFlags.Ephemeral] });
-        if (member.roles.highest.position >= botMember.roles.highest.position) return interaction.reply({ content: '❌ I cannot timeout this user — their role is equal to or above mine.', flags: [MessageFlags.Ephemeral] });
+        if (!botMember.permissions.has(PermissionFlagsBits.ModerateMembers)) return interaction.editReply({ content: '❌ I need the "Moderate Members" permission for timeouts.', flags: [MessageFlags.Ephemeral] });
+        if (member.roles.highest.position >= botMember.roles.highest.position) return interaction.editReply({ content: '❌ I cannot timeout this user — their role is equal to or above mine.', flags: [MessageFlags.Ephemeral] });
         try {
             await member.timeout(duration.totalMs, reason);
             const durationDisplay = formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds);
@@ -796,7 +809,7 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Reason', value: reason }
                 ).setTimestamp()]
             }).catch(() => {});
-            await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('🔇 Timeout Applied')
+            await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('🔇 Timeout Applied')
                 .addFields(
                     { name: 'User', value: `${user}`, inline: true },
                     { name: 'Duration', value: durationDisplay, inline: true },
@@ -807,7 +820,7 @@ client.on('interactionCreate', async interaction => {
             });
         } catch (error) {
             console.error(error);
-            await interaction.reply({ content: '❌ Failed to apply timeout. Check permissions and role hierarchy.', flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: '❌ Failed to apply timeout. Check permissions and role hierarchy.' });
         }
     }
 
@@ -815,7 +828,7 @@ client.on('interactionCreate', async interaction => {
     else if (commandName === 'mywarnings') {
         const userId = interaction.user.id;
         const userWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === userId);
-        if (!userWarnings.length) return interaction.reply({ content: '✅ You have no active warnings!', flags: [MessageFlags.Ephemeral] });
+        if (!userWarnings.length) return interaction.editReply({ content: '✅ You have no active warnings!', flags: [MessageFlags.Ephemeral] });
         const config = await getConfig(guildId);
         const embed = new EmbedBuilder().setColor('#FFA500').setTitle('⏰ Your Active Warnings')
             .setDescription(`You have ${userWarnings.length} active warning${userWarnings.length > 1 ? 's' : ''}:`)
@@ -835,20 +848,20 @@ client.on('interactionCreate', async interaction => {
                 }
             }
         }
-        await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+        await interaction.editReply({ embeds: [embed] });
     }
 
     // ── /warnlist ──────────────────────────────────────────────────────────
     else if (commandName === 'warnlist') {
         const { embed, totalPages, page } = buildWarnlistEmbed(guildId, 0);
-        await interaction.reply({ embeds: [embed], components: warnlistRow(page, totalPages, guildId), flags: [MessageFlags.Ephemeral] });
+        await interaction.editReply({ embeds: [embed], components: warnlistRow(page, totalPages, guildId) });
     }
 
     // ── /history ───────────────────────────────────────────────────────────
     else if (commandName === 'history') {
         const user = interaction.options.getUser('user');
         const entries = await getHistory(guildId, user.id);
-        if (!entries.length) return interaction.reply({ content: `📋 No warning history found for ${user}.`, flags: [MessageFlags.Ephemeral] });
+        if (!entries.length) return interaction.editReply({ content: `📋 No warning history found for ${user}.`, flags: [MessageFlags.Ephemeral] });
         const embed = new EmbedBuilder().setColor('#5865F2')
             .setTitle(`📋 Warning History — ${user.tag}`)
             .setDescription(`Showing last ${entries.length} record${entries.length > 1 ? 's' : ''}.`)
@@ -863,7 +876,7 @@ client.on('interactionCreate', async interaction => {
                 embed.addFields({ name: `Level ${e.level} — ${e.roleName} — <t:${Math.floor(e.issuedAt / 1000)}:d>`, value: `${status} • by ${e.issuedBy}\n${e.reason}` });
             }
         }
-        await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+        await interaction.editReply({ embeds: [embed] });
     }
 
     // ── /kick ──────────────────────────────────────────────────────────────
@@ -871,10 +884,10 @@ client.on('interactionCreate', async interaction => {
         const user = interaction.options.getUser('user');
         const member = interaction.guild.members.cache.get(user.id);
         const reason = interaction.options.getString('reason').slice(0, 512).replace(/[\x00-\x1F\x7F]/g, '');
-        if (!member) return interaction.reply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
+        if (!member) return interaction.editReply({ content: `❌ ${user} is not in this server.`, flags: [MessageFlags.Ephemeral] });
         const botMember = interaction.guild.members.me;
-        if (!botMember.permissions.has(PermissionFlagsBits.KickMembers)) return interaction.reply({ content: '❌ I need the "Kick Members" permission.', flags: [MessageFlags.Ephemeral] });
-        if (member.roles.highest.position >= botMember.roles.highest.position) return interaction.reply({ content: '❌ I cannot kick this user — their role is equal to or above mine.', flags: [MessageFlags.Ephemeral] });
+        if (!botMember.permissions.has(PermissionFlagsBits.KickMembers)) return interaction.editReply({ content: '❌ I need the "Kick Members" permission.', flags: [MessageFlags.Ephemeral] });
+        if (member.roles.highest.position >= botMember.roles.highest.position) return interaction.editReply({ content: '❌ I cannot kick this user — their role is equal to or above mine.', flags: [MessageFlags.Ephemeral] });
         try {
             user.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('You have been kicked')
                 .setDescription(`You were kicked from **${interaction.guild.name}**.`)
@@ -889,7 +902,7 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Moderator', value: `${interaction.user}`, inline: true },
                     { name: 'Reason', value: reason }
                 ).setTimestamp());
-            await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('Member Kicked')
+            await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('Member Kicked')
                 .addFields(
                     { name: 'User', value: `${user}`, inline: true },
                     { name: 'Reason', value: reason },
@@ -898,7 +911,7 @@ client.on('interactionCreate', async interaction => {
             });
         } catch (error) {
             console.error(error);
-            await interaction.reply({ content: '❌ Failed to kick user. Check permissions.', flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: '❌ Failed to kick user. Check permissions.' });
         }
     }
 
@@ -909,8 +922,8 @@ client.on('interactionCreate', async interaction => {
         const reason = interaction.options.getString('reason').slice(0, 512).replace(/[\x00-\x1F\x7F]/g, '');
         const deleteDays = interaction.options.getInteger('delete_days') ?? 0;
         const botMember = interaction.guild.members.me;
-        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) return interaction.reply({ content: '❌ I need the "Ban Members" permission.', flags: [MessageFlags.Ephemeral] });
-        if (member && member.roles.highest.position >= botMember.roles.highest.position) return interaction.reply({ content: '❌ I cannot ban this user — their role is equal to or above mine.', flags: [MessageFlags.Ephemeral] });
+        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) return interaction.editReply({ content: '❌ I need the "Ban Members" permission.', flags: [MessageFlags.Ephemeral] });
+        if (member && member.roles.highest.position >= botMember.roles.highest.position) return interaction.editReply({ content: '❌ I cannot ban this user — their role is equal to or above mine.', flags: [MessageFlags.Ephemeral] });
         try {
             if (member) {
                 user.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('You have been banned')
@@ -928,7 +941,7 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true },
                     { name: 'Reason', value: reason }
                 ).setTimestamp());
-            await interaction.reply({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Member Banned')
+            await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Member Banned')
                 .addFields(
                     { name: 'User', value: `${user}`, inline: true },
                     { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true },
@@ -938,7 +951,7 @@ client.on('interactionCreate', async interaction => {
             });
         } catch (error) {
             console.error(error);
-            await interaction.reply({ content: '❌ Failed to ban user. Check permissions.', flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: '❌ Failed to ban user. Check permissions.' });
         }
     }
 
@@ -952,21 +965,21 @@ client.on('interactionCreate', async interaction => {
             const note = { id: Date.now(), text, addedBy: interaction.user.tag, addedAt: Date.now() };
             await addNote(guildId, user.id, note);
             console.log(`🔒 [AUDIT] ${interaction.user.tag} added note to ${user.tag} in ${interaction.guild.name}`);
-            await interaction.reply({ content: `✅ Note added to ${user} (ID: \`${note.id}\`).`, flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: `✅ Note added to ${user} (ID: \`${note.id}\`).`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'view') {
             const notes = await getNotes(guildId, user.id);
-            if (!notes.length) return interaction.reply({ content: `📋 No notes found for ${user}.`, flags: [MessageFlags.Ephemeral] });
+            if (!notes.length) return interaction.editReply({ content: `📋 No notes found for ${user}.`, flags: [MessageFlags.Ephemeral] });
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`)
                 .setDescription(`${notes.length} note${notes.length > 1 ? 's' : ''} on record.`).setTimestamp();
             for (const n of notes.slice(-10))
                 embed.addFields({ name: `ID: ${n.id} — <t:${Math.floor(n.addedAt / 1000)}:d> — ${n.addedBy}`, value: n.text });
             if (notes.length > 10) embed.setFooter({ text: `Showing last 10 of ${notes.length} notes` });
-            await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ embeds: [embed] });
         } else if (sub === 'delete') {
             const id = interaction.options.getInteger('id');
             const deleted = await deleteNote(guildId, user.id, id);
-            if (!deleted) return interaction.reply({ content: `❌ Note ID \`${id}\` not found for ${user}.`, flags: [MessageFlags.Ephemeral] });
-            await interaction.reply({ content: `✅ Note \`${id}\` deleted.`, flags: [MessageFlags.Ephemeral] });
+            if (!deleted) return interaction.editReply({ content: `❌ Note ID \`${id}\` not found for ${user}.`, flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: `✅ Note \`${id}\` deleted.`, flags: [MessageFlags.Ephemeral] });
         }
     }
 
@@ -981,47 +994,47 @@ client.on('interactionCreate', async interaction => {
         if (sub === 'set') {
             const level = interaction.options.getInteger('level');
             const threshold = interaction.options.getInteger('threshold');
-            if (level < 1 || level > 100) return interaction.reply({ content: '❌ Level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
-            if (threshold < 2 || threshold > 50) return interaction.reply({ content: '❌ Threshold must be between 2 and 50.', flags: [MessageFlags.Ephemeral] });
+            if (level < 1 || level > 100) return interaction.editReply({ content: '❌ Level must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
+            if (threshold < 2 || threshold > 50) return interaction.editReply({ content: '❌ Threshold must be between 2 and 50.', flags: [MessageFlags.Ephemeral] });
             esc.thresholds[level] = threshold;
             await saveConfig(guildId, config);
-            await interaction.reply({ content: `✅ **${threshold}x** Level ${level} warnings → auto Level ${level + 1}.`, flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: `✅ **${threshold}x** Level ${level} warnings → auto Level ${level + 1}.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'remove') {
             const level = interaction.options.getInteger('level');
-            if (!esc.thresholds[level]) return interaction.reply({ content: `❌ No threshold set for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
+            if (!esc.thresholds[level]) return interaction.editReply({ content: `❌ No threshold set for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
             delete esc.thresholds[level];
             await saveConfig(guildId, config);
-            await interaction.reply({ content: `✅ Removed escalation threshold for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: `✅ Removed escalation threshold for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'setcap') {
             const level = interaction.options.getInteger('level');
-            if (level < 1 || level > 100) return interaction.reply({ content: '❌ Cap must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
+            if (level < 1 || level > 100) return interaction.editReply({ content: '❌ Cap must be between 1 and 100.', flags: [MessageFlags.Ephemeral] });
             esc.cap = level;
             await saveConfig(guildId, config);
-            await interaction.reply({ content: `✅ Level cap set to **${level}**.`, flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: `✅ Level cap set to **${level}**.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'removecap') {
-            if (!esc.cap) return interaction.reply({ content: '❌ No level cap is set.', flags: [MessageFlags.Ephemeral] });
+            if (!esc.cap) return interaction.editReply({ content: '❌ No level cap is set.', flags: [MessageFlags.Ephemeral] });
             delete esc.cap;
             await saveConfig(guildId, config);
-            await interaction.reply({ content: '✅ Level cap removed.', flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: '✅ Level cap removed.' });
         } else if (sub === 'settimeout') {
             const level = interaction.options.getInteger('level');
             const threshold = interaction.options.getInteger('threshold');
             const durationStr = interaction.options.getString('duration');
-            if (level < 2 || level > 100) return interaction.reply({ content: '❌ Target level must be between 2 and 100.', flags: [MessageFlags.Ephemeral] });
-            if (threshold < 2 || threshold > 50) return interaction.reply({ content: '❌ Threshold must be between 2 and 50.', flags: [MessageFlags.Ephemeral] });
+            if (level < 2 || level > 100) return interaction.editReply({ content: '❌ Target level must be between 2 and 100.', flags: [MessageFlags.Ephemeral] });
+            if (threshold < 2 || threshold > 50) return interaction.editReply({ content: '❌ Threshold must be between 2 and 50.', flags: [MessageFlags.Ephemeral] });
             const duration = parseDuration(durationStr);
-            if (!duration || duration.isForever) return interaction.reply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.', flags: [MessageFlags.Ephemeral] });
-            if (duration.totalMs > MAX_TIMEOUT_MS) return interaction.reply({ content: '❌ Discord timeouts cannot exceed 28 days.', flags: [MessageFlags.Ephemeral] });
+            if (!duration || duration.isForever) return interaction.editReply({ content: '❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.', flags: [MessageFlags.Ephemeral] });
+            if (duration.totalMs > MAX_TIMEOUT_MS) return interaction.editReply({ content: '❌ Discord timeouts cannot exceed 28 days.', flags: [MessageFlags.Ephemeral] });
             esc.timeouts ??= {};
             esc.timeouts[level] = { durationMs: duration.totalMs, durationDisplay: formatDuration(duration.days, duration.hours, duration.minutes, duration.seconds), threshold };
             await saveConfig(guildId, config);
-            await interaction.reply({ content: `✅ Timeout escalation set: **${threshold}x** Level ${level - 1} warnings → auto Level ${level} + **${esc.timeouts[level].durationDisplay}** timeout.`, flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: `✅ Timeout escalation set: **${threshold}x** Level ${level - 1} warnings → auto Level ${level} + **${esc.timeouts[level].durationDisplay}** timeout.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'removetimeout') {
             const level = interaction.options.getInteger('level');
-            if (!esc.timeouts?.[level]) return interaction.reply({ content: `❌ No escalation timeout for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
+            if (!esc.timeouts?.[level]) return interaction.editReply({ content: `❌ No escalation timeout for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
             delete esc.timeouts[level];
             await saveConfig(guildId, config);
-            await interaction.reply({ content: `✅ Removed escalation timeout for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ content: `✅ Removed escalation timeout for Level ${level}.`, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'view') {
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle('⬆️ Escalation Configuration').setTimestamp();
             const thresholds = esc.thresholds ?? {};
@@ -1035,7 +1048,7 @@ client.on('interactionCreate', async interaction => {
                     embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(timeouts).sort(([a], [b]) => a - b).map(([lvl, t]) => `• ${t.threshold}x Level ${parseInt(lvl) - 1} → auto Level ${lvl} + **${t.durationDisplay}** timeout`).join('\n') });
                 embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
             }
-            await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+            await interaction.editReply({ embeds: [embed] });
         }
     }
 
@@ -1043,9 +1056,8 @@ client.on('interactionCreate', async interaction => {
       if (error?.code === 40060) return; // already acknowledged, ignore
       console.error('❌ Interaction error:', error);
       try {
-          const msg = { content: '❌ Something went wrong. Please try again.', flags: [MessageFlags.Ephemeral] };
-          if (interaction.replied || interaction.deferred) await interaction.followUp(msg);
-          else await interaction.reply(msg);
+          const msg = { content: '❌ Something went wrong. Please try again.' };
+          if (interaction.deferred || interaction.replied) await interaction.editReply(msg).catch(() => {});
       } catch {}
   }
 });
