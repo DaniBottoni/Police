@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { Pool } = require('pg');
 const dns = require('dns'); dns.setDefaultResultOrder('ipv4first');
 const http = require('http'), https = require('https');
@@ -161,7 +161,7 @@ async function applyWarning(guild, member, user, guildId, level, reason, channel
     if (!lc || !role) return { error: `Level ${level} config or role not found.` };
     if (role.position >= guild.members.me.roles.highest.position) return { error: `Role hierarchy: my role must be above ${role.name}.` };
     await member.roles.add(role);
-    user.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ You Received a Warning')
+    if (cfg.warnDm !== false) user.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ You Received a Warning')
         .setDescription(`You have been warned in **${guild.name}**.`)
         .addFields({ name: 'Warning Level', value: `${level}`, inline: true }, { name: 'Duration', value: lc.durationDisplay || 'Unknown', inline: true }, { name: 'Reason', value: reason })
         .setFooter({ text: `Use /mywarnings in ${guild.name} to check when this warning expires` }).setTimestamp()]
@@ -256,11 +256,12 @@ const helpPages = {
     ).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands').addFields(
         { name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' },
-        { name: '/config view', value: 'View all configured warning levels and their roles and durations.' },
+        { name: '/config view', value: 'View all configured warning levels, their roles, durations, and warn DM status.' },
         { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access regardless.' },
         { name: '/config logchannel', value: 'Set a channel where every mod action (warn, kick, ban, timeout) is automatically logged.' },
         { name: '/config removelogchannel', value: 'Remove the mod-log channel.' },
-        { name: '/config remove', value: 'Remove a warning level from the configuration entirely.' }
+        { name: '/config remove', value: 'Remove a warning level from the configuration entirely.' },
+        { name: '/config warndm', value: 'Toggle whether users are DM\'d when they receive a warning. Enabled by default.' }
     ).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_escalation: new EmbedBuilder().setColor('#ff9900').setTitle('Escalation Commands').addFields(
         { name: '/escalation set', value: 'Set a threshold: once a user reaches N warnings at level X, they are auto-escalated to level X+1.' },
@@ -284,10 +285,11 @@ const helpPages = {
             { name: 'notes', value: 'Private mod notes per user, stored separately from the warning history.' }
         ).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_features: new EmbedBuilder().setColor('#9b59b6').setTitle('Other Features').addFields(
-        { name: 'Warning expiry DMs', value: 'Users are DM\'d when a warning is issued and again when it expires and the role is removed.' },
+        { name: 'Warning expiry DMs', value: 'Users are DM\'d when a warning is issued (if enabled) and again when it expires and the role is removed.' },
         { name: 'Rejoin protection', value: 'If a warned user leaves and rejoins the server, their warning roles are automatically reapplied and they are DM\'d.' },
         { name: 'Timer restoration', value: 'On bot restart, all active warning timers are restored from the database so no warning expires silently.' },
         { name: 'Audit logging', value: 'Sensitive commands (warn, unwarn, timeout, config) are logged to console with the moderator\'s tag.' },
+        { name: '/invite', value: 'Get a pre-configured invite link with all required permissions to add the bot to another server.' },
         { name: '/help', value: 'This interactive help menu.' }
     ).setFooter({ text: 'Use the buttons to explore other categories' }),
 };
@@ -308,13 +310,13 @@ client.once('ready', async () => {
     client.user.setPresence({ activities: [{ name: 'Monitoring the security cameras', type: ActivityType.Watching }], status: 'online' });
 
     const commands = [
+        new SlashCommandBuilder().setName('invite').setDescription('Get a link to invite this bot to another server'),
         new SlashCommandBuilder().setName('warn').setDescription('Give a warning to a user')
             .addUserOption(o => o.setName('user').setDescription('User to warn').setRequired(true))
             .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true))
             .addStringOption(o => o.setName('reason').setDescription('Reason for the warning')),
-        new SlashCommandBuilder().setName('unwarn').setDescription('Remove a warning role from a user')
-            .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
-            .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)),
+        new SlashCommandBuilder().setName('unwarn').setDescription('Remove a warning from a user')
+            .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
         new SlashCommandBuilder().setName('timeout').setDescription('Apply a Discord timeout to a user')
             .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
             .addStringOption(o => o.setName('duration').setDescription('m:s / h:m:s / d:h:m:s, max 28 days').setRequired(true))
@@ -349,7 +351,8 @@ client.once('ready', async () => {
             .addSubcommand(s => s.setName('access').setDescription('Set which role can use moderation commands'))
             .addSubcommand(s => s.setName('logchannel').setDescription('Set the mod-log channel').addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true)))
             .addSubcommand(s => s.setName('removelogchannel').setDescription('Remove the mod-log channel'))
-            .addSubcommand(s => s.setName('remove').setDescription('Remove a warning level').addIntegerOption(o => o.setName('level').setDescription('Warning level to remove').setRequired(true))),
+            .addSubcommand(s => s.setName('remove').setDescription('Remove a warning level').addIntegerOption(o => o.setName('level').setDescription('Warning level to remove').setRequired(true)))
+            .addSubcommand(s => s.setName('warndm').setDescription('Toggle whether users are DM\'d when warned').addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable warn DMs').setRequired(true))),
         new SlashCommandBuilder().setName('escalation').setDescription('Configure auto-escalation rules')
             .addSubcommand(s => s.setName('set').setDescription('Set escalation threshold')
                 .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true))
@@ -419,6 +422,22 @@ client.on('guildMemberAdd', async member => {
 // ── Interactions ───────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
   try {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('unwarn_select_')) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const pendingId = interaction.customId.slice(14);
+        const pending = pendingUnwarns.get(pendingId);
+        if (!pending) return interaction.update({ content: '❌ Confirmation expired. Run `/unwarn` again.', embeds: [], components: [] });
+        if (interaction.user.id !== pending.modId) return interaction.reply({ content: '❌ Only the moderator who ran this command can use this.', flags: [MessageFlags.Ephemeral] });
+        const selectedKey = interaction.values[0];
+        const w = activeWarnings.get(selectedKey);
+        if (!w) return interaction.update({ content: '❌ Warning no longer exists.', embeds: [], components: [] });
+        pendingUnwarns.set(pendingId, { ...pending, selectedKey, roleId: w.roleId, level: w.level });
+        const role = interaction.guild.roles.cache.get(w.roleId);
+        const E2 = (color, title) => new EmbedBuilder().setColor(color).setTitle(title).setTimestamp();
+        await interaction.update({ embeds: [E2('#FFA500','⚠️ Confirm Unwarn').setDescription(`Remove **Level ${w.level}** warning from <@${pending.targetUserId}>?`).addFields({ name: 'Role', value: role ? `${role}` : w.roleName, inline: true }, { name: 'Issued', value: `<t:${Math.floor(w.issuedAt/1000)}:R>`, inline: true }, { name: 'Reason', value: w.reason || 'No reason', inline: false }).setFooter({ text: 'Expires in 60 seconds' })], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`unwarn_confirm_${pendingId}`).setLabel('Confirm').setStyle(ButtonStyle.Danger), new ButtonBuilder().setCustomId(`unwarn_cancel_${pendingId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary))] });
+        return;
+    }
+
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('access_role_')) {
         const guildId = interaction.customId.replace('access_role_', '');
         if (guildId !== interaction.guild.id) return interaction.reply({ content: '❌ Invalid interaction.', flags: [MessageFlags.Ephemeral] });
@@ -454,15 +473,17 @@ client.on('interactionCreate', async interaction => {
             if (interaction.user.id !== pending.modId) return interaction.reply({ content: '❌ Only the moderator who ran this command can confirm.', flags: [MessageFlags.Ephemeral] });
             if (!isConfirm) { pendingUnwarns.delete(pendingId); return interaction.update({ content: '✅ Unwarn cancelled.', embeds: [], components: [] }); }
             pendingUnwarns.delete(pendingId);
-            const { targetUserId, targetUserTag, level, guildId, roleId } = pending;
+            const { targetUserId, targetUserTag, level, guildId, roleId, selectedKey } = pending;
             const member = interaction.guild.members.cache.get(targetUserId);
             const role = interaction.guild.roles.cache.get(roleId);
             if (!member) return interaction.update({ content: '❌ User is no longer in this server.', embeds: [], components: [] });
             if (!role) return interaction.update({ content: '❌ Role not found.', embeds: [], components: [] });
             await member.roles.remove(role);
             console.log(`🔒 [AUDIT] ${interaction.user.tag} unwarned ${targetUserTag} (Level ${level}) in ${interaction.guild.name}`);
-            const keys = [...activeWarnings.entries()].filter(([, w]) => w.userId === targetUserId && w.guildId === guildId && w.level === level).map(([k]) => k);
+            // If a specific warning key was selected, remove only that one; else remove all at that level
+            const keys = selectedKey ? [selectedKey] : [...activeWarnings.entries()].filter(([, w]) => w.userId === targetUserId && w.guildId === guildId && w.level === level).map(([k]) => k);
             for (const k of keys) { addHistory(guildId, targetUserId, { ...activeWarnings.get(k), endedAt: Date.now(), endReason: 'manual' }); clearTimeout(warningTimers.get(k)); warningTimers.delete(k); deleteWarning(k); }
+            logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#00ff00').setTitle('Warning Removed').addFields({ name: 'User', value: `<@${targetUserId}> (${targetUserTag})`, inline: true }, { name: 'Level', value: `${level}`, inline: true }, { name: 'Role', value: `${role}`, inline: true }, { name: 'Removed by', value: `${interaction.user}` }).setTimestamp());
             await interaction.update({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('✅ Warning Removed').addFields({ name: 'User', value: `<@${targetUserId}>`, inline: true }, { name: 'Level', value: `${level}`, inline: true }, { name: 'Role', value: `${role}`, inline: true }, { name: 'Removed by', value: `${interaction.user}` }).setTimestamp()], components: [] });
         }
         return;
@@ -481,7 +502,13 @@ client.on('interactionCreate', async interaction => {
     const E = (color, title) => new EmbedBuilder().setColor(color).setTitle(title).setTimestamp();
     const reply = (opts) => interaction.reply(typeof opts === 'string' ? { content: opts, flags: [MessageFlags.Ephemeral] } : opts);
 
-    if (commandName === 'help') {
+    if (commandName === 'invite') {
+        const perms = PermissionFlagsBits.ManageRoles | PermissionFlagsBits.KickMembers | PermissionFlagsBits.BanMembers | PermissionFlagsBits.ModerateMembers | PermissionFlagsBits.ViewChannel | PermissionFlagsBits.SendMessages | PermissionFlagsBits.EmbedLinks | PermissionFlagsBits.ReadMessageHistory | PermissionFlagsBits.ViewAuditLog;
+        const url = `https://discord.com/oauth2/authorize?client_id=${client.user.id}&permissions=${perms}&scope=bot%20applications.commands`;
+        return reply({ embeds: [E('#5865F2','➕ Invite Police Bot').setDescription(`[**Click here to invite me**](${url})\n\nThis link requests the minimum permissions needed to function correctly.`).addFields({ name: 'Permissions Requested', value: '• Manage Roles — assign/remove warning roles\n• Kick & Ban Members — moderation commands\n• Moderate Members — timeouts\n• Send Messages & Embed Links — responses\n• View Audit Log — detect who added the bot\n• Read Message History — channel access' }).setFooter({ text: 'You can adjust permissions after inviting' })], flags: [MessageFlags.Ephemeral] });
+    }
+
+    else if (commandName === 'help') {
         await reply({ embeds: [helpOverviewEmbed()], components: helpRows(), flags: [MessageFlags.Ephemeral] });
     }
 
@@ -503,6 +530,7 @@ client.on('interactionCreate', async interaction => {
             if (!cfg.levels || !Object.keys(cfg.levels).length) return reply('📋 No warning levels configured yet. Use /config set to add some.');
             const embed = E('#0099ff','🚨 Warning Configuration');
             for (const [lvl, d] of Object.entries(cfg.levels)) embed.addFields({ name: `Level ${lvl}`, value: `Role: <@&${d.roleId}>\nDuration: ${d.durationDisplay}`, inline: true });
+            embed.addFields({ name: 'Warn DMs', value: cfg.warnDm === false ? '🔕 Disabled' : '✅ Enabled', inline: true });
             await reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'logchannel') {
             const channel = interaction.options.getChannel('channel');
@@ -522,6 +550,11 @@ client.on('interactionCreate', async interaction => {
             delete cfg.levels[level]; saveConfig(guildId, cfg);
             console.log(`🔒 [AUDIT] ${interaction.user.tag} removed Level ${level} config in ${interaction.guild.name}`);
             await reply(`✅ Warning Level ${level} (${roleName}) removed from config.`);
+        } else if (sub === 'warndm') {
+            const enabled = interaction.options.getBoolean('enabled');
+            const cfg = await getConfig(guildId); cfg.warnDm = enabled; saveConfig(guildId, cfg);
+            console.log(`🔒 [AUDIT] ${interaction.user.tag} set warnDm=${enabled} in ${interaction.guild.name}`);
+            await reply({ embeds: [E(enabled ? '#00ff00' : '#FFA500', enabled ? '✅ Warn DMs Enabled' : '🔕 Warn DMs Disabled').setDescription(enabled ? 'Users will be DM\'d when they receive a warning.' : 'Users will **not** be DM\'d when they receive a warning.')], flags: [MessageFlags.Ephemeral] });
         }
     }
 
@@ -552,18 +585,18 @@ client.on('interactionCreate', async interaction => {
 
     else if (commandName === 'unwarn') {
         const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
-        const level = interaction.options.getInteger('level');
-        if (level < 1 || level > 100) return reply('❌ Level must be between 1 and 100.');
         if (!member) return reply(`❌ ${user} is not in this server.`);
-        const cfg = await getConfig(guildId);
-        if (!cfg.levels?.[level]) return reply(`❌ Level ${level} is not configured.`);
-        const role = interaction.guild.roles.cache.get(cfg.levels[level].roleId);
-        if (!role) return reply('❌ Configured role not found.');
-        if (!member.roles.cache.has(role.id)) return reply(`❌ ${user} doesn't have the ${role} role.`);
+        const userWarnings = [...activeWarnings.entries()].filter(([, w]) => w.guildId === guildId && w.userId === user.id);
+        if (!userWarnings.length) return reply(`❌ ${user} has no active warnings.`);
+        const options = userWarnings.slice(0, 25).map(([key, w]) => {
+            const expires = w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt/1000)}:R>`;
+            return { label: `Level ${w.level} — ${w.roleName}`, description: `${expires} · ${(w.reason||'No reason').slice(0,50)}`, value: key };
+        });
         const pendingId = interaction.id;
-        pendingUnwarns.set(pendingId, { targetUserId: user.id, targetUserTag: user.tag, level, guildId, roleId: role.id, modId: interaction.user.id });
+        pendingUnwarns.set(pendingId, { targetUserId: user.id, targetUserTag: user.tag, guildId, modId: interaction.user.id });
         setTimeout(() => pendingUnwarns.delete(pendingId), 60_000);
-        await reply({ embeds: [E('#FFA500','⚠️ Confirm Unwarn').setDescription(`Remove **Level ${level}** warning from ${user}?`).addFields({ name: 'Role to remove', value: `${role}`, inline: true }).setFooter({ text: 'Expires in 60 seconds' })], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`unwarn_confirm_${pendingId}`).setLabel('Confirm').setStyle(ButtonStyle.Danger), new ButtonBuilder().setCustomId(`unwarn_cancel_${pendingId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary))], flags: [MessageFlags.Ephemeral] });
+        const cfg = await getConfig(guildId);
+        await reply({ embeds: [E('#FFA500','⚠️ Remove a Warning').setDescription(`Select which warning to remove from ${user}.`).addFields({ name: 'Active Warnings', value: `${userWarnings.length} warning${userWarnings.length>1?'s':''} on record` }).setFooter({ text: 'Expires in 60 seconds' })], components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`unwarn_select_${pendingId}`).setPlaceholder('Select a warning to remove…').addOptions(options))], flags: [MessageFlags.Ephemeral] });
     }
 
     else if (commandName === 'timeout') {
