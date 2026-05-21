@@ -8,13 +8,15 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 - **/unwarn:** Manually removes a warning from the user.
 - **/timeout:** Gives a configurable length timeout to a user.
 - **/kick:** Kicks the user
-- **/ban:** Bans the user and deletes their messages in the last (configurable time).
+- **/ban:** Bans the user and deletes their messages in the last (configurable time). Can also be set to unban after set time.
+- **/unban:** Unbans the user.
 - **/mywarnings:** Shows you how much time is left on your warnings.
 
 ## Config:
 - **/config set:** Config the warning levels by matching them to roles and setting how long they take to expire.
 - **/config access:** Config what role is needed to access mod commands like /warn and /config.
 - **/config view:** Shows your current warning configuration.
+- **/config remove:** SRemoves a warning level.
 - **/config logchannel:** Set the channel where all warning, kick and ban embeds go to.
 - **/config removelogchannel:** Removes the log channel.
 
@@ -27,9 +29,10 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 - **/escalation settimeout:** Adds a special threshold where the user gets a configurable timeout.
 - **/escalation removetimeout:** Removes one of the special steps.
 
-## Moderation:
+## Admin:
 - **/history:** Shows the warning history of a specific user.
 - **/warnlist:** Shows all active warning in the server.
+- **/userinfo:** View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.
 
 ## Other
 
