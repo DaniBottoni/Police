@@ -507,7 +507,14 @@ client.on('interactionCreate', async interaction => {
     }
 
     const E = (color, title) => new EmbedBuilder().setColor(color).setTitle(title).setTimestamp();
-    const reply = (opts) => interaction.reply(typeof opts === 'string' ? { content: opts, flags: [MessageFlags.Ephemeral] } : opts);
+    const reply = (opts) => {
+        if (interaction.deferred) {
+            if (typeof opts === 'string') return interaction.editReply({ content: opts });
+            const { flags, ...rest } = opts;
+            return interaction.editReply(rest);
+        }
+        return interaction.reply(typeof opts === 'string' ? { content: opts, flags: [MessageFlags.Ephemeral] } : opts);
+    };
 
     if (commandName === 'invite') {
         const perms = PermissionFlagsBits.ManageRoles | PermissionFlagsBits.KickMembers | PermissionFlagsBits.BanMembers | PermissionFlagsBits.ModerateMembers | PermissionFlagsBits.ViewChannel | PermissionFlagsBits.SendMessages | PermissionFlagsBits.EmbedLinks | PermissionFlagsBits.ReadMessageHistory | PermissionFlagsBits.ViewAuditLog;
@@ -570,6 +577,7 @@ client.on('interactionCreate', async interaction => {
         const level = interaction.options.getInteger('level'), reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,1000).replace(/[\x00-\x1F\x7F]/g,'');
         if (level < 1 || level > 100) return reply('❌ Level must be between 1 and 100.');
         if (!member) return reply(`❌ ${user} is not in this server.`);
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const cfg = await getConfig(guildId);
         if (!cfg.levels?.[level]) return reply(`❌ Level ${level} is not configured. Use /config set first.`);
         const botMember = interaction.guild.members.me, configRole = interaction.guild.roles.cache.get(cfg.levels[level].roleId);
@@ -620,6 +628,7 @@ client.on('interactionCreate', async interaction => {
             const dur = parseDuration(interaction.options.getString('duration'));
             if (!dur || dur.isForever) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.');
             if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Discord timeouts cannot exceed 28 days.');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             try {
                 await member.timeout(dur.totalMs, reason);
                 const dd = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds), exTs = Math.floor((Date.now()+dur.totalMs)/1000);
@@ -631,6 +640,7 @@ client.on('interactionCreate', async interaction => {
             } catch (e) { console.error(e); await reply('❌ Failed to apply timeout. Check permissions.'); }
         } else if (sub === 'remove') {
             if (!member.communicationDisabledUntilTimestamp || member.communicationDisabledUntilTimestamp < Date.now()) return reply(`❌ ${user} is not currently timed out.`);
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             try {
                 await member.timeout(null, reason);
                 console.log(`🔒 [AUDIT] ${interaction.user.tag} removed timeout from ${user.tag} in ${interaction.guild.name}`);
@@ -683,6 +693,7 @@ client.on('interactionCreate', async interaction => {
         const botMember = interaction.guild.members.me;
         if (!botMember.permissions.has(PermissionFlagsBits.KickMembers)) return reply('❌ I need the "Kick Members" permission.');
         if (member.roles.highest.position >= botMember.roles.highest.position) return reply('❌ Cannot kick this user — their role is equal to or above mine.');
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         try {
             user.send({ embeds: [E('#ff6600','You have been kicked').setDescription(`You were kicked from **${interaction.guild.name}**.`).addFields({ name: 'Reason', value: reason })] }).catch(() => {});
             await member.kick(reason);
@@ -704,6 +715,7 @@ client.on('interactionCreate', async interaction => {
             const dur = durationStr ? parseDuration(durationStr) : null;
             if (durationStr && (!dur || dur.isForever)) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. "forever" is not valid — omit duration for a permanent ban.');
             if (member && member.roles.highest.position >= botMember.roles.highest.position) return reply('❌ Cannot ban this user — their role is equal to or above mine.');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             try {
                 const dd = dur ? formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds) : null;
                 const expiresAt = dur ? Date.now() + dur.totalMs : null;
@@ -720,6 +732,7 @@ client.on('interactionCreate', async interaction => {
             const userId = interaction.options.getString('user_id').trim();
             const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
             if (!/^\d{17,20}$/.test(userId)) return reply('❌ Invalid user ID. Must be a Discord snowflake (17-20 digits).');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             try {
                 const ban = await interaction.guild.bans.fetch(userId).catch(() => null);
                 if (!ban) return reply('❌ That user is not banned in this server.');
