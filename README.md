@@ -31,7 +31,7 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 - **/escalation removetimeout:** Removes one of the special steps.
 
 ## Admin:
-- **/history:** Shows the warning history of a specific user.
+- **/warning history:** Shows the warning history of a specific user.
 - **/warning list:** Shows all active warning in the server.
 - **/userinfo:** View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.
 
