@@ -239,19 +239,19 @@ function warnlistRow(page, total, guildId) {
 // ── Help pages ─────────────────────────────────────────────────────────────
 const helpPages = {
     help_warn: new EmbedBuilder().setColor('#ff0000').setTitle('Warning Commands').addFields(
-        { name: '/warn', value: 'Issue a warning to a user at a configured level. Requires a reason. Triggers escalation checks automatically.' },
+        { name: '/warning give', value: 'Issue a warning to a user at a configured level. Requires a reason. Triggers escalation checks automatically.' },
         { name: '/userinfo', value: 'View a user\'s full moderation profile — warnings, kicks, bans, notes, and more.' },
-        { name: '/unwarn', value: 'Remove a warning role from a user. Shows a confirm/cancel prompt before executing.' },
-        { name: '/timeout', value: 'Apply a Discord native timeout to a user. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` format (max 28 days).' },
+        { name: '/warning remove', value: 'Remove a warning from a user. Shows a dropdown to select which warning, then a confirm/cancel prompt.' },
+        { name: '/timeout give', value: 'Apply a Discord native timeout to a user. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` format (max 28 days).' },
         { name: '/mywarnings', value: 'Check your own active warnings and how long is left on each one.' },
-        { name: '/warnlist', value: 'View all active warnings in the server, paginated 10 users per page.' },
+        { name: '/warning list', value: 'View all active warnings in the server, paginated 10 users per page.' },
         { name: '/history', value: 'View the last 10 warning history entries for a specific user, including expired and manually removed warnings.' }
     ).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands').addFields(
         { name: '/kick', value: 'Kick a user from the server. Sends a DM, logs to history, and posts to the mod-log channel.' },
-        { name: '/ban', value: 'Ban a user. Optional timed ban with auto-unban on expiry. Optionally delete recent messages (0–7 days).' },
-        { name: '/unban', value: 'Unban a user by their ID. Logs to history and mod-log channel.' },
-        { name: '/timeout', value: 'Apply a Discord native timeout. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' },
+        { name: '/ban give', value: 'Ban a user. Optional timed ban with auto-unban on expiry. Optionally delete recent messages (0–7 days).' },
+        { name: '/ban remove', value: 'Unban a user by their ID. Logs to history and mod-log channel.' },
+        { name: '/timeout give / remove', value: 'Apply or remove a Discord native timeout. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' },
         { name: '/userinfo', value: 'View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.' }
     ).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands').addFields(
@@ -311,33 +311,39 @@ client.once('ready', async () => {
 
     const commands = [
         new SlashCommandBuilder().setName('invite').setDescription('Get a link to invite this bot to another server'),
-        new SlashCommandBuilder().setName('warn').setDescription('Give a warning to a user')
-            .addUserOption(o => o.setName('user').setDescription('User to warn').setRequired(true))
-            .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true))
-            .addStringOption(o => o.setName('reason').setDescription('Reason for the warning')),
-        new SlashCommandBuilder().setName('unwarn').setDescription('Remove a warning from a user')
-            .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
-        new SlashCommandBuilder().setName('timeout').setDescription('Apply a Discord timeout to a user')
-            .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
-            .addStringOption(o => o.setName('duration').setDescription('m:s / h:m:s / d:h:m:s, max 28 days').setRequired(true))
-            .addStringOption(o => o.setName('reason').setDescription('Reason')),
+        new SlashCommandBuilder().setName('warning').setDescription('Manage warnings')
+            .addSubcommand(s => s.setName('give').setDescription('Give a warning to a user')
+                .addUserOption(o => o.setName('user').setDescription('User to warn').setRequired(true))
+                .addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason for the warning')))
+            .addSubcommand(s => s.setName('remove').setDescription('Remove a warning from a user')
+                .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+            .addSubcommand(s => s.setName('list').setDescription('View all active warnings in this server')),
+        new SlashCommandBuilder().setName('timeout').setDescription('Manage timeouts')
+            .addSubcommand(s => s.setName('give').setDescription('Apply a Discord timeout to a user')
+                .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+                .addStringOption(o => o.setName('duration').setDescription('m:s / h:m:s / d:h:m:s, max 28 days').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason')))
+            .addSubcommand(s => s.setName('remove').setDescription('Remove a timeout from a user')
+                .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason'))),
         new SlashCommandBuilder().setName('mywarnings').setDescription('Check your active warnings'),
-        new SlashCommandBuilder().setName('warnlist').setDescription('View all active warnings in this server'),
         new SlashCommandBuilder().setName('history').setDescription('View warning history for a user')
             .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
         new SlashCommandBuilder().setName('kick').setDescription('Kick a user')
             .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
             .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)),
-        new SlashCommandBuilder().setName('ban').setDescription('Ban a user')
-            .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
-            .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true))
-            .addStringOption(o => o.setName('duration').setDescription('Optional timed ban duration (m:s / h:m:s / d:h:m:s)'))
-            .addIntegerOption(o => o.setName('delete_days').setDescription('Days of messages to delete (0-7)').setMinValue(0).setMaxValue(7)),
+        new SlashCommandBuilder().setName('ban').setDescription('Manage bans')
+            .addSubcommand(s => s.setName('give').setDescription('Ban a user')
+                .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true))
+                .addStringOption(o => o.setName('duration').setDescription('Optional timed ban duration (m:s / h:m:s / d:h:m:s)'))
+                .addIntegerOption(o => o.setName('delete_days').setDescription('Days of messages to delete (0-7)').setMinValue(0).setMaxValue(7)))
+            .addSubcommand(s => s.setName('remove').setDescription('Unban a user from the server')
+                .addStringOption(o => o.setName('user_id').setDescription('User ID to unban').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason for unban'))),
         new SlashCommandBuilder().setName('userinfo').setDescription('View info and moderation history for a user')
             .addUserOption(o => o.setName('user').setDescription('User to look up').setRequired(true)),
-        new SlashCommandBuilder().setName('unban').setDescription('Unban a user from the server')
-            .addStringOption(o => o.setName('user_id').setDescription('User ID to unban').setRequired(true))
-            .addStringOption(o => o.setName('reason').setDescription('Reason for unban')),
         new SlashCommandBuilder().setName('note').setDescription('Manage mod notes on a user')
             .addSubcommand(s => s.setName('add').setDescription('Add a note').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('text').setDescription('Note content').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View notes').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
@@ -493,7 +499,7 @@ client.on('interactionCreate', async interaction => {
     const { commandName, guildId } = interaction;
     if (!interaction.guild) return interaction.reply({ content: '❌ Server only.', flags: [MessageFlags.Ephemeral] });
 
-    const restricted = ['config','warn','unwarn','timeout','kick','ban','unban','note','userinfo','warnlist','history','escalation'];
+    const restricted = ['config','warning','timeout','kick','ban','note','userinfo','history','escalation'];
     if (restricted.includes(commandName) && !await hasCommandPermission(interaction, guildId)) {
         const cfg = await getConfig(guildId);
         return interaction.reply({ content: `❌ No permission.\n\n**Required:** Administrator OR ${cfg.accessRoleId ? `<@&${cfg.accessRoleId}>` : 'no role configured'}\n\nAsk an admin to run \`/config access\`.`, flags: [MessageFlags.Ephemeral] });
@@ -558,7 +564,7 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    else if (commandName === 'warn') {
+    else if (commandName === 'warning' && interaction.options.getSubcommand() === 'give') {
         const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
         const level = interaction.options.getInteger('level'), reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,1000).replace(/[\x00-\x1F\x7F]/g,'');
         if (level < 1 || level > 100) return reply('❌ Level must be between 1 and 100.');
@@ -583,7 +589,7 @@ client.on('interactionCreate', async interaction => {
         } catch (e) { console.error(e); await reply('❌ Failed to assign warning. Check permissions.'); }
     }
 
-    else if (commandName === 'unwarn') {
+    else if (commandName === 'warning' && interaction.options.getSubcommand() === 'remove') {
         const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
         if (!member) return reply(`❌ ${user} is not in this server.`);
         const userWarnings = [...activeWarnings.entries()].filter(([, w]) => w.guildId === guildId && w.userId === user.id);
@@ -602,23 +608,34 @@ client.on('interactionCreate', async interaction => {
     }
 
     else if (commandName === 'timeout') {
+        const sub = interaction.options.getSubcommand();
         const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
         const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
         if (!member) return reply(`❌ ${user} is not in this server.`);
-        const dur = parseDuration(interaction.options.getString('duration'));
-        if (!dur || dur.isForever) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.');
-        if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Discord timeouts cannot exceed 28 days.');
         const botMember = interaction.guild.members.me;
         if (!botMember.permissions.has(PermissionFlagsBits.ModerateMembers)) return reply('❌ I need the "Moderate Members" permission.');
-        if (member.roles.highest.position >= botMember.roles.highest.position) return reply('❌ Cannot timeout this user — their role is equal to or above mine.');
-        try {
-            await member.timeout(dur.totalMs, reason);
-            const dd = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds), exTs = Math.floor((Date.now()+dur.totalMs)/1000);
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} timed out ${user.tag} for ${dd} in ${interaction.guild.name}`);
-            logMod(interaction.guild, guildId, E('#ff6600','Member Timed Out').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
-            user.send({ embeds: [E('#ff6600','You Have Been Timed Out').setDescription(`You were timed out in **${interaction.guild.name}**.`).addFields({ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason })] }).catch(() => {});
-            await reply({ embeds: [E('#ff6600','Timeout Applied').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Issued by', value: `${interaction.user}` })] });
-        } catch (e) { console.error(e); await reply('❌ Failed to apply timeout. Check permissions.'); }
+        if (member.roles.highest.position >= botMember.roles.highest.position) return reply(`❌ Cannot ${sub === 'give' ? 'timeout' : 'remove timeout from'} this user — their role is equal to or above mine.`);
+        if (sub === 'give') {
+            const dur = parseDuration(interaction.options.getString('duration'));
+            if (!dur || dur.isForever) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.');
+            if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Discord timeouts cannot exceed 28 days.');
+            try {
+                await member.timeout(dur.totalMs, reason);
+                const dd = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds), exTs = Math.floor((Date.now()+dur.totalMs)/1000);
+                console.log(`🔒 [AUDIT] ${interaction.user.tag} timed out ${user.tag} for ${dd} in ${interaction.guild.name}`);
+                logMod(interaction.guild, guildId, E('#ff6600','Member Timed Out').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
+                user.send({ embeds: [E('#ff6600','You Have Been Timed Out').setDescription(`You were timed out in **${interaction.guild.name}**.`).addFields({ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason })] }).catch(() => {});
+                await reply({ embeds: [E('#ff6600','Timeout Applied').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Issued by', value: `${interaction.user}` })] });
+            } catch (e) { console.error(e); await reply('❌ Failed to apply timeout. Check permissions.'); }
+        } else if (sub === 'remove') {
+            if (!member.communicationDisabledUntilTimestamp || member.communicationDisabledUntilTimestamp < Date.now()) return reply(`❌ ${user} is not currently timed out.`);
+            try {
+                await member.timeout(null, reason);
+                console.log(`🔒 [AUDIT] ${interaction.user.tag} removed timeout from ${user.tag} in ${interaction.guild.name}`);
+                logMod(interaction.guild, guildId, E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
+                await reply({ embeds: [E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Removed by', value: `${interaction.user}` })] });
+            } catch (e) { console.error(e); await reply('❌ Failed to remove timeout. Check permissions.'); }
+        }
     }
 
     else if (commandName === 'mywarnings') {
@@ -637,7 +654,7 @@ client.on('interactionCreate', async interaction => {
         await reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     }
 
-    else if (commandName === 'warnlist') {
+    else if (commandName === 'warning' && interaction.options.getSubcommand() === 'list') {
         const { embed, totalPages, page } = buildWarnlistEmbed(guildId, 0);
         await reply({ embeds: [embed], components: warnlistRow(page, totalPages, guildId) });
     }
@@ -674,92 +691,44 @@ client.on('interactionCreate', async interaction => {
     }
 
     else if (commandName === 'ban') {
-        const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
-        const reason = interaction.options.getString('reason').slice(0,512).replace(/[ -]/g,''), deleteDays = interaction.options.getInteger('delete_days') ?? 0;
-        const durationStr = interaction.options.getString('duration');
-        const dur = durationStr ? parseDuration(durationStr) : null;
-        if (durationStr && (!dur || dur.isForever)) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. "forever" is not valid — omit duration for a permanent ban.');
+        const sub = interaction.options.getSubcommand();
         const botMember = interaction.guild.members.me;
         if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) return reply('❌ I need the "Ban Members" permission.');
-        if (member && member.roles.highest.position >= botMember.roles.highest.position) return reply('❌ Cannot ban this user — their role is equal to or above mine.');
-        try {
-            const dd = dur ? formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds) : null;
-            const expiresAt = dur ? Date.now() + dur.totalMs : null;
-            const exTs = expiresAt ? Math.floor(expiresAt / 1000) : null;
-            if (member) user.send({ embeds: [E('#ff0000','You have been banned').setDescription(`You were banned from **${interaction.guild.name}**.`).addFields({ name: 'Reason', value: reason }, ...(dd ? [{ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []))] }).catch(() => {});
-            await interaction.guild.members.ban(user, { reason, deleteMessageDays: deleteDays });
-            addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'ban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), deleteDays, expiresAt });
-            if (expiresAt) scheduleBanExpiry(guildId, user.id, user.tag, expiresAt, reason);
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} banned ${user.tag} from ${interaction.guild.name}${dd ? ` for ${dd}` : ''}`);
-            logMod(interaction.guild, guildId, E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Duration', value: dd || 'Permanent', inline: true }, ...(exTs ? [{ name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []), { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true }, { name: 'Reason', value: reason }));
-            await reply({ embeds: [E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Duration', value: dd || 'Permanent', inline: true }, ...(exTs ? [{ name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []), { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true }, { name: 'Reason', value: reason }, { name: 'Banned by', value: `${interaction.user}` })] });
-        } catch (e) { console.error(e); await reply('❌ Failed to ban user. Check permissions.'); }
-    }
-
-    else if (commandName === 'userinfo') {
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const user = interaction.options.getUser('user');
-        const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-        const cfg = await getConfig(guildId);
-        const allHistory = await getAllHistory(guildId, user.id);
-        const activeUserWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === user.id);
-        const notes = await getNotes(guildId, user.id);
-
-        // Stats from history
-        const warnCounts = {}, kicks = allHistory.filter(e => e.type === 'kick').length, bans = allHistory.filter(e => e.type === 'ban').length;
-        for (const e of allHistory.filter(e => !e.type)) { warnCounts[e.level] = (warnCounts[e.level] || 0) + 1; }
-        const timeoutCount = allHistory.filter(e => e.type === 'timeout').length;
-
-        const embed = E('#5865F2', `👤 ${user.tag}`)
-            .setThumbnail(user.displayAvatarURL())
-            .addFields(
-                { name: 'Account Created', value: `<t:${Math.floor(user.createdTimestamp/1000)}:D> (<t:${Math.floor(user.createdTimestamp/1000)}:R>)`, inline: true },
-                { name: 'Joined Server', value: member ? `<t:${Math.floor(member.joinedTimestamp/1000)}:D> (<t:${Math.floor(member.joinedTimestamp/1000)}:R>)` : 'Not in server', inline: true }
-            );
-
-        if (member) {
-            const roles = member.roles.cache.filter(r => r.id !== interaction.guild.id).sort((a,b) => b.position - a.position).map(r => `${r}`).slice(0,10).join(' ');
-            if (roles) embed.addFields({ name: 'Roles', value: roles || 'None' });
+        if (sub === 'give') {
+            const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
+            const reason = interaction.options.getString('reason').slice(0,512).replace(/[ -]/g,''), deleteDays = interaction.options.getInteger('delete_days') ?? 0;
+            const durationStr = interaction.options.getString('duration');
+            const dur = durationStr ? parseDuration(durationStr) : null;
+            if (durationStr && (!dur || dur.isForever)) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. "forever" is not valid — omit duration for a permanent ban.');
+            if (member && member.roles.highest.position >= botMember.roles.highest.position) return reply('❌ Cannot ban this user — their role is equal to or above mine.');
+            try {
+                const dd = dur ? formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds) : null;
+                const expiresAt = dur ? Date.now() + dur.totalMs : null;
+                const exTs = expiresAt ? Math.floor(expiresAt / 1000) : null;
+                if (member) user.send({ embeds: [E('#ff0000','You have been banned').setDescription(`You were banned from **${interaction.guild.name}**.`).addFields({ name: 'Reason', value: reason }, ...(dd ? [{ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []))] }).catch(() => {});
+                await interaction.guild.members.ban(user, { reason, deleteMessageDays: deleteDays });
+                addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'ban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), deleteDays, expiresAt });
+                if (expiresAt) scheduleBanExpiry(guildId, user.id, user.tag, expiresAt, reason);
+                console.log(`🔒 [AUDIT] ${interaction.user.tag} banned ${user.tag} from ${interaction.guild.name}${dd ? ` for ${dd}` : ''}`);
+                logMod(interaction.guild, guildId, E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Duration', value: dd || 'Permanent', inline: true }, ...(exTs ? [{ name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []), { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true }, { name: 'Reason', value: reason }));
+                await reply({ embeds: [E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Duration', value: dd || 'Permanent', inline: true }, ...(exTs ? [{ name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []), { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true }, { name: 'Reason', value: reason }, { name: 'Banned by', value: `${interaction.user}` })] });
+            } catch (e) { console.error(e); await reply('❌ Failed to ban user. Check permissions.'); }
+        } else if (sub === 'remove') {
+            const userId = interaction.options.getString('user_id').trim();
+            const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
+            if (!/^\d{17,20}$/.test(userId)) return reply('❌ Invalid user ID. Must be a Discord snowflake (17-20 digits).');
+            try {
+                const ban = await interaction.guild.bans.fetch(userId).catch(() => null);
+                if (!ban) return reply('❌ That user is not banned in this server.');
+                await interaction.guild.members.unban(userId, reason);
+                const user = ban.user;
+                addHistory(guildId, userId, { guildId, userId, userTag: user.tag, type: 'unban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
+                console.log(`🔒 [AUDIT] ${interaction.user.tag} unbanned ${user.tag} from ${interaction.guild.name}`);
+                logMod(interaction.guild, guildId, E('#00ff00','Member Unbanned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }));
+                await reply({ embeds: [E('#00ff00','Member Unbanned').addFields({ name: 'User', value: `${user.tag}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Unbanned by', value: `${interaction.user}` })] });
+            } catch (e) { console.error(e); await reply('❌ Failed to unban. Check permissions.'); }
         }
-
-        const warnSummary = Object.keys(warnCounts).length
-            ? Object.entries(warnCounts).sort(([a],[b])=>a-b).map(([l,c]) => `Level ${l}: **${c}**`).join(' • ')
-            : 'None';
-        embed.addFields(
-            { name: 'Active Warnings', value: activeUserWarnings.length ? activeUserWarnings.map(w => { const exp = w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt/1000)}:R>`; return `Level ${w.level} — ${exp}`; }).join('\n') : 'None', inline: true },
-            { name: 'Total Warns (all time)', value: warnSummary, inline: true },
-            { name: 'Kicks', value: `${kicks}`, inline: true },
-            { name: 'Bans', value: `${bans}`, inline: true },
-            { name: 'Notes', value: `${notes.length}`, inline: true }
-        );
-
-        if (allHistory.length) {
-            const last = allHistory[allHistory.length - 1];
-            const typeLabel = last.type === 'kick' ? 'Kick' : last.type === 'ban' ? 'Ban' : `Level ${last.level} warn`;
-            embed.addFields({ name: 'Last Action', value: `${typeLabel} <t:${Math.floor(last.issuedAt/1000)}:R> by ${last.issuedBy}` });
-        }
-
-        await interaction.editReply({ embeds: [embed] });
     }
-
-    else if (commandName === 'unban') {
-        const userId = interaction.options.getString('user_id').trim();
-        const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
-        if (!/^\d{17,20}$/.test(userId)) return reply('❌ Invalid user ID. Must be a Discord snowflake (17-20 digits).');
-        const botMember = interaction.guild.members.me;
-        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) return reply('❌ I need the "Ban Members" permission.');
-        try {
-            const ban = await interaction.guild.bans.fetch(userId).catch(() => null);
-            if (!ban) return reply('❌ That user is not banned in this server.');
-            await interaction.guild.members.unban(userId, reason);
-            const user = ban.user;
-            addHistory(guildId, userId, { guildId, userId, userTag: user.tag, type: 'unban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} unbanned ${user.tag} from ${interaction.guild.name}`);
-            logMod(interaction.guild, guildId, E('#00ff00','Member Unbanned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }));
-            await reply({ embeds: [E('#00ff00','Member Unbanned').addFields({ name: 'User', value: `${user.tag}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Unbanned by', value: `${interaction.user}` })] });
-        } catch (e) { console.error(e); await reply('❌ Failed to unban. Check permissions.'); }
-    }
-
     else if (commandName === 'note') {
         const sub = interaction.options.getSubcommand(), user = interaction.options.getUser('user');
         if (sub === 'add') {
