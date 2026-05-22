@@ -206,7 +206,6 @@ async function checkEscalation(guild, member, user, guildId, level, channelId, i
 function keepAlive() {
     const ping = () => {
         const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
-        (url.startsWith('https://') ? https : http).get(url, r => console.log(`🏓 Keep-alive: ${r.statusCode}`)).on('error', e => console.error('Keep-alive failed:', e.message));
     };
     setTimeout(ping, 5000); setInterval(ping, 14 * 60 * 1000);
 }
@@ -403,7 +402,6 @@ client.once('ready', async () => {
 
 // ── Guild join ─────────────────────────────────────────────────────────────
 client.on('guildCreate', async guild => {
-    console.log(`Bot joined: ${guild.name}`);
     const cfg = await getConfig(guild.id);
     if (!cfg.levels) saveConfig(guild.id, { levels: {} });
     try {
@@ -454,7 +452,6 @@ client.on('interactionCreate', async interaction => {
         if (role.managed) return interaction.update({ content: '❌ Cannot use managed/bot roles.', components: [] });
         const cfg = await getConfig(guildId); cfg.accessRoleId = role.id; saveConfig(guildId, cfg);
         await interaction.update({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Access Control Updated').setDescription(`Members with the ${role} role can now use moderation commands.\n\n*Server administrators always have access.*`).setTimestamp()], components: [] });
-        console.log(`🔒 [AUDIT] Access role set to ${role.name} in ${interaction.guild.name}`);
         return;
     }
 
@@ -486,7 +483,6 @@ client.on('interactionCreate', async interaction => {
             if (!member) return interaction.update({ content: '❌ User is no longer in this server.', embeds: [], components: [] });
             if (!role) return interaction.update({ content: '❌ Role not found.', embeds: [], components: [] });
             await member.roles.remove(role);
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} unwarned ${targetUserTag} (Level ${level}) in ${interaction.guild.name}`);
             // If a specific warning key was selected, remove only that one; else remove all at that level
             const keys = selectedKey ? [selectedKey] : [...activeWarnings.entries()].filter(([, w]) => w.userId === targetUserId && w.guildId === guildId && w.level === level).map(([k]) => k);
             for (const k of keys) { addHistory(guildId, targetUserId, { ...activeWarnings.get(k), endedAt: Date.now(), endReason: 'manual' }); clearTimeout(warningTimers.get(k)); warningTimers.delete(k); deleteWarning(k); }
@@ -537,7 +533,6 @@ client.on('interactionCreate', async interaction => {
             const cfg = await getConfig(guildId); cfg.levels ??= {};
             cfg.levels[level] = { roleId: role.id, roleName: role.name, durationMs: dur.totalMs, isForever: dur.isForever, durationDisplay: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds, dur.isForever) };
             saveConfig(guildId, cfg);
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} configured Level ${level} → ${role.name} in ${interaction.guild.name}`);
             await reply({ embeds: [E('#00ff00','Warning Level Configured').addFields({ name: 'Level', value: `${level}`, inline: true }, { name: 'Role', value: `${role}`, inline: true }, { name: 'Duration', value: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds, dur.isForever), inline: true })], flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'view') {
             const cfg = await getConfig(guildId);
@@ -562,12 +557,10 @@ client.on('interactionCreate', async interaction => {
             if (!cfg.levels?.[level]) return reply(`❌ Level ${level} is not configured.`);
             const roleName = cfg.levels[level].roleName;
             delete cfg.levels[level]; saveConfig(guildId, cfg);
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} removed Level ${level} config in ${interaction.guild.name}`);
             await reply(`Warning Level ${level} (${roleName}) removed from config.`);
         } else if (sub === 'warndm') {
             const enabled = interaction.options.getBoolean('enabled');
             const cfg = await getConfig(guildId); cfg.warnDm = enabled; saveConfig(guildId, cfg);
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} set warnDm=${enabled} in ${interaction.guild.name}`);
             await reply({ embeds: [E(enabled ? '#00ff00' : '#FFA500', enabled ? 'Warn DMs Enabled' : 'Warn DMs Disabled').setDescription(enabled ? 'Users will be DM\'d when they receive a warning.' : 'Users will **not** be DM\'d when they receive a warning.')], flags: [MessageFlags.Ephemeral] });
         }
     }
@@ -587,7 +580,6 @@ client.on('interactionCreate', async interaction => {
         try {
             const result = await applyWarning(interaction.guild, member, user, guildId, level, reason, interaction.channel.id, interaction.user.tag);
             if (result.error) return reply(`❌ ${result.error}`);
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} warned ${user.tag} (Level ${level}) in ${interaction.guild.name}`);
             logMod(interaction.guild, guildId, E('#ff0000','Warning Issued').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Level', value: `${level}`, inline: true }, { name: 'Duration', value: result.config.durationDisplay||'Unknown', inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
             await reply({ embeds: [E('#ff0000','Warning Issued').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Level', value: `${level}`, inline: true }, { name: 'Role', value: `${result.role}`, inline: true }, { name: 'Duration', value: result.config.durationDisplay||'Unknown', inline: true }, { name: 'Reason', value: reason }, { name: 'Issued by', value: `${interaction.user}` })] });
             const esc = await checkEscalation(interaction.guild, member, user, guildId, level, interaction.channel.id, interaction.user.tag);
@@ -632,7 +624,6 @@ client.on('interactionCreate', async interaction => {
             try {
                 await member.timeout(dur.totalMs, reason);
                 const dd = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds), exTs = Math.floor((Date.now()+dur.totalMs)/1000);
-                console.log(`🔒 [AUDIT] ${interaction.user.tag} timed out ${user.tag} for ${dd} in ${interaction.guild.name}`);
                 logMod(interaction.guild, guildId, E('#ff6600','Member Timed Out').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
                 user.send({ embeds: [E('#ff6600','You Have Been Timed Out').setDescription(`You were timed out in **${interaction.guild.name}**.`).addFields({ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason })] }).catch(() => {});
                 addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'timeout', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), duration: dd });
@@ -643,7 +634,6 @@ client.on('interactionCreate', async interaction => {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             try {
                 await member.timeout(null, reason);
-                console.log(`🔒 [AUDIT] ${interaction.user.tag} removed timeout from ${user.tag} in ${interaction.guild.name}`);
                 logMod(interaction.guild, guildId, E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
                 addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'timeout_remove', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
                 await reply({ embeds: [E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Removed by', value: `${interaction.user}` })] });
@@ -698,7 +688,6 @@ client.on('interactionCreate', async interaction => {
             user.send({ embeds: [E('#ff6600','You have been kicked').setDescription(`You were kicked from **${interaction.guild.name}**.`).addFields({ name: 'Reason', value: reason })] }).catch(() => {});
             await member.kick(reason);
             addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'kick', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} kicked ${user.tag} from ${interaction.guild.name}`);
             logMod(interaction.guild, guildId, E('#ff6600','Member Kicked').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }));
             await reply({ embeds: [E('#ff6600','Member Kicked').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Kicked by', value: `${interaction.user}` })] });
         } catch (e) { console.error(e); await reply('❌ Failed to kick user. Check permissions.'); }
@@ -724,7 +713,6 @@ client.on('interactionCreate', async interaction => {
                 await interaction.guild.members.ban(user, { reason, deleteMessageDays: deleteDays });
                 addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'ban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), deleteDays, expiresAt });
                 if (expiresAt) scheduleBanExpiry(guildId, user.id, user.tag, expiresAt, reason);
-                console.log(`🔒 [AUDIT] ${interaction.user.tag} banned ${user.tag} from ${interaction.guild.name}${dd ? ` for ${dd}` : ''}`);
                 logMod(interaction.guild, guildId, E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Duration', value: dd || 'Permanent', inline: true }, ...(exTs ? [{ name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []), { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true }, { name: 'Reason', value: reason }));
                 await reply({ embeds: [E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Duration', value: dd || 'Permanent', inline: true }, ...(exTs ? [{ name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []), { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true }, { name: 'Reason', value: reason }, { name: 'Banned by', value: `${interaction.user}` })] });
             } catch (e) { console.error(e); await reply('❌ Failed to ban user. Check permissions.'); }
@@ -739,7 +727,6 @@ client.on('interactionCreate', async interaction => {
                 await interaction.guild.members.unban(userId, reason);
                 const user = ban.user;
                 addHistory(guildId, userId, { guildId, userId, userTag: user.tag, type: 'unban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
-                console.log(`🔒 [AUDIT] ${interaction.user.tag} unbanned ${user.tag} from ${interaction.guild.name}`);
                 logMod(interaction.guild, guildId, E('#00ff00','Member Unbanned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }));
                 await reply({ embeds: [E('#00ff00','Member Unbanned').addFields({ name: 'User', value: `${user.tag}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Unbanned by', value: `${interaction.user}` })] });
             } catch (e) { console.error(e); await reply('❌ Failed to unban. Check permissions.'); }
@@ -798,7 +785,6 @@ client.on('interactionCreate', async interaction => {
             const text = interaction.options.getString('text').slice(0,1000).replace(/[\x00-\x1F\x7F]/g,'');
             const note = { id: Date.now(), text, addedBy: interaction.user.tag, addedAt: Date.now() };
             addNote(guildId, user.id, note);
-            console.log(`🔒 [AUDIT] ${interaction.user.tag} added note to ${user.tag} in ${interaction.guild.name}`);
             await reply(`✅ Note added to ${user} (ID: \`${note.id}\`).`);
         } else if (sub === 'view') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
