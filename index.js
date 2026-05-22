@@ -205,6 +205,7 @@ async function checkEscalation(guild, member, user, guildId, level, channelId, i
 function keepAlive() {
     const ping = () => {
         const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
+        fetch(`${url}/health`).then(() => console.log(`🏓 Keep-alive ping sent to ${url}`)).catch(() => {});
     };
     setTimeout(ping, 5000); setInterval(ping, 14 * 60 * 1000);
 }
