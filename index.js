@@ -626,6 +626,7 @@ client.on('interactionCreate', async interaction => {
                 console.log(`🔒 [AUDIT] ${interaction.user.tag} timed out ${user.tag} for ${dd} in ${interaction.guild.name}`);
                 logMod(interaction.guild, guildId, E('#ff6600','Member Timed Out').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
                 user.send({ embeds: [E('#ff6600','You Have Been Timed Out').setDescription(`You were timed out in **${interaction.guild.name}**.`).addFields({ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason })] }).catch(() => {});
+                addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'timeout', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), duration: dd });
                 await reply({ embeds: [E('#ff6600','Timeout Applied').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Issued by', value: `${interaction.user}` })] });
             } catch (e) { console.error(e); await reply('❌ Failed to apply timeout. Check permissions.'); }
         } else if (sub === 'remove') {
@@ -634,6 +635,7 @@ client.on('interactionCreate', async interaction => {
                 await member.timeout(null, reason);
                 console.log(`🔒 [AUDIT] ${interaction.user.tag} removed timeout from ${user.tag} in ${interaction.guild.name}`);
                 logMod(interaction.guild, guildId, E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
+                addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'timeout_remove', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
                 await reply({ embeds: [E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Removed by', value: `${interaction.user}` })] });
             } catch (e) { console.error(e); await reply('❌ Failed to remove timeout. Check permissions.'); }
         }
@@ -730,6 +732,53 @@ client.on('interactionCreate', async interaction => {
             } catch (e) { console.error(e); await reply('❌ Failed to unban. Check permissions.'); }
         }
     }
+    else if (commandName === 'userinfo') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const user = interaction.options.getUser('user');
+        const [member, history, notes] = await Promise.all([
+            interaction.guild.members.fetch(user.id).catch(() => null),
+            getAllHistory(guildId, user.id),
+            getNotes(guildId, user.id)
+        ]);
+
+        const embed = new EmbedBuilder()
+            .setColor('#5865F2')
+            .setAuthor({ name: user.tag, iconURL: user.displayAvatarURL({ size: 256 }) })
+            .setThumbnail(user.displayAvatarURL({ size: 256 }))
+            .addFields(
+                { name: 'Account Created', value: `<t:${Math.floor(user.createdTimestamp/1000)}:F>\n<t:${Math.floor(user.createdTimestamp/1000)}:R>`, inline: true },
+                { name: 'Joined Server', value: member ? `<t:${Math.floor(member.joinedTimestamp/1000)}:F>\n<t:${Math.floor(member.joinedTimestamp/1000)}:R>` : '*Not in server*', inline: true }
+            )
+            .setTimestamp();
+
+        // Active warnings by level
+        const activeUserWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === user.id);
+        const activeByLevel = {};
+        for (const w of activeUserWarnings) activeByLevel[w.level] = (activeByLevel[w.level] || 0) + 1;
+        embed.addFields({ name: 'Active Warnings', value: Object.keys(activeByLevel).length
+            ? Object.entries(activeByLevel).sort(([a],[b])=>a-b).map(([l,c])=>`Level ${l}: **${c}**`).join('\n')
+            : 'None', inline: true });
+
+        // History: warn counts per level, timeouts, kicks, bans
+        const warnCounts = {}, timeoutCount = history.filter(e => e.type === 'timeout').length,
+              kickCount = history.filter(e => e.type === 'kick').length,
+              banCount  = history.filter(e => e.type === 'ban').length;
+        for (const e of history) if (e.level != null) warnCounts[e.level] = (warnCounts[e.level] || 0) + 1;
+
+        if (Object.keys(warnCounts).length) embed.addFields({ name: 'Warn History', value: Object.entries(warnCounts).sort(([a],[b])=>a-b).map(([l,c])=>`Level ${l}: **${c}**`).join('\n'), inline: true });
+        const modLines = [...(timeoutCount ? [`Timeouts: **${timeoutCount}**`] : []), ...(kickCount ? [`Kicks: **${kickCount}**`] : []), ...(banCount ? [`Bans: **${banCount}**`] : [])];
+        if (modLines.length) embed.addFields({ name: 'Mod Actions', value: modLines.join('\n'), inline: true });
+
+        // Notes
+        if (notes.length) {
+            const shown = notes.slice(-5);
+            embed.addFields({ name: `Notes (${notes.length})`, value: shown.map(n => `\`${n.id}\` <t:${Math.floor(n.addedAt/1000)}:d> by **${n.addedBy}**\n${n.text.slice(0,100)}${n.text.length>100?'…':''}`).join('\n\n') });
+            if (notes.length > 5) embed.setFooter({ text: `Showing last 5 of ${notes.length} notes` });
+        }
+
+        await interaction.editReply({ embeds: [embed] });
+    }
+
     else if (commandName === 'note') {
         const sub = interaction.options.getSubcommand(), user = interaction.options.getUser('user');
         if (sub === 'add') {
