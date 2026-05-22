@@ -32,7 +32,7 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 
 ## Admin:
 - **/history:** Shows the warning history of a specific user.
-- **/warnlist:** Shows all active warning in the server.
+- **/warning list:** Shows all active warning in the server.
 - **/userinfo:** View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.
 
 ## Notes:
