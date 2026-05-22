@@ -245,7 +245,7 @@ const helpPages = {
         { name: '/timeout give', value: 'Apply a Discord native timeout to a user. Duration uses `m:s`, `h:m:s`, or `d:h:m:s` format (max 28 days).' },
         { name: '/mywarnings', value: 'Check your own active warnings and how long is left on each one.' },
         { name: '/warning list', value: 'View all active warnings in the server, paginated 10 users per page.' },
-        { name: '/history', value: 'View the last 10 warning history entries for a specific user, including expired and manually removed warnings.' }
+        { name: '/warning history', value: 'View the last 10 warning history entries for a specific user, including expired and manually removed warnings.' }
     ).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands').addFields(
         { name: '/kick', value: 'Kick a user from the server. Sends a DM, logs to history, and posts to the mod-log channel.' },
@@ -318,7 +318,9 @@ client.once('ready', async () => {
                 .addStringOption(o => o.setName('reason').setDescription('Reason for the warning')))
             .addSubcommand(s => s.setName('remove').setDescription('Remove a warning from a user')
                 .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
-            .addSubcommand(s => s.setName('list').setDescription('View all active warnings in this server')),
+            .addSubcommand(s => s.setName('list').setDescription('View all active warnings in this server'))
+            .addSubcommand(s => s.setName('history').setDescription('View warning history for a user')
+                .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))),
         new SlashCommandBuilder().setName('timeout').setDescription('Manage timeouts')
             .addSubcommand(s => s.setName('give').setDescription('Apply a Discord timeout to a user')
                 .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
@@ -328,8 +330,7 @@ client.once('ready', async () => {
                 .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
                 .addStringOption(o => o.setName('reason').setDescription('Reason'))),
         new SlashCommandBuilder().setName('mywarnings').setDescription('Check your active warnings'),
-        new SlashCommandBuilder().setName('history').setDescription('View warning history for a user')
-            .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+
         new SlashCommandBuilder().setName('kick').setDescription('Kick a user')
             .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
             .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)),
@@ -499,7 +500,7 @@ client.on('interactionCreate', async interaction => {
     const { commandName, guildId } = interaction;
     if (!interaction.guild) return interaction.reply({ content: '❌ Server only.', flags: [MessageFlags.Ephemeral] });
 
-    const restricted = ['config','warning','timeout','kick','ban','note','userinfo','history','escalation'];
+    const restricted = ['config','warning','timeout','kick','ban','note','userinfo','escalation'];
     if (restricted.includes(commandName) && !await hasCommandPermission(interaction, guildId)) {
         const cfg = await getConfig(guildId);
         return interaction.reply({ content: `❌ No permission.\n\n**Required:** Administrator OR ${cfg.accessRoleId ? `<@&${cfg.accessRoleId}>` : 'no role configured'}\n\nAsk an admin to run \`/config access\`.`, flags: [MessageFlags.Ephemeral] });
@@ -659,7 +660,7 @@ client.on('interactionCreate', async interaction => {
         await reply({ embeds: [embed], components: warnlistRow(page, totalPages, guildId) });
     }
 
-    else if (commandName === 'history') {
+    else if (commandName === 'warning' && interaction.options.getSubcommand() === 'history') {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const user = interaction.options.getUser('user');
         const entries = await getHistory(guildId, user.id);
