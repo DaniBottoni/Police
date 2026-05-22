@@ -17,7 +17,6 @@ async function initDB() {
         CREATE INDEX IF NOT EXISTS history_guild_user  ON history(guild_id, user_id);
         CREATE INDEX IF NOT EXISTS notes_guild_user    ON notes(guild_id, user_id);
     `);
-    console.log('✅ Database initialised');
 }
 
 const configCache = new Map();
@@ -382,7 +381,6 @@ client.once('ready', async () => {
         const [wRes, cRes] = await Promise.all([pool.query('SELECT key, data FROM warnings'), pool.query('SELECT guild_id, data FROM configs')]);
         for (const { key, data } of wRes.rows) activeWarnings.set(key, data);
         for (const { guild_id, data } of cRes.rows) configCache.set(guild_id, data);
-        console.log(`🔄 Loaded ${activeWarnings.size} warnings, ${configCache.size} configs`);
         for (const [key, w] of activeWarnings.entries()) if (!w.isForever) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
         // Restore timed bans
         const banRes = await pool.query("SELECT guild_id, user_id, data FROM history WHERE data->>'type' = 'ban' AND data->>'expiresAt' IS NOT NULL ORDER BY id DESC");
@@ -395,7 +393,6 @@ client.once('ready', async () => {
             if (unbanRes.rows.length) continue;
             if (data.expiresAt > Date.now()) scheduleBanExpiry(guild_id, user_id, data.userTag, data.expiresAt, data.reason);
         }
-        console.log('🔄 Timed bans restored');
     } catch (e) { console.error('❌ DB init failed:', e.message); }
     keepAlive();
 });
