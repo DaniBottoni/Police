@@ -4,12 +4,13 @@ A discord bot to give warnings to users, and to remove the warnings after a set 
 # Commands
 
 ## Moderation:
-- **/warn:** Gives a warning to a user.
-- **/unwarn:** Manually removes the selected warning from a user.
-- **/timeout:** Gives a configurable length timeout to a user.
+- **/warning add:** Gives a warning to a user.
+- **/warning remove:** Manually removes the selected warning from a user.
+- **/timeout add:** Gives a configurable length timeout to a user.
+- **/timeout remove:** Remove the timeout from a user.
 - **/kick:** Kicks the user
-- **/ban:** Bans the user and deletes their messages in the last (configurable time). Can also be set to unban after set time.
-- **/unban:** Unbans the user.
+- **/ban add:** Bans the user and deletes their messages in the last (configurable time). Can also be set to unban after set time.
+- **/ban remove:** Unbans the user.
 
 ## Config:
 - **/config set:** Config the warning levels by matching them to roles and setting how long they take to expire.
