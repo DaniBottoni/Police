@@ -818,8 +818,16 @@ client.on('interactionCreate', async interaction => {
             const level = interaction.options.getInteger('level'), threshold = interaction.options.getInteger('threshold');
             if (level < 1 || level > 100) return reply('❌ Level must be between 1 and 100.');
             if (threshold < 2 || threshold > 50) return reply('❌ Threshold must be between 2 and 50.');
+            
+            // Validate that the source level exists
+            if (!cfg.levels?.[level]) return reply(`❌ Level ${level} is not configured. Please configure it first with /config set.`);
+            
+            // Validate that the target level (level+1) exists
+            const targetLevel = level + 1;
+            if (!cfg.levels?.[targetLevel]) return reply(`❌ Level ${targetLevel} is not configured. Please configure it first with /config set before setting up escalation to it.`);
+            
             esc.thresholds[level] = threshold; saveConfig(guildId, cfg);
-            await reply(`**${threshold}x** Level ${level} warnings → auto Level ${level+1}.`);
+            await reply(`**${threshold}x** Level ${level} warnings → auto Level ${targetLevel}.`);
         } else if (sub === 'remove') {
             const level = interaction.options.getInteger('level');
             if (!esc.thresholds[level]) return reply(`❌ No threshold set for Level ${level}.`);
@@ -838,6 +846,10 @@ client.on('interactionCreate', async interaction => {
             const level = interaction.options.getInteger('level'), threshold = interaction.options.getInteger('threshold'), durationStr = interaction.options.getString('duration');
             if (level < 2 || level > 100) return reply('❌ Target level must be between 2 and 100.');
             if (threshold < 2 || threshold > 50) return reply('❌ Threshold must be between 2 and 50.');
+            
+            // Validate that the target level is configured
+            if (!cfg.levels?.[level]) return reply(`❌ Level ${level} is not configured. Please configure it first with /config set.`);
+            
             const dur = parseDuration(durationStr);
             if (!dur || dur.isForever) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.');
             if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Discord timeouts cannot exceed 28 days.');
