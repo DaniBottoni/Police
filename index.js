@@ -536,16 +536,31 @@ client.on('interactionCreate', async interaction => {
             const cfg = await getConfig(guildId);
             if (!cfg.levels || !Object.keys(cfg.levels).length) return reply('📋 No warning levels configured yet. Use /config set to add some.');
             const embed = E('#0099ff','Warning Configuration');
-            for (const [lvl, d] of Object.entries(cfg.levels)) embed.addFields({ name: `Level ${lvl}`, value: `Role: <@&${d.roleId}>\nDuration: ${d.durationDisplay}`, inline: true });
             
-            // Add timeout escalation info if configured
-            const timeouts = cfg.escalation?.timeouts ?? {};
-            if (Object.keys(timeouts).length) {
-                const timeoutInfo = Object.entries(timeouts)
+            // Separate normal levels from timeout levels
+            const normalLevels = {}, timeoutLevels = {};
+            for (const [lvl, d] of Object.entries(cfg.levels)) {
+                if (d.isTimeoutLevel) {
+                    timeoutLevels[lvl] = d;
+                } else {
+                    normalLevels[lvl] = d;
+                }
+            }
+            
+            // Display normal warning levels
+            if (Object.keys(normalLevels).length) {
+                for (const [lvl, d] of Object.entries(normalLevels)) {
+                    embed.addFields({ name: `Level ${lvl}`, value: `Role: <@&${d.roleId}>\nDuration: ${d.durationDisplay}`, inline: true });
+                }
+            }
+            
+            // Display timeout levels separately
+            if (Object.keys(timeoutLevels).length) {
+                const timeoutInfo = Object.entries(timeoutLevels)
                     .sort(([a], [b]) => a - b)
-                    .map(([lvl, t]) => `• **Level ${lvl}** (${t.threshold}x warnings → **${t.durationDisplay}** timeout)`)
+                    .map(([lvl, t]) => `• **Level ${lvl}** — Timeout: **${t.timeoutDisplay}**`)
                     .join('\n');
-                embed.addFields({ name: 'Timeout Escalation', value: timeoutInfo, inline: false });
+                embed.addFields({ name: '⏱️ Timeout Levels (Auto-Escalation)', value: timeoutInfo, inline: false });
             }
             
             embed.addFields({ name: 'Warn DMs', value: cfg.warnDm === false ? 'Disabled' : 'Enabled', inline: true });
@@ -847,12 +862,20 @@ client.on('interactionCreate', async interaction => {
             if (level < 2 || level > 100) return reply('❌ Target level must be between 2 and 100.');
             if (threshold < 2 || threshold > 50) return reply('❌ Threshold must be between 2 and 50.');
             
-            // Validate that the target level is configured
-            if (!cfg.levels?.[level]) return reply(`❌ Level ${level} is not configured. Please configure it first with /config set.`);
-            
             const dur = parseDuration(durationStr);
             if (!dur || dur.isForever) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.');
             if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Discord timeouts cannot exceed 28 days.');
+            
+            // Create timeout level as a special config entry (doesn't need manual /config set)
+            cfg.levels ??= {};
+            if (!cfg.levels[level]) {
+                cfg.levels[level] = { 
+                    isTimeoutLevel: true,
+                    timeoutDurationMs: dur.totalMs,
+                    timeoutDisplay: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds)
+                };
+            }
+            
             esc.timeouts ??= {};
             esc.timeouts[level] = { durationMs: dur.totalMs, durationDisplay: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds), threshold };
             saveConfig(guildId, cfg);
