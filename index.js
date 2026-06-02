@@ -537,6 +537,17 @@ client.on('interactionCreate', async interaction => {
             if (!cfg.levels || !Object.keys(cfg.levels).length) return reply('📋 No warning levels configured yet. Use /config set to add some.');
             const embed = E('#0099ff','Warning Configuration');
             for (const [lvl, d] of Object.entries(cfg.levels)) embed.addFields({ name: `Level ${lvl}`, value: `Role: <@&${d.roleId}>\nDuration: ${d.durationDisplay}`, inline: true });
+            
+            // Add timeout escalation info if configured
+            const timeouts = cfg.escalation?.timeouts ?? {};
+            if (Object.keys(timeouts).length) {
+                const timeoutInfo = Object.entries(timeouts)
+                    .sort(([a], [b]) => a - b)
+                    .map(([lvl, t]) => `• **Level ${lvl}** (${t.threshold}x warnings → **${t.durationDisplay}** timeout)`)
+                    .join('\n');
+                embed.addFields({ name: 'Timeout Escalation', value: timeoutInfo, inline: false });
+            }
+            
             embed.addFields({ name: 'Warn DMs', value: cfg.warnDm === false ? 'Disabled' : 'Enabled', inline: true });
             await reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'logchannel') {
