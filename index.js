@@ -313,6 +313,7 @@ function safeMath(expr) {
         } else norm += s[k];
     }
     s = norm.replace(/[×·•]/g, '*').replace(/÷/g, '/').replace(/−/g, '-').replace(/\s+/g, '').toLowerCase();
+    s = s.replace(/(?<=[\d)])x(?=[\d(])/g, '*'); // 5x4 → 5*4
     s = s.replace(/\*\*/g, '^'); // ** acts as power
     s = s.replace(/(\d+)√/g, (_, n) => `nrt${n}(`);
     s = s.replace(/∜/g, 'nrt4(').replace(/∛/g, 'cbrt(').replace(/√/g, 'sqrt(');
