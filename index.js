@@ -2,20 +2,23 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, Emb
 const { Pool } = require('pg');
 const dns = require('dns'); dns.setDefaultResultOrder('ipv4first');
 const http = require('http'), https = require('https');
+const sharp = require('sharp');
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 // ── DB ─────────────────────────────────────────────────────────────────────
 async function initDB() {
     await pool.query(`
-        CREATE TABLE IF NOT EXISTS configs  (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
-        CREATE TABLE IF NOT EXISTS warnings (key TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
-        CREATE TABLE IF NOT EXISTS history  (id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
-        CREATE TABLE IF NOT EXISTS notes    (id BIGINT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
-        CREATE INDEX IF NOT EXISTS warnings_guild_user ON warnings(guild_id, user_id);
-        CREATE INDEX IF NOT EXISTS history_guild_user  ON history(guild_id, user_id);
-        CREATE INDEX IF NOT EXISTS notes_guild_user    ON notes(guild_id, user_id);
+        CREATE TABLE IF NOT EXISTS configs     (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS warnings    (key TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS history     (id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS notes       (id BIGINT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS scam_hashes (id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, hash TEXT NOT NULL, label TEXT, added_by TEXT, added_at BIGINT);
+        CREATE INDEX IF NOT EXISTS warnings_guild_user    ON warnings(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS history_guild_user     ON history(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS notes_guild_user       ON notes(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS scam_hashes_guild      ON scam_hashes(guild_id);
     `);
 }
 
@@ -98,6 +101,81 @@ function parseDuration(s) {
 function formatDuration(d, h, m, s, isForever = false) {
     if (isForever) return 'Forever';
     return [d && `${d}d`, h && `${h}h`, m && `${m}m`, s && `${s}s`].filter(Boolean).join(' ') || '0s';
+}
+
+// ── Scam protection ────────────────────────────────────────────────────────
+// dHash: 9x8 greyscale → compare adjacent horizontal pixels → 64-bit hash
+async function dHash(buffer) {
+    const result = await sharp(buffer).resize(9, 8, { fit: 'fill' }).greyscale().raw().toBuffer({ resolveWithObject: true });
+    const data = result.data;
+    let hash = 0n;
+    for (let row = 0; row < 8; row++)
+        for (let col = 0; col < 8; col++)
+            if (data[row * 9 + col] > data[row * 9 + col + 1]) hash |= (1n << BigInt(row * 8 + col));
+    return hash.toString(16).padStart(16, '0');
+}
+function hammingDistance(a, b) {
+    let diff = BigInt('0x' + a) ^ BigInt('0x' + b);
+    let dist = 0;
+    while (diff) { dist += Number(diff & 1n); diff >>= 1n; }
+    return dist;
+}
+async function fetchImageBuffer(url) {
+    return new Promise((resolve, reject) => {
+        const mod = url.startsWith('https') ? https : http;
+        mod.get(url, { headers: { 'User-Agent': 'PoliceBot/1.0' } }, res => {
+            if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+            res.on('error', reject);
+        }).on('error', reject);
+    });
+}
+
+// Cache of scam hashes per guild: Map<guildId, Array<{id, hash, label}>>
+const scamHashCache = new Map();
+async function getScamHashes(guildId) {
+    if (scamHashCache.has(guildId)) return scamHashCache.get(guildId);
+    const res = await pool.query('SELECT id, hash, label, added_by, added_at FROM scam_hashes WHERE guild_id = $1 ORDER BY id', [guildId]);
+    const hashes = res.rows.map(r => ({ id: r.id, hash: r.hash, label: r.label, addedBy: r.added_by, addedAt: r.added_at }));
+    scamHashCache.set(guildId, hashes);
+    return hashes;
+}
+async function addScamHash(guildId, hash, label, addedBy) {
+    const res = await pool.query('INSERT INTO scam_hashes (guild_id, hash, label, added_by, added_at) VALUES ($1, $2, $3, $4, $5) RETURNING id', [guildId, hash, label, addedBy, Date.now()]);
+    const entry = { id: res.rows[0].id, hash, label, addedBy, addedAt: Date.now() };
+    const cached = scamHashCache.get(guildId) ?? [];
+    cached.push(entry);
+    scamHashCache.set(guildId, cached);
+    return entry;
+}
+async function removeScamHash(guildId, id) {
+    const res = await pool.query('DELETE FROM scam_hashes WHERE guild_id = $1 AND id = $2', [guildId, id]);
+    if (res.rowCount > 0) {
+        const cached = scamHashCache.get(guildId) ?? [];
+        scamHashCache.set(guildId, cached.filter(h => h.id !== id));
+    }
+    return res.rowCount > 0;
+}
+async function checkImageAgainstScamHashes(guildId, buffer) {
+    const hashes = await getScamHashes(guildId);
+    if (!hashes.length) return null;
+    let hash;
+    try { hash = await dHash(buffer); } catch { return null; }
+    for (const entry of hashes) {
+        const dist = hammingDistance(hash, entry.hash);
+        const cfg = await getConfig(guildId);
+        const threshold = cfg.scamProt?.threshold ?? 10;
+        if (dist <= threshold) return { ...entry, distance: dist };
+    }
+    return null;
+}
+
+// Default scam prot config: { enabled: true, threshold: 10, timeoutMs: 5*60*1000, deleteMsg: true }
+async function getScamProtConfig(guildId) {
+    const cfg = await getConfig(guildId);
+    return { enabled: true, threshold: 10, timeoutMs: 5 * 60 * 1000, timeoutDisplay: '5m', deleteMsg: true, ...cfg.scamProt };
 }
 
 // ── Warning timers ─────────────────────────────────────────────────────────
@@ -228,9 +306,11 @@ function buildWarnlistEmbed(guildId, page) {
     return { embed, totalPages: total, page };
 }
 function warnlistRow(page, total, guildId) {
-    if (total <= 1) return [];
+    const refresh = new ButtonBuilder().setCustomId(`wl_${page}_${guildId}`).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary);
+    if (total <= 1) return [new ActionRowBuilder().addComponents(refresh)];
     return [new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`wl_${page - 1}_${guildId}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+        refresh,
         new ButtonBuilder().setCustomId(`wl_${page + 1}_${guildId}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(page === total - 1)
     )];
 }
@@ -373,6 +453,18 @@ client.once('ready', async () => {
             .addSubcommand(s => s.setName('removetimeout').setDescription('Remove timeout from escalation level').addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View escalation configuration')),
         new SlashCommandBuilder().setName('help').setDescription('View all commands and features'),
+        new SlashCommandBuilder().setName('scam').setDescription('Manage scam image protection')
+            .addSubcommand(s => s.setName('add').setDescription('Upload a scam image to block')
+                .addAttachmentOption(o => o.setName('image').setDescription('The scam image to register').setRequired(true))
+                .addStringOption(o => o.setName('label').setDescription('Label for this scam image (e.g. "fake nitro")').setRequired(true)))
+            .addSubcommand(s => s.setName('remove').setDescription('Remove a scam image by ID')
+                .addIntegerOption(o => o.setName('id').setDescription('ID from /scam list').setRequired(true)))
+            .addSubcommand(s => s.setName('list').setDescription('List all registered scam images'))
+            .addSubcommand(s => s.setName('config').setDescription('Configure scam protection settings')
+                .addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable scam detection'))
+                .addBooleanOption(o => o.setName('delete').setDescription('Delete messages containing scam images'))
+                .addStringOption(o => o.setName('timeout').setDescription('Timeout duration on detection (m:s / h:m:s / d:h:m:s, or "none")'))
+                .addIntegerOption(o => o.setName('threshold').setDescription('Hash similarity threshold 0–20 (lower = stricter, default 10)').setMinValue(0).setMaxValue(20))),
     ].map(c => c.toJSON());
 
     client.application.commands.set(commands);
@@ -383,6 +475,14 @@ client.once('ready', async () => {
         for (const { key, data } of wRes.rows) activeWarnings.set(key, data);
         for (const { guild_id, data } of cRes.rows) configCache.set(guild_id, data);
         for (const [key, w] of activeWarnings.entries()) if (!w.isForever) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
+        // Preload scam hashes for all guilds
+        const shRes = await pool.query('SELECT guild_id, id, hash, label, added_by, added_at FROM scam_hashes ORDER BY id');
+        for (const r of shRes.rows) {
+            const arr = scamHashCache.get(r.guild_id) ?? [];
+            arr.push({ id: r.id, hash: r.hash, label: r.label, addedBy: r.added_by, addedAt: r.added_at });
+            scamHashCache.set(r.guild_id, arr);
+        }
+        console.log(`✅ Loaded scam hashes for ${scamHashCache.size} guild(s)`);
         // Restore timed bans
         const banRes = await pool.query("SELECT guild_id, user_id, data FROM history WHERE data->>'type' = 'ban' AND data->>'expiresAt' IS NOT NULL ORDER BY id DESC");
         const seenBans = new Set();
@@ -420,6 +520,84 @@ client.on('guildMemberAdd', async member => {
         .setDescription(`Your active warning(s) in **${member.guild.name}** have been reapplied because you rejoined.`)
         .addFields({ name: 'Active Warnings', value: userWarnings.map(([, w]) => `Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') }).setTimestamp()]
     }).catch(() => {});
+});
+
+// ── Scam detection ─────────────────────────────────────────────────────────
+client.on('messageCreate', async message => {
+    if (!message.guild || message.author.bot) return;
+    const attachments = [...message.attachments.values()].filter(a => /\.(png|jpg|jpeg|gif|webp)$/i.test(a.name ?? '') || a.contentType?.startsWith('image/'));
+    if (!attachments.length) return;
+
+    const guildId = message.guild.id;
+    const spc = await getScamProtConfig(guildId);
+    if (!spc.enabled) return;
+    const hashes = await getScamHashes(guildId);
+    if (!hashes.length) return;
+
+    // Check if bot has ManageMessages before trying to delete
+    const botMember = message.guild.members.me;
+    const canDelete = spc.deleteMsg && botMember.permissionsIn(message.channel).has(PermissionFlagsBits.ManageMessages);
+    const canTimeout = botMember.permissions.has(PermissionFlagsBits.ModerateMembers);
+
+    for (const att of attachments) {
+        let buffer;
+        try { buffer = await fetchImageBuffer(att.url); } catch (e) { console.error('scam: fetch failed:', e.message); continue; }
+        let match;
+        try {
+            const imgHash = await dHash(buffer);
+            match = null;
+            for (const entry of hashes) {
+                if (hammingDistance(imgHash, entry.hash) <= spc.threshold) { match = entry; break; }
+            }
+        } catch (e) { console.error('scam: hash failed:', e.message); continue; }
+        if (!match) continue;
+
+        console.log(`🚨 Scam image detected in ${guildId} from ${message.author.tag} (match: "${match.label}")`);
+
+        // Delete the message
+        if (canDelete) message.delete().catch(() => {});
+
+        // Timeout the user
+        let timedOut = false;
+        if (spc.timeoutMs && canTimeout) {
+            const member = message.guild.members.cache.get(message.author.id) ?? await message.guild.members.fetch(message.author.id).catch(() => null);
+            if (member && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+                await member.timeout(spc.timeoutMs, `Scam image detected: ${match.label}`).catch(() => {});
+                timedOut = true;
+            }
+        }
+
+        // Warn user in channel
+        message.channel.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Detected')
+            .setDescription(`${message.author}'s message was removed — it matched a known scam image.`)
+            .addFields(
+                { name: 'Matched', value: match.label, inline: true },
+                ...(timedOut ? [{ name: 'Consequence', value: `Timed out for ${spc.timeoutDisplay}`, inline: true }] : [])
+            ).setTimestamp()]
+        }).catch(() => {});
+
+        // DM the user
+        message.author.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Your message was removed')
+            .setDescription(`A message you sent in **${message.guild.name}** was detected as a known scam image and removed.`)
+            .addFields(
+                { name: 'Matched Pattern', value: match.label, inline: true },
+                ...(timedOut ? [{ name: 'Consequence', value: `You have been timed out for ${spc.timeoutDisplay}`, inline: true }] : [])
+            ).setFooter({ text: 'If you believe this is a mistake, contact a moderator' }).setTimestamp()]
+        }).catch(() => {});
+
+        // Log to mod channel
+        logMod(message.guild, guildId, new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Auto-Removed')
+            .addFields(
+                { name: 'User', value: `${message.author} (${message.author.tag})`, inline: true },
+                { name: 'Channel', value: `${message.channel}`, inline: true },
+                { name: 'Matched', value: match.label, inline: true },
+                ...(timedOut ? [{ name: 'Timeout', value: spc.timeoutDisplay, inline: true }] : []),
+                { name: 'Message Deleted', value: canDelete ? 'Yes' : 'No (missing ManageMessages)', inline: true }
+            ).setTimestamp());
+
+        addHistory(guildId, message.author.id, { guildId, userId: message.author.id, userTag: message.author.tag, type: 'scam_remove', reason: `Scam image: ${match.label}`, issuedBy: client.user.tag, issuedAt: Date.now() });
+        break; // one action per message is enough
+    }
 });
 
 // ── Interactions ───────────────────────────────────────────────────────────
@@ -467,6 +645,118 @@ client.on('interactionCreate', async interaction => {
             const { embed, totalPages, page: p } = buildWarnlistEmbed(guildId, page);
             return interaction.update({ embeds: [embed], components: warnlistRow(p, totalPages, guildId) });
         }
+        if (customId.startsWith('mywarnings_refresh_')) {
+            const ownerId = customId.slice(19);
+            if (interaction.user.id !== ownerId) return interaction.reply({ content: '❌ This button is not for you.', flags: [MessageFlags.Ephemeral] });
+            const guildId = interaction.guild.id;
+            const userWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === interaction.user.id);
+            if (!userWarnings.length) return interaction.update({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Your Active Warnings').setDescription('You have no active warnings!').setTimestamp()], components: [] });
+            const cfg = await getConfig(guildId);
+            const E2 = (color, title) => new EmbedBuilder().setColor(color).setTitle(title).setTimestamp();
+            const embed = E2('#FFA500','Your Active Warnings').setDescription(`You have ${userWarnings.length} active warning${userWarnings.length>1?'s':''}`).setFooter({ text: 'Warnings are automatically removed when they expire' });
+            for (const w of userWarnings) {
+                const lc = cfg.levels?.[w.level], name = `Level ${w.level} — ${lc?.roleName||'Unknown Role'}`;
+                if (w.isForever) embed.addFields({ name, value: ' **Duration:** Forever\n **Status:** Permanent' });
+                else {
+                    const t = w.expiresAt - Date.now();
+                    embed.addFields({ name, value: t <= 0 ? 'Expired (will be removed shortly)' : (() => { const s = Math.floor(t/1000); return `**Time Left:** ${formatDuration(Math.floor(s/86400),Math.floor((s%86400)/3600),Math.floor((s%3600)/60),s%60)}\n**Expires:** <t:${Math.floor(w.expiresAt/1000)}:F>`; })() });
+                }
+            }
+            return interaction.update({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))] });
+        }
+        if (customId.startsWith('userinfo_refresh_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            const parts = customId.slice(17).split('_'), userId = parts[0], guildId = parts[1];
+            await interaction.deferUpdate();
+            const user = await interaction.client.users.fetch(userId).catch(() => null);
+            if (!user) return interaction.editReply({ content: '❌ Could not fetch user.', embeds: [], components: [] });
+            const [member, history, notes] = await Promise.all([
+                interaction.guild.members.fetch(userId).catch(() => null),
+                getAllHistory(guildId, userId),
+                getNotes(guildId, userId)
+            ]);
+            const embed = new EmbedBuilder()
+                .setColor('#5865F2')
+                .setAuthor({ name: user.tag, iconURL: user.displayAvatarURL({ size: 256 }) })
+                .setThumbnail(user.displayAvatarURL({ size: 256 }))
+                .addFields(
+                    { name: 'Account Created', value: `<t:${Math.floor(user.createdTimestamp/1000)}:F>\n<t:${Math.floor(user.createdTimestamp/1000)}:R>`, inline: true },
+                    { name: 'Joined Server', value: member ? `<t:${Math.floor(member.joinedTimestamp/1000)}:F>\n<t:${Math.floor(member.joinedTimestamp/1000)}:R>` : '*Not in server*', inline: true }
+                )
+                .setTimestamp();
+            const activeUserWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === userId);
+            const activeByLevel = {};
+            for (const w of activeUserWarnings) activeByLevel[w.level] = (activeByLevel[w.level] || 0) + 1;
+            embed.addFields({ name: 'Active Warnings', value: Object.keys(activeByLevel).length
+                ? Object.entries(activeByLevel).sort(([a],[b])=>a-b).map(([l,c])=>`Level ${l}: **${c}**`).join('\n')
+                : 'None', inline: true });
+            const warnCounts = {}, timeoutCount = history.filter(e => e.type === 'timeout').length,
+                  kickCount = history.filter(e => e.type === 'kick').length,
+                  banCount  = history.filter(e => e.type === 'ban').length;
+            for (const e of history) if (e.level != null) warnCounts[e.level] = (warnCounts[e.level] || 0) + 1;
+            if (Object.keys(warnCounts).length) embed.addFields({ name: 'Warn History', value: Object.entries(warnCounts).sort(([a],[b])=>a-b).map(([l,c])=>`Level ${l}: **${c}**`).join('\n'), inline: true });
+            const modLines = [...(timeoutCount ? [`Timeouts: **${timeoutCount}**`] : []), ...(kickCount ? [`Kicks: **${kickCount}**`] : []), ...(banCount ? [`Bans: **${banCount}**`] : [])];
+            if (modLines.length) embed.addFields({ name: 'Mod Actions', value: modLines.join('\n'), inline: true });
+            if (notes.length) {
+                const shown = notes.slice(-5);
+                embed.addFields({ name: `Notes (${notes.length})`, value: shown.map(n => `\`${n.id}\` <t:${Math.floor(n.addedAt/1000)}:d> by **${n.addedBy}**\n${n.text.slice(0,100)}${n.text.length>100?'…':''}`).join('\n\n') });
+                if (notes.length > 5) embed.setFooter({ text: `Showing last 5 of ${notes.length} notes` });
+            }
+            return interaction.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))] });
+        }
+        if (customId.startsWith('configview_refresh_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            const guildId = customId.slice(19);
+            await interaction.deferUpdate();
+            const cfg = await getConfig(guildId);
+            if (!cfg.levels || !Object.keys(cfg.levels).length) return interaction.editReply({ content: '📋 No warning levels configured yet.', embeds: [], components: [] });
+            const E2 = (color, title) => new EmbedBuilder().setColor(color).setTitle(title).setTimestamp();
+            const embed = E2('#0099ff','Warning Configuration');
+            const normalLevels = {}, timeoutLevels = {};
+            for (const [lvl, d] of Object.entries(cfg.levels)) {
+                if (d.isTimeoutLevel) timeoutLevels[lvl] = d; else normalLevels[lvl] = d;
+            }
+            if (Object.keys(normalLevels).length) for (const [lvl, d] of Object.entries(normalLevels)) embed.addFields({ name: `Level ${lvl}`, value: `Role: <@&${d.roleId}>\nDuration: ${d.durationDisplay}`, inline: true });
+            if (Object.keys(timeoutLevels).length) embed.addFields({ name: '⏱️ Timeout Levels (Auto-Escalation)', value: Object.entries(timeoutLevels).sort(([a],[b])=>a-b).map(([lvl,t])=>`• **Level ${lvl}** — Timeout: **${t.timeoutDisplay}**`).join('\n'), inline: false });
+            embed.addFields({ name: 'Warn DMs', value: cfg.warnDm === false ? 'Disabled' : 'Enabled', inline: true });
+            return interaction.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))] });
+        }
+        if (customId.startsWith('escalationview_refresh_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            const guildId = customId.slice(23);
+            await interaction.deferUpdate();
+            const cfg = await getConfig(guildId);
+            const esc = cfg.escalation ?? {};
+            const E2 = (color, title) => new EmbedBuilder().setColor(color).setTitle(title).setTimestamp();
+            const embed = E2('#5865F2','Escalation Configuration');
+            const th = esc.thresholds ?? {}, to = esc.timeouts ?? {};
+            if (!Object.keys(th).length && !esc.cap && !Object.keys(to).length) { embed.setDescription('No escalation rules configured. Use `/escalation set` to add thresholds.'); }
+            else {
+                if (Object.keys(th).length) embed.addFields({ name: 'Thresholds', value: Object.entries(th).sort(([a],[b])=>a-b).map(([l,t])=>`• **${t}x** Level ${l} → auto Level ${parseInt(l)+1}`).join('\n') });
+                if (Object.keys(to).length) embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(to).sort(([a],[b])=>a-b).map(([l,t])=>`• ${t.threshold}x Level ${parseInt(l)-1} → auto Level ${l} + **${t.durationDisplay}** timeout`).join('\n') });
+                embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
+            }
+            return interaction.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))] });
+        }
+        if (customId.startsWith('scamlist_refresh_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            const guildId = customId.slice(17);
+            await interaction.deferUpdate();
+            scamHashCache.delete(guildId); // force reload from DB
+            const hashes = await getScamHashes(guildId);
+            const spc = await getScamProtConfig(guildId);
+            const E2 = (color, title) => new EmbedBuilder().setColor(color).setTitle(title).setTimestamp();
+            if (!hashes.length) return interaction.editReply({ embeds: [E2('#ff0000','Scam Image Registry').setDescription('No scam images registered.')], components: [] });
+            const embed = E2('#ff0000','Scam Image Registry')
+                .setDescription(`**${hashes.length}** image${hashes.length > 1 ? 's' : ''} registered — detection is **${spc.enabled ? 'enabled' : 'disabled'}**`)
+                .addFields(
+                    { name: 'Threshold', value: `${spc.threshold} (Hamming distance)`, inline: true },
+                    { name: 'On Detection', value: [spc.deleteMsg ? 'Delete message' : null, spc.timeoutMs ? `Timeout ${spc.timeoutDisplay}` : null].filter(Boolean).join(' + ') || 'No action', inline: true }
+                );
+            for (const h of hashes.slice(0, 20)) embed.addFields({ name: `ID ${h.id} — ${h.label}`, value: `Hash: \`${h.hash}\` · Added by ${h.addedBy} <t:${Math.floor(h.addedAt/1000)}:R>` });
+            if (hashes.length > 20) embed.setFooter({ text: `Showing first 20 of ${hashes.length}` });
+            return interaction.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))] });
+        }
         if (customId.startsWith('unwarn_confirm_') || customId.startsWith('unwarn_cancel_')) {
             const isConfirm = customId.startsWith('unwarn_confirm_');
             const pendingId = customId.slice(isConfirm ? 15 : 13);
@@ -494,7 +784,7 @@ client.on('interactionCreate', async interaction => {
     const { commandName, guildId } = interaction;
     if (!interaction.guild) return interaction.reply({ content: '❌ Server only.', flags: [MessageFlags.Ephemeral] });
 
-    const restricted = ['config','warning','timeout','kick','ban','note','userinfo','escalation'];
+    const restricted = ['config','warning','timeout','kick','ban','note','userinfo','escalation','scam'];
     if (restricted.includes(commandName) && !await hasCommandPermission(interaction, guildId)) {
         const cfg = await getConfig(guildId);
         return interaction.reply({ content: `❌ No permission.\n\n**Required:** Administrator OR ${cfg.accessRoleId ? `<@&${cfg.accessRoleId}>` : 'no role configured'}\n\nAsk an admin to run \`/config access\`.`, flags: [MessageFlags.Ephemeral] });
@@ -564,7 +854,7 @@ client.on('interactionCreate', async interaction => {
             }
             
             embed.addFields({ name: 'Warn DMs', value: cfg.warnDm === false ? 'Disabled' : 'Enabled', inline: true });
-            await reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+            await reply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`configview_refresh_${guildId}`).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))], flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'logchannel') {
             const channel = interaction.options.getChannel('channel');
             if (!channel.isTextBased()) return reply('❌ Please select a text channel.');
@@ -678,7 +968,7 @@ client.on('interactionCreate', async interaction => {
                 embed.addFields({ name, value: t <= 0 ? 'Expired (will be removed shortly)' : (() => { const s = Math.floor(t/1000); return `**Time Left:** ${formatDuration(Math.floor(s/86400),Math.floor((s%86400)/3600),Math.floor((s%3600)/60),s%60)}\n**Expires:** <t:${Math.floor(w.expiresAt/1000)}:F>`; })() });
             }
         }
-        await reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+        await reply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`mywarnings_refresh_${interaction.user.id}`).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))], flags: [MessageFlags.Ephemeral] });
     }
 
     else if (commandName === 'warning' && interaction.options.getSubcommand() === 'list') {
@@ -800,7 +1090,7 @@ client.on('interactionCreate', async interaction => {
             if (notes.length > 5) embed.setFooter({ text: `Showing last 5 of ${notes.length} notes` });
         }
 
-        await interaction.editReply({ embeds: [embed] });
+        await interaction.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`userinfo_refresh_${user.id}_${guildId}`).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))] });
     }
 
     else if (commandName === 'note') {
@@ -822,6 +1112,81 @@ client.on('interactionCreate', async interaction => {
             const id = interaction.options.getInteger('id');
             const deleted = await deleteNote(guildId, user.id, id);
             await reply(deleted ? `✅ Note \`${id}\` deleted.` : `❌ Note ID \`${id}\` not found for ${user}.`);
+        }
+    }
+
+    else if (commandName === 'scam') {
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === 'add') {
+            const att = interaction.options.getAttachment('image');
+            const label = interaction.options.getString('label').slice(0, 100).replace(/[\x00-\x1F\x7F]/g, '');
+            if (!att.contentType?.startsWith('image/') && !/\.(png|jpg|jpeg|gif|webp)$/i.test(att.name ?? '')) return reply('❌ Please attach an image file (PNG, JPG, GIF, or WebP).');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            let buffer;
+            try { buffer = await fetchImageBuffer(att.url); } catch (e) { return reply(`❌ Failed to download image: ${e.message}`); }
+            let hash;
+            try { hash = await dHash(buffer); } catch (e) { return reply(`❌ Failed to process image: ${e.message}`); }
+            // Check for duplicates
+            const existing = await getScamHashes(guildId);
+            const spc = await getScamProtConfig(guildId);
+            for (const e of existing) {
+                if (hammingDistance(hash, e.hash) <= spc.threshold) return reply(`❌ This image is already registered (or very similar to) **${e.label}** (ID: \`${e.id}\`).`);
+            }
+            const entry = await addScamHash(guildId, hash, label, interaction.user.tag);
+            await reply({ embeds: [E('#00ff00','Scam Image Registered').addFields({ name: 'Label', value: label, inline: true }, { name: 'ID', value: `${entry.id}`, inline: true }, { name: 'Hash', value: `\`${hash}\``, inline: false }).setFooter({ text: 'Any similar image posted in this server will now be actioned' })] });
+        }
+
+        else if (sub === 'remove') {
+            const id = interaction.options.getInteger('id');
+            const deleted = await removeScamHash(guildId, id);
+            await reply(deleted ? `✅ Scam image \`${id}\` removed.` : `❌ No scam image with ID \`${id}\` found.`);
+        }
+
+        else if (sub === 'list') {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const hashes = await getScamHashes(guildId);
+            if (!hashes.length) return reply('📋 No scam images registered. Use `/scam add` to add one.');
+            const spc = await getScamProtConfig(guildId);
+            const embed = E('#ff0000','Scam Image Registry')
+                .setDescription(`**${hashes.length}** image${hashes.length > 1 ? 's' : ''} registered — detection is **${spc.enabled ? 'enabled' : 'disabled'}**`)
+                .addFields(
+                    { name: 'Threshold', value: `${spc.threshold} (Hamming distance)`, inline: true },
+                    { name: 'On Detection', value: [spc.deleteMsg ? 'Delete message' : null, spc.timeoutMs ? `Timeout ${spc.timeoutDisplay}` : null].filter(Boolean).join(' + ') || 'No action', inline: true }
+                );
+            for (const h of hashes.slice(0, 20)) embed.addFields({ name: `ID ${h.id} — ${h.label}`, value: `Hash: \`${h.hash}\` · Added by ${h.addedBy} <t:${Math.floor(h.addedAt/1000)}:R>` });
+            if (hashes.length > 20) embed.setFooter({ text: `Showing first 20 of ${hashes.length}` });
+            await interaction.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`scamlist_refresh_${guildId}`).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))] });
+        }
+
+        else if (sub === 'config') {
+            const enabled  = interaction.options.getBoolean('enabled');
+            const del      = interaction.options.getBoolean('delete');
+            const toStr    = interaction.options.getString('timeout');
+            const thresh   = interaction.options.getInteger('threshold');
+            const cfg = await getConfig(guildId);
+            cfg.scamProt ??= {};
+            if (enabled  !== null) cfg.scamProt.enabled   = enabled;
+            if (del      !== null) cfg.scamProt.deleteMsg  = del;
+            if (thresh   !== null) cfg.scamProt.threshold  = thresh;
+            if (toStr !== null) {
+                if (toStr.toLowerCase() === 'none') { cfg.scamProt.timeoutMs = null; cfg.scamProt.timeoutDisplay = 'None'; }
+                else {
+                    const dur = parseDuration(toStr);
+                    if (!dur || dur.isForever) return reply('❌ Invalid timeout. Use `m:s`, `h:m:s`, `d:h:m:s`, or `none`.');
+                    if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Discord timeouts cannot exceed 28 days.');
+                    cfg.scamProt.timeoutMs = dur.totalMs;
+                    cfg.scamProt.timeoutDisplay = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds);
+                }
+            }
+            saveConfig(guildId, cfg);
+            const spc = { enabled: true, threshold: 10, timeoutMs: 5 * 60 * 1000, timeoutDisplay: '5m', deleteMsg: true, ...cfg.scamProt };
+            await reply({ embeds: [E('#5865F2','Scam Protection Config').addFields(
+                { name: 'Detection', value: spc.enabled ? 'Enabled' : 'Disabled', inline: true },
+                { name: 'Delete Messages', value: spc.deleteMsg ? 'Yes' : 'No', inline: true },
+                { name: 'Timeout', value: spc.timeoutMs ? spc.timeoutDisplay : 'None', inline: true },
+                { name: 'Threshold', value: `${spc.threshold}`, inline: true }
+            )], flags: [MessageFlags.Ephemeral] });
         }
     }
 
@@ -894,7 +1259,7 @@ client.on('interactionCreate', async interaction => {
                 if (Object.keys(to).length) embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(to).sort(([a],[b])=>a-b).map(([l,t])=>`• ${t.threshold}x Level ${parseInt(l)-1} → auto Level ${l} + **${t.durationDisplay}** timeout`).join('\n') });
                 embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
             }
-            await reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+            await reply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`escalationview_refresh_${guildId}`).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary))], flags: [MessageFlags.Ephemeral] });
         }
     }
 
