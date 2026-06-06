@@ -1,17 +1,17 @@
 {
-  "name": "police-bot",
+  "name": "Police",
   "version": "1.0.0",
-  "description": "Discord bot for managing temporary warning roles",
+  "description": "The best moderation bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "keywords": ["discord", "bot", "moderation", "warnings"],
-  "author": "Daniel",
+  "author": "sleepy",
   "license": "MIT",
   "dependencies": {
     "discord.js": "^14.14.1",
-    "pg": "^8.11.0"
+    "pg": "^8.11.0",
     "sharp": "^0.34.5",
   }
 }
