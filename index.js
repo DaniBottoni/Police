@@ -635,7 +635,8 @@ client.on('messageCreate', async message => {
     const spc = await getScamProtConfig(guildId);
     if (!spc.enabled) return;
     const hashes = await getScamHashes(guildId);
-    if (!hashes.length) return;
+    const globalHashes = await getGlobalScamHashes();
+    if (!hashes.length && !globalHashes.length) return;
 
     // Check if bot has ManageMessages before trying to delete
     const botMember = message.guild.members.me;
@@ -650,7 +651,6 @@ client.on('messageCreate', async message => {
         try { imgHash = await dHash(buffer); } catch (e) { console.error('scam: hash failed:', e.message); continue; }
 
         // 1. Check global hashes (always enforced, threshold 10)
-        const globalHashes = await getGlobalScamHashes();
         let match = null;
         let isGlobal = false;
         let matchDistance = 0;
