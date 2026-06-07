@@ -737,25 +737,28 @@ client.on('messageCreate', async message => {
         addHistory(guildId, message.author.id, { guildId, userId: message.author.id, userTag: message.author.tag, type: 'scam_remove', reason: `Scam image: ${match.label}`, issuedBy: client.user.tag, issuedAt: Date.now() });
         break; // one action per message is enough
     }
+});
 
-    // ── Spam check ────────────────────────────────────────────────────────
+// ── Spam detection ─────────────────────────────────────────────────────────
+client.on('messageCreate', async message => {
+    if (!message.guild || message.author.bot) return;
     if (!message.content) return;
+
+    const guildId = message.guild.id;
     const spc2 = await getSpamConfig(guildId);
     if (!spc2.enabled) return;
 
     const spamKey = `${guildId}-${message.author.id}`;
     const now = Date.now();
     const history = spamTracker.get(spamKey) ?? [];
-    // Prune entries outside the window
     const fresh = history.filter(e => now - e.ts < spc2.windowMs);
     fresh.push({ content: normalise(message.content), msgId: message.id, channelId: message.channel.id, ts: now });
     spamTracker.set(spamKey, fresh);
 
-    // Count how many recent messages match the latest content
     const latest = normalise(message.content);
     const matches = fresh.filter(e => e.content === latest && e.channelId === message.channel.id);
     if (matches.length >= spc2.count) {
-        spamTracker.delete(spamKey); // reset after triggering
+        spamTracker.delete(spamKey);
         await handleSpam(message, matches, spc2);
     }
 });
