@@ -221,9 +221,15 @@ async function handleSpam(message, matchedMessages, spc) {
     const botMember = guild.members.me;
     const canDelete = spc.deleteMsg && botMember.permissionsIn(channel).has(PermissionFlagsBits.ManageMessages);
     if (canDelete) {
-        for (const m of matchedMessages) {
-            channel.messages.delete(m.msgId).catch(() => {});
-        }
+        const ids = matchedMessages.map(m => m.msgId);
+        // bulkDelete only works for messages <14 days old, which spam always will be
+        channel.bulkDelete(ids).catch(async e => {
+            console.error('spam: bulkDelete failed, falling back to individual deletes:', e.message);
+            for (const id of ids) {
+                const msg = await channel.messages.fetch(id).catch(() => null);
+                if (msg) msg.delete().catch(e2 => console.error('spam: delete failed:', e2.message));
+            }
+        });
     }
 
     // Timeout the user
