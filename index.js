@@ -14,11 +14,12 @@ async function initDB() {
         CREATE TABLE IF NOT EXISTS warnings    (key TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
         CREATE TABLE IF NOT EXISTS history     (id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
         CREATE TABLE IF NOT EXISTS notes       (id BIGINT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
-        CREATE TABLE IF NOT EXISTS scam_hashes (id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, hash TEXT NOT NULL, label TEXT, added_by TEXT, added_at BIGINT);
-        CREATE INDEX IF NOT EXISTS warnings_guild_user    ON warnings(guild_id, user_id);
-        CREATE INDEX IF NOT EXISTS history_guild_user     ON history(guild_id, user_id);
-        CREATE INDEX IF NOT EXISTS notes_guild_user       ON notes(guild_id, user_id);
-        CREATE INDEX IF NOT EXISTS scam_hashes_guild      ON scam_hashes(guild_id);
+        CREATE TABLE IF NOT EXISTS scam_hashes        (id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, hash TEXT NOT NULL, label TEXT, added_by TEXT, added_at BIGINT);
+        CREATE TABLE IF NOT EXISTS global_scam_hashes  (id SERIAL PRIMARY KEY, hash TEXT NOT NULL, label TEXT NOT NULL, added_by TEXT, added_at BIGINT);
+        CREATE INDEX IF NOT EXISTS warnings_guild_user ON warnings(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS history_guild_user  ON history(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS notes_guild_user    ON notes(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS scam_hashes_guild   ON scam_hashes(guild_id);
     `);
 }
 
@@ -172,10 +173,100 @@ async function checkImageAgainstScamHashes(guildId, buffer) {
     return null;
 }
 
+// Global scam hashes — shared across all servers, managed directly in DB
+// INSERT INTO global_scam_hashes (hash, label, added_by, added_at) VALUES ('...', 'fake nitro', 'admin', extract(epoch from now())*1000);
+let globalScamHashCache = null; // null = not yet loaded
+async function getGlobalScamHashes() {
+    if (globalScamHashCache !== null) return globalScamHashCache;
+    const res = await pool.query('SELECT id, hash, label FROM global_scam_hashes ORDER BY id');
+    globalScamHashCache = res.rows.map(r => ({ id: r.id, hash: r.hash, label: r.label, global: true }));
+    return globalScamHashCache;
+}
+function invalidateGlobalScamCache() { globalScamHashCache = null; }
+// Reload global hashes every 5 minutes so DB inserts take effect without a restart
+setInterval(invalidateGlobalScamCache, 5 * 60 * 1000);
+
 // Default scam prot config: { enabled: true, threshold: 10, timeoutMs: 5*60*1000, deleteMsg: true }
 async function getScamProtConfig(guildId) {
     const cfg = await getConfig(guildId);
     return { enabled: true, threshold: 10, timeoutMs: 5 * 60 * 1000, timeoutDisplay: '5m', deleteMsg: true, ...cfg.scamProt };
+}
+
+// ── Spam protection ────────────────────────────────────────────────────────
+// Tracks recent messages per user per guild: Map<`${guildId}-${userId}`, Array<{content, msgId, channelId, ts}>>
+const spamTracker = new Map();
+const spamCooldown = new Set(); // users currently being actioned, to prevent double-fires
+
+function normalise(content) {
+    return content.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+async function getSpamConfig(guildId) {
+    const cfg = await getConfig(guildId);
+    // defaults: enabled, 5 identical msgs in 10s triggers action, delete msgs, 10m timeout
+    return { enabled: true, count: 5, windowMs: 10_000, timeoutMs: 10 * 60 * 1000, timeoutDisplay: '10m', deleteMsg: true, ...cfg.spamProt };
+}
+
+async function handleSpam(message, matchedMessages, spc) {
+    const { guild, author, channel } = message;
+    const guildId = guild.id;
+    const key = `${guildId}-${author.id}`;
+    if (spamCooldown.has(key)) return;
+    spamCooldown.add(key);
+    setTimeout(() => spamCooldown.delete(key), 5000);
+
+    console.log(`🚨 Spam detected in ${guildId} from ${author.tag} (${matchedMessages.length} identical messages)`);
+
+    // Delete all matching messages
+    const botMember = guild.members.me;
+    const canDelete = spc.deleteMsg && botMember.permissionsIn(channel).has(PermissionFlagsBits.ManageMessages);
+    if (canDelete) {
+        for (const m of matchedMessages) {
+            channel.messages.delete(m.msgId).catch(() => {});
+        }
+    }
+
+    // Timeout the user
+    let timedOut = false;
+    if (spc.timeoutMs) {
+        const canTimeout = botMember.permissions.has(PermissionFlagsBits.ModerateMembers);
+        if (canTimeout) {
+            const member = guild.members.cache.get(author.id) ?? await guild.members.fetch(author.id).catch(() => null);
+            if (member && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+                await member.timeout(spc.timeoutMs, 'Spam detection: repeated messages').catch(() => {});
+                timedOut = true;
+            }
+        }
+    }
+
+    // Public notice
+    channel.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('Spam Detected')
+        .setDescription(`${author}'s repeated messages were removed.`)
+        .addFields(
+            { name: 'Messages Removed', value: `${matchedMessages.length}`, inline: true },
+            ...(timedOut ? [{ name: 'Consequence', value: `Timed out for ${spc.timeoutDisplay}`, inline: true }] : [])
+        ).setTimestamp()]
+    }).catch(() => {});
+
+    // DM the user
+    author.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('Your messages were removed')
+        .setDescription(`You were detected as spamming in **${guild.name}** and your repeated messages were removed.`)
+        .addFields(
+            ...(timedOut ? [{ name: 'Consequence', value: `You have been timed out for ${spc.timeoutDisplay}`, inline: true }] : [])
+        ).setFooter({ text: 'If you believe this is a mistake, contact a moderator' }).setTimestamp()]
+    }).catch(() => {});
+
+    // Mod log
+    logMod(guild, guildId, new EmbedBuilder().setColor('#ff6600').setTitle('Spam Auto-Removed')
+        .addFields(
+            { name: 'User', value: `${author} (${author.tag})`, inline: true },
+            { name: 'Channel', value: `${channel}`, inline: true },
+            { name: 'Messages Removed', value: `${matchedMessages.length}`, inline: true },
+            ...(timedOut ? [{ name: 'Timeout', value: spc.timeoutDisplay, inline: true }] : []),
+            { name: 'Content', value: matchedMessages[0]?.content?.slice(0, 200) || '(empty)' }
+        ).setTimestamp());
+
+    addHistory(guildId, author.id, { guildId, userId: author.id, userTag: author.tag, type: 'spam_remove', reason: `Spam: ${matchedMessages.length}x identical messages`, issuedBy: client.user.tag, issuedAt: Date.now() });
 }
 
 // ── Warning timers ─────────────────────────────────────────────────────────
@@ -465,6 +556,15 @@ client.once('ready', async () => {
                 .addBooleanOption(o => o.setName('delete').setDescription('Delete messages containing scam images'))
                 .addStringOption(o => o.setName('timeout').setDescription('Timeout duration on detection (m:s / h:m:s / d:h:m:s, or "none")'))
                 .addIntegerOption(o => o.setName('threshold').setDescription('Hash similarity threshold 0–20 (lower = stricter, default 10)').setMinValue(0).setMaxValue(20))),
+        new SlashCommandBuilder().setName('spam').setDescription('Configure spam protection')
+            .addSubcommand(s => s.setName('config').setDescription('Configure spam detection settings')
+                .addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable spam detection'))
+                .addBooleanOption(o => o.setName('delete').setDescription('Delete spam messages'))
+                .addIntegerOption(o => o.setName('count').setDescription('Number of identical messages to trigger (default 5)').setMinValue(2).setMaxValue(20))
+                .addIntegerOption(o => o.setName('window').setDescription('Time window in seconds to count messages in (default 10)').setMinValue(3).setMaxValue(60))
+                .addStringOption(o => o.setName('timeout').setDescription('Timeout duration (m:s / h:m:s / d:h:m:s, or "none")'))
+            )
+            .addSubcommand(s => s.setName('view').setDescription('View current spam protection settings')),
     ].map(c => c.toJSON());
 
     client.application.commands.set(commands);
@@ -482,7 +582,10 @@ client.once('ready', async () => {
             arr.push({ id: r.id, hash: r.hash, label: r.label, addedBy: r.added_by, addedAt: r.added_at });
             scamHashCache.set(r.guild_id, arr);
         }
-        console.log(`✅ Loaded scam hashes for ${scamHashCache.size} guild(s)`);
+        // Preload global scam hashes
+        await getGlobalScamHashes();
+        const globalCount = globalScamHashCache?.length ?? 0;
+        console.log(`✅ Loaded scam hashes for ${scamHashCache.size} guild(s), ${globalCount} global hash(es)`);
         // Restore timed bans
         const banRes = await pool.query("SELECT guild_id, user_id, data FROM history WHERE data->>'type' = 'ban' AND data->>'expiresAt' IS NOT NULL ORDER BY id DESC");
         const seenBans = new Set();
@@ -542,27 +645,47 @@ client.on('messageCreate', async message => {
     for (const att of attachments) {
         let buffer;
         try { buffer = await fetchImageBuffer(att.url); } catch (e) { console.error('scam: fetch failed:', e.message); continue; }
-        let match;
-        try {
-            const imgHash = await dHash(buffer);
-            match = null;
+
+        let imgHash;
+        try { imgHash = await dHash(buffer); } catch (e) { console.error('scam: hash failed:', e.message); continue; }
+
+        // 1. Check global hashes (always enforced, threshold 10)
+        const globalHashes = await getGlobalScamHashes();
+        let match = null;
+        let isGlobal = false;
+        let matchDistance = 0;
+        for (const entry of globalHashes) {
+            const dist = hammingDistance(imgHash, entry.hash);
+            if (dist <= 10) { match = entry; isGlobal = true; matchDistance = dist; break; }
+        }
+
+        // 2. Check guild-specific hashes
+        if (!match) {
             for (const entry of hashes) {
-                if (hammingDistance(imgHash, entry.hash) <= spc.threshold) { match = entry; break; }
+                const dist = hammingDistance(imgHash, entry.hash);
+                if (dist <= spc.threshold) { match = entry; matchDistance = dist; break; }
             }
-        } catch (e) { console.error('scam: hash failed:', e.message); continue; }
+        }
+
         if (!match) continue;
 
-        console.log(`🚨 Scam image detected in ${guildId} from ${message.author.tag} (match: "${match.label}")`);
+        console.log(`🚨 ${isGlobal ? '[GLOBAL] ' : ''}Scam image detected in ${guildId} from ${message.author.tag} (match: "${match.label}")`);
+
+        // Global matches always delete + timeout; guild matches respect per-guild config
+        const shouldDelete = isGlobal ? true : spc.deleteMsg;
+        const shouldTimeout = isGlobal ? true : !!spc.timeoutMs;
+        const timeoutMs = isGlobal ? (spc.timeoutMs ?? 5 * 60 * 1000) : spc.timeoutMs;
+        const timeoutDisplay = isGlobal ? (spc.timeoutDisplay ?? '5m') : spc.timeoutDisplay;
 
         // Delete the message
-        if (canDelete) message.delete().catch(() => {});
+        if (shouldDelete && canDelete) message.delete().catch(() => {});
 
         // Timeout the user
         let timedOut = false;
-        if (spc.timeoutMs && canTimeout) {
+        if (shouldTimeout && timeoutMs && canTimeout) {
             const member = message.guild.members.cache.get(message.author.id) ?? await message.guild.members.fetch(message.author.id).catch(() => null);
             if (member && !member.permissions.has(PermissionFlagsBits.Administrator)) {
-                await member.timeout(spc.timeoutMs, `Scam image detected: ${match.label}`).catch(() => {});
+                await member.timeout(timeoutMs, `${isGlobal ? '[Global] ' : ''}Scam image: ${match.label}`).catch(() => {});
                 timedOut = true;
             }
         }
@@ -572,7 +695,7 @@ client.on('messageCreate', async message => {
             .setDescription(`${message.author}'s message was removed — it matched a known scam image.`)
             .addFields(
                 { name: 'Matched', value: match.label, inline: true },
-                ...(timedOut ? [{ name: 'Consequence', value: `Timed out for ${spc.timeoutDisplay}`, inline: true }] : [])
+                ...(timedOut ? [{ name: 'Consequence', value: `Timed out for ${timeoutDisplay}`, inline: true }] : [])
             ).setTimestamp()]
         }).catch(() => {});
 
@@ -581,22 +704,59 @@ client.on('messageCreate', async message => {
             .setDescription(`A message you sent in **${message.guild.name}** was detected as a known scam image and removed.`)
             .addFields(
                 { name: 'Matched Pattern', value: match.label, inline: true },
-                ...(timedOut ? [{ name: 'Consequence', value: `You have been timed out for ${spc.timeoutDisplay}`, inline: true }] : [])
+                ...(timedOut ? [{ name: 'Consequence', value: `You have been timed out for ${timeoutDisplay}`, inline: true }] : [])
             ).setFooter({ text: 'If you believe this is a mistake, contact a moderator' }).setTimestamp()]
         }).catch(() => {});
 
         // Log to mod channel
-        logMod(message.guild, guildId, new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Auto-Removed')
-            .addFields(
-                { name: 'User', value: `${message.author} (${message.author.tag})`, inline: true },
-                { name: 'Channel', value: `${message.channel}`, inline: true },
-                { name: 'Matched', value: match.label, inline: true },
-                ...(timedOut ? [{ name: 'Timeout', value: spc.timeoutDisplay, inline: true }] : []),
-                { name: 'Message Deleted', value: canDelete ? 'Yes' : 'No (missing ManageMessages)', inline: true }
-            ).setTimestamp());
+        const cfg2 = await getConfig(guildId);
+        const logCh = cfg2.logChannelId && message.guild.channels.cache.get(cfg2.logChannelId);
+        if (logCh) {
+            const logEmbed = new EmbedBuilder().setColor('#ff0000').setTitle(`Scam Image Auto-Removed${isGlobal ? ' (Global)' : ''}`)
+                .addFields(
+                    { name: 'User', value: `${message.author} (${message.author.tag})`, inline: true },
+                    { name: 'Channel', value: `${message.channel}`, inline: true },
+                    { name: 'Matched', value: `${match.label}${isGlobal ? ' *(global)*' : ''}`, inline: true },
+                    ...(timedOut ? [{ name: 'Timeout', value: timeoutDisplay, inline: true }] : []),
+                    { name: 'Message Deleted', value: (shouldDelete && canDelete) ? 'Yes' : shouldDelete ? 'No (missing ManageMessages)' : 'No', inline: true },
+                    { name: 'Match Distance', value: matchDistance === 0 ? 'Exact match' : `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different`, inline: true }
+                ).setTimestamp();
+            await logCh.send({ embeds: [logEmbed] }).catch(() => {});
+
+            // If it's a near-match (not exact), forward the original image so mods can review it
+            if (matchDistance > 0) {
+                const reviewEmbed = new EmbedBuilder().setColor('#ff9900').setTitle('⚠️ Near-Match — Please Review')
+                    .setDescription(`This image was **similar but not identical** to the registered scam hash for **${match.label}**.\nIf this is a false positive, use \`/scam remove ${match.id}\` or adjust the threshold with \`/scam config threshold\`.`)
+                    .setImage(att.url)
+                    .addFields({ name: 'Similarity', value: `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different (threshold: ${isGlobal ? 10 : spc.threshold})`, inline: true })
+                    .setTimestamp();
+                await logCh.send({ embeds: [reviewEmbed] }).catch(() => {});
+            }
+        }
 
         addHistory(guildId, message.author.id, { guildId, userId: message.author.id, userTag: message.author.tag, type: 'scam_remove', reason: `Scam image: ${match.label}`, issuedBy: client.user.tag, issuedAt: Date.now() });
         break; // one action per message is enough
+    }
+
+    // ── Spam check ────────────────────────────────────────────────────────
+    if (!message.content) return;
+    const spc2 = await getSpamConfig(guildId);
+    if (!spc2.enabled) return;
+
+    const spamKey = `${guildId}-${message.author.id}`;
+    const now = Date.now();
+    const history = spamTracker.get(spamKey) ?? [];
+    // Prune entries outside the window
+    const fresh = history.filter(e => now - e.ts < spc2.windowMs);
+    fresh.push({ content: normalise(message.content), msgId: message.id, channelId: message.channel.id, ts: now });
+    spamTracker.set(spamKey, fresh);
+
+    // Count how many recent messages match the latest content
+    const latest = normalise(message.content);
+    const matches = fresh.filter(e => e.content === latest && e.channelId === message.channel.id);
+    if (matches.length >= spc2.count) {
+        spamTracker.delete(spamKey); // reset after triggering
+        await handleSpam(message, matches, spc2);
     }
 });
 
@@ -784,7 +944,7 @@ client.on('interactionCreate', async interaction => {
     const { commandName, guildId } = interaction;
     if (!interaction.guild) return interaction.reply({ content: '❌ Server only.', flags: [MessageFlags.Ephemeral] });
 
-    const restricted = ['config','warning','timeout','kick','ban','note','userinfo','escalation','scam'];
+    const restricted = ['config','warning','timeout','kick','ban','note','userinfo','escalation','scam','spam'];
     if (restricted.includes(commandName) && !await hasCommandPermission(interaction, guildId)) {
         const cfg = await getConfig(guildId);
         return interaction.reply({ content: `❌ No permission.\n\n**Required:** Administrator OR ${cfg.accessRoleId ? `<@&${cfg.accessRoleId}>` : 'no role configured'}\n\nAsk an admin to run \`/config access\`.`, flags: [MessageFlags.Ephemeral] });
@@ -1186,6 +1346,49 @@ client.on('interactionCreate', async interaction => {
                 { name: 'Delete Messages', value: spc.deleteMsg ? 'Yes' : 'No', inline: true },
                 { name: 'Timeout', value: spc.timeoutMs ? spc.timeoutDisplay : 'None', inline: true },
                 { name: 'Threshold', value: `${spc.threshold}`, inline: true }
+            )], flags: [MessageFlags.Ephemeral] });
+        }
+    }
+
+    else if (commandName === 'spam') {
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'config') {
+            const enabled = interaction.options.getBoolean('enabled');
+            const del     = interaction.options.getBoolean('delete');
+            const count   = interaction.options.getInteger('count');
+            const window  = interaction.options.getInteger('window');
+            const toStr   = interaction.options.getString('timeout');
+            const cfg = await getConfig(guildId);
+            cfg.spamProt ??= {};
+            if (enabled !== null) cfg.spamProt.enabled   = enabled;
+            if (del     !== null) cfg.spamProt.deleteMsg  = del;
+            if (count   !== null) cfg.spamProt.count      = count;
+            if (window  !== null) cfg.spamProt.windowMs   = window * 1000;
+            if (toStr !== null) {
+                if (toStr.toLowerCase() === 'none') { cfg.spamProt.timeoutMs = null; cfg.spamProt.timeoutDisplay = 'None'; }
+                else {
+                    const dur = parseDuration(toStr);
+                    if (!dur || dur.isForever) return reply('❌ Invalid timeout. Use `m:s`, `h:m:s`, `d:h:m:s`, or `none`.');
+                    if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Discord timeouts cannot exceed 28 days.');
+                    cfg.spamProt.timeoutMs = dur.totalMs;
+                    cfg.spamProt.timeoutDisplay = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds);
+                }
+            }
+            saveConfig(guildId, cfg);
+            const spc = { enabled: true, count: 5, windowMs: 10_000, timeoutMs: 10 * 60 * 1000, timeoutDisplay: '10m', deleteMsg: true, ...cfg.spamProt };
+            await reply({ embeds: [E('#ff6600','Spam Protection Config').addFields(
+                { name: 'Detection', value: spc.enabled ? 'Enabled' : 'Disabled', inline: true },
+                { name: 'Trigger', value: `${spc.count} identical messages within ${spc.windowMs / 1000}s`, inline: true },
+                { name: 'Delete Messages', value: spc.deleteMsg ? 'Yes' : 'No', inline: true },
+                { name: 'Timeout', value: spc.timeoutMs ? spc.timeoutDisplay : 'None', inline: true }
+            )], flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'view') {
+            const spc = await getSpamConfig(guildId);
+            await reply({ embeds: [E('#ff6600','Spam Protection Config').addFields(
+                { name: 'Detection', value: spc.enabled ? 'Enabled' : 'Disabled', inline: true },
+                { name: 'Trigger', value: `${spc.count} identical messages within ${spc.windowMs / 1000}s`, inline: true },
+                { name: 'Delete Messages', value: spc.deleteMsg ? 'Yes' : 'No', inline: true },
+                { name: 'Timeout', value: spc.timeoutMs ? spc.timeoutDisplay : 'None', inline: true }
             )], flags: [MessageFlags.Ephemeral] });
         }
     }
