@@ -201,10 +201,25 @@ function normalise(content) {
     return content.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
+// Similarity ratio 0–1 between two strings using character bigrams (Dice coefficient).
+// For very short strings (<4 chars) also checks sorted-character equality to catch anagrams like "idk"/"dik".
+function similarity(a, b) {
+    if (a === b) return 1;
+    if (!a.length || !b.length) return 0;
+    // Short string anagram check
+    if (a.length <= 4 && b.length <= 4 && a.split('').sort().join('') === b.split('').sort().join('')) return 0.9;
+    if (a.length < 2 || b.length < 2) return 0;
+    const getBigrams = s => { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const bg = s.slice(i, i+2); m.set(bg, (m.get(bg) ?? 0) + 1); } return m; };
+    const aMap = getBigrams(a), bMap = getBigrams(b);
+    let intersection = 0;
+    for (const [bg, count] of aMap) intersection += Math.min(count, bMap.get(bg) ?? 0);
+    return (2 * intersection) / (a.length - 1 + b.length - 1);
+}
+
 async function getSpamConfig(guildId) {
     const cfg = await getConfig(guildId);
-    // defaults: enabled, 5 identical msgs in 10s triggers action, delete msgs, 10m timeout
-    return { enabled: true, count: 5, windowMs: 10_000, timeoutMs: 10 * 60 * 1000, timeoutDisplay: '10m', deleteMsg: true, ...cfg.spamProt };
+    // defaults: enabled, 5 similar msgs in 10s triggers action, delete msgs, 10m timeout, 0.7 similarity
+    return { enabled: true, count: 5, windowMs: 10_000, timeoutMs: 10 * 60 * 1000, timeoutDisplay: '10m', deleteMsg: true, similarityThreshold: 0.7, ...cfg.spamProt };
 }
 
 async function handleSpam(message, matchedMessages, spc) {
@@ -566,9 +581,10 @@ client.once('ready', async () => {
             .addSubcommand(s => s.setName('config').setDescription('Configure spam detection settings')
                 .addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable spam detection'))
                 .addBooleanOption(o => o.setName('delete').setDescription('Delete spam messages'))
-                .addIntegerOption(o => o.setName('count').setDescription('Number of identical messages to trigger (default 5)').setMinValue(2).setMaxValue(20))
+                .addIntegerOption(o => o.setName('count').setDescription('Number of similar messages to trigger (default 5)').setMinValue(2).setMaxValue(20))
                 .addIntegerOption(o => o.setName('window').setDescription('Time window in seconds to count messages in (default 10)').setMinValue(3).setMaxValue(60))
                 .addStringOption(o => o.setName('timeout').setDescription('Timeout duration (m:s / h:m:s / d:h:m:s, or "none")'))
+                .addIntegerOption(o => o.setName('similarity').setDescription('Similarity % needed to count as spam (default 70, lower = stricter)').setMinValue(50).setMaxValue(100))
             )
             .addSubcommand(s => s.setName('view').setDescription('View current spam protection settings')),
     ].map(c => c.toJSON());
@@ -762,7 +778,8 @@ client.on('messageCreate', async message => {
     spamTracker.set(spamKey, fresh);
 
     const latest = normalise(message.content);
-    const matches = fresh.filter(e => e.content === latest && e.channelId === message.channel.id);
+    // Group recent messages that are similar to the latest one
+    const matches = fresh.filter(e => e.channelId === message.channel.id && similarity(e.content, latest) >= spc2.similarityThreshold);
     if (matches.length >= spc2.count) {
         spamTracker.delete(spamKey);
         await handleSpam(message, matches, spc2);
@@ -1367,12 +1384,14 @@ client.on('interactionCreate', async interaction => {
             const count   = interaction.options.getInteger('count');
             const window  = interaction.options.getInteger('window');
             const toStr   = interaction.options.getString('timeout');
+            const simPct  = interaction.options.getInteger('similarity');
             const cfg = await getConfig(guildId);
             cfg.spamProt ??= {};
             if (enabled !== null) cfg.spamProt.enabled   = enabled;
             if (del     !== null) cfg.spamProt.deleteMsg  = del;
             if (count   !== null) cfg.spamProt.count      = count;
             if (window  !== null) cfg.spamProt.windowMs   = window * 1000;
+            if (simPct  !== null) cfg.spamProt.similarityThreshold = simPct / 100;
             if (toStr !== null) {
                 if (toStr.toLowerCase() === 'none') { cfg.spamProt.timeoutMs = null; cfg.spamProt.timeoutDisplay = 'None'; }
                 else {
@@ -1384,10 +1403,11 @@ client.on('interactionCreate', async interaction => {
                 }
             }
             saveConfig(guildId, cfg);
-            const spc = { enabled: true, count: 5, windowMs: 10_000, timeoutMs: 10 * 60 * 1000, timeoutDisplay: '10m', deleteMsg: true, ...cfg.spamProt };
+            const spc = { enabled: true, count: 5, windowMs: 10_000, timeoutMs: 10 * 60 * 1000, timeoutDisplay: '10m', deleteMsg: true, similarityThreshold: 0.7, ...cfg.spamProt };
             await reply({ embeds: [E('#ff6600','Spam Protection Config').addFields(
                 { name: 'Detection', value: spc.enabled ? 'Enabled' : 'Disabled', inline: true },
-                { name: 'Trigger', value: `${spc.count} identical messages within ${spc.windowMs / 1000}s`, inline: true },
+                { name: 'Trigger', value: `${spc.count} similar messages within ${spc.windowMs / 1000}s`, inline: true },
+                { name: 'Similarity', value: `${Math.round(spc.similarityThreshold * 100)}%`, inline: true },
                 { name: 'Delete Messages', value: spc.deleteMsg ? 'Yes' : 'No', inline: true },
                 { name: 'Timeout', value: spc.timeoutMs ? spc.timeoutDisplay : 'None', inline: true }
             )], flags: [MessageFlags.Ephemeral] });
@@ -1395,7 +1415,8 @@ client.on('interactionCreate', async interaction => {
             const spc = await getSpamConfig(guildId);
             await reply({ embeds: [E('#ff6600','Spam Protection Config').addFields(
                 { name: 'Detection', value: spc.enabled ? 'Enabled' : 'Disabled', inline: true },
-                { name: 'Trigger', value: `${spc.count} identical messages within ${spc.windowMs / 1000}s`, inline: true },
+                { name: 'Trigger', value: `${spc.count} similar messages within ${spc.windowMs / 1000}s`, inline: true },
+                { name: 'Similarity', value: `${Math.round(spc.similarityThreshold * 100)}%`, inline: true },
                 { name: 'Delete Messages', value: spc.deleteMsg ? 'Yes' : 'No', inline: true },
                 { name: 'Timeout', value: spc.timeoutMs ? spc.timeoutDisplay : 'None', inline: true }
             )], flags: [MessageFlags.Ephemeral] });
