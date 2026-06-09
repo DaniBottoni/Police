@@ -16,7 +16,7 @@ The ultimate moderation bot for discord.
 - **/config remove:** Removes a warning level.
 - **/config logchannel:** Set the channel where all warning, kick and ban embeds go to.
 - **/config removelogchannel:** Removes the log channel.
-- **/config warndm:** Toggles DM's to users on or off.
+- **/config notifications:** Toggles DM's to users on or off.
 ## Escalation:
 - **/escalation set:** Configure how many level X warnings you need to automatically bump up to a level Y.
 - **/escalation remove:** Removes an escalation step.
@@ -33,6 +33,9 @@ The ultimate moderation bot for discord.
 ## Spam Protection:
 - **/spam config:** Configure spam detection settings including enabling/disabling, how many similar messages trigger it, the time window, similarity threshold, whether to delete messages, and timeout duration.
 - **/spam view:** Shows the current spam protection configuration.
+## Messages:
+- **/messages delete:** Delete messages in one channel with filters like only deleting from a specific user, deleting in the last x hours and setting the amount of messages deleted.
+- **/messages purge:** Delete all of the selected users messages across all channels that were sent in the last x hours.
 ## Admin:
 - **/warning history:** Shows the warning history of a specific user.
 - **/warning list:** Shows all active warning in the server.
