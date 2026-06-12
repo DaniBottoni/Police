@@ -13,18 +13,13 @@ The ultimate moderation bot for discord.
 - **/config set:** Config the warning levels by matching them to roles and setting how long they take to expire.
 - **/config access:** Config what role is needed to access mod commands like /warn and /config.
 - **/config view:** Shows your current warning configuration.
-- **/config remove:** Removes a warning level.
-- **/config logchannel:** Set the channel where all warning, kick and ban embeds go to.
 - **/config removelogchannel:** Removes the log channel.
 - **/config notifications:** Toggles DM's to users on or off.
 ## Escalation:
 - **/escalation set:** Configure how many level X warnings you need to automatically bump up to a level Y.
-- **/escalation remove:** Removes an escalation step.
 - **/escalation setcap:** Sets the cap of the warnings, where any additional warning won't escalate.
-- **/escalation removecap:** Removes the escalation cap.
 - **/escalation view:** Shows the current escalation setup.
 - **/escalation settimeout:** Adds a special threshold where the user gets a configurable timeout.
-- **/escalation removetimeout:** Removes one of the special steps.
 ## Scam Protection:
 - **/scam add:** Upload a known scam image to register it. Any similar image posted in the server will be automatically removed.
 - **/scam remove:** Remove a registered scam image by its ID.
