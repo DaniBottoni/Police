@@ -264,13 +264,67 @@ function warnlistRow(page, total, guildId) {
     return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`wl_${page - 1}_${guildId}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(page === 0), refresh, new ButtonBuilder().setCustomId(`wl_${page + 1}_${guildId}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(page === total - 1))];
 }
 const refreshBtn = (id) => new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary));
+const customIdMatches = (id, prefixes) => prefixes.some(p => id.startsWith(p));
+
+async function buildScamListEmbed(guildId) {
+    const hashes = await getScamHashes(guildId), spc = await getScamProtConfig(guildId);
+    if (!hashes.length) return { embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Registry').setDescription('No scam images registered. Use `/scam add` to add one.')], components: [] };
+    const embed = new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Registry').setTimestamp().setDescription(`**${hashes.length}** image${hashes.length>1?'s':''} registered — detection **${spc.enabled?'enabled':'disabled'}**`).addFields({ name: 'Threshold', value: `${spc.threshold} (Hamming distance)`, inline: true }, { name: 'On Detection', value: [spc.deleteMsg?'Delete message':null, spc.timeoutMs?`Timeout ${spc.timeoutDisplay}`:null].filter(Boolean).join(' + ')||'No action', inline: true });
+    for (const h of hashes.slice(0,20)) embed.addFields({ name: `ID ${h.id} — ${h.label}`, value: `Hash: \`${h.hash}\` · Added by ${h.addedBy} <t:${Math.floor(h.addedAt/1000)}:R>` });
+    if (hashes.length > 20) embed.setFooter({ text: `Showing first 20 of ${hashes.length}` });
+    const components = [refreshBtn(`scamlist_refresh_${guildId}`)];
+    components.unshift(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`scamlist_remove_${guildId}`).setPlaceholder('Remove a scam image…').addOptions(hashes.slice(0,25).map(h => ({ label: `ID ${h.id} — ${h.label}`.slice(0,100), value: `${h.id}` })))));
+    return { embeds: [embed], components };
+}
+
+async function buildNoteViewEmbed(guildId, user) {
+    const notes = await getNotes(guildId, user.id);
+    if (!notes.length) return { embeds: [new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`).setDescription('No notes found for this user.')], components: [] };
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`).setTimestamp().setDescription(`${notes.length} note${notes.length>1?'s':''} on record.`);
+    const shown = notes.slice(-10);
+    for (const n of shown) embed.addFields({ name: `ID: ${n.id} — <t:${Math.floor(n.addedAt/1000)}:d> — ${n.addedBy}`, value: n.text });
+    if (notes.length > 10) embed.setFooter({ text: `Showing last 10 of ${notes.length} notes` });
+    const components = [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`noteview_remove_${guildId}_${user.id}`).setPlaceholder('Remove a note…').addOptions(shown.slice(0,25).map(n => ({ label: `ID ${n.id} — ${n.text.slice(0,80)}`.slice(0,100), value: `${n.id}` }))))];
+    return { embeds: [embed], components };
+}async function buildConfigViewEmbed(guildId) {
+    const cfg = await getConfig(guildId);
+    if (!cfg.levels || !Object.keys(cfg.levels).length) return { embeds: [new EmbedBuilder().setColor('#0099ff').setTitle('Warning Configuration').setDescription('📋 No warning levels configured yet.')], components: [] };
+    const embed = new EmbedBuilder().setColor('#0099ff').setTitle('Warning Configuration').setTimestamp(), normalLevels = {}, timeoutLevels = {};
+    for (const [lvl, d] of Object.entries(cfg.levels)) { if (d.isTimeoutLevel) timeoutLevels[lvl] = d; else normalLevels[lvl] = d; }
+    if (Object.keys(normalLevels).length) for (const [lvl, d] of Object.entries(normalLevels)) embed.addFields({ name: `Level ${lvl}`, value: `Role: <@&${d.roleId}>\nDuration: ${d.durationDisplay}`, inline: true });
+    if (Object.keys(timeoutLevels).length) embed.addFields({ name: '⏱️ Timeout Levels (Auto-Escalation)', value: Object.entries(timeoutLevels).sort(([a],[b])=>a-b).map(([lvl,t])=>`• **Level ${lvl}** — Timeout: **${t.timeoutDisplay}**`).join('\n'), inline: false });
+    embed.addFields({ name: 'Notifications', value: cfg.warnDm === false ? 'Disabled' : 'Enabled', inline: true });
+    const components = [refreshBtn(`configview_refresh_${guildId}`)];
+    const levelKeys = Object.keys(cfg.levels);
+    if (levelKeys.length) components.unshift(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`configview_removelevel_${guildId}`).setPlaceholder('Remove a warning level…').addOptions(levelKeys.slice(0,25).map(lvl => ({ label: `Level ${lvl}${cfg.levels[lvl].roleName ? ` — ${cfg.levels[lvl].roleName}` : ''}`, value: lvl })))));
+    return { embeds: [embed], components };
+}
+
+async function buildEscalationViewEmbed(guildId) {
+    const cfg = await getConfig(guildId), esc = cfg.escalation ?? {}, th = esc.thresholds ?? {}, to = esc.timeouts ?? {};
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Escalation Configuration').setTimestamp();
+    if (!Object.keys(th).length && !esc.cap && !Object.keys(to).length) embed.setDescription('No escalation rules configured. Use `/escalation set` to add thresholds.');
+    else {
+        if (Object.keys(th).length) embed.addFields({ name: 'Thresholds', value: Object.entries(th).sort(([a],[b])=>a-b).map(([l,t])=>`• **${t}x** Level ${l} → auto Level ${parseInt(l)+1}`).join('\n') });
+        if (Object.keys(to).length) embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(to).sort(([a],[b])=>a-b).map(([l,t])=>`• ${t.threshold}x Level ${parseInt(l)-1} → auto Level ${l} + **${t.durationDisplay}** timeout`).join('\n') });
+        embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
+    }
+    const components = [];
+    const thKeys = Object.keys(th), toKeys = Object.keys(to);
+    if (thKeys.length) components.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`escview_removethreshold_${guildId}`).setPlaceholder('Remove a threshold…').addOptions(thKeys.slice(0,25).map(l => ({ label: `Level ${l} (${th[l]}x → Level ${parseInt(l)+1})`, value: l })))));
+    if (toKeys.length) components.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`escview_removetimeout_${guildId}`).setPlaceholder('Remove a timeout escalation…').addOptions(toKeys.slice(0,25).map(l => ({ label: `Level ${l} (${to[l].threshold}x → +${to[l].durationDisplay} timeout)`, value: l })))));
+    const lastRow = [refreshBtn(`escalationview_refresh_${guildId}`).components[0]];
+    if (esc.cap) lastRow.push(new ButtonBuilder().setCustomId(`escview_removecap_${guildId}`).setLabel('Remove Level Cap').setStyle(ButtonStyle.Danger));
+    components.push(new ActionRowBuilder().addComponents(...lastRow));
+    return { embeds: [embed], components };
+}
 
 const helpPages = {
     help_warn: new EmbedBuilder().setColor('#ff0000').setTitle('Warning Commands').addFields({ name: '/warning give', value: 'Issue a warning at a configured level. Requires a reason. Triggers escalation checks automatically.' }, { name: '/warning remove', value: 'Remove a warning from a user via a dropdown and confirm prompt.' }, { name: '/warning list', value: 'View all active warnings in the server, paginated 10 users per page.' }, { name: '/warning history', value: 'View the last 10 warning history entries for a specific user.' }, { name: '/mywarnings', value: 'Check your own active warnings and how long is left on each one.' }, { name: '/timeout give', value: 'Apply a Discord native timeout. Duration: `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }, { name: '/userinfo', value: "View a user's full moderation profile — warnings, kicks, bans, notes, and more." }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands').addFields({ name: '/kick', value: 'Kick a user. Sends a DM, logs to history, posts to mod-log.' }, { name: '/ban give', value: 'Ban a user. Optional timed ban with auto-unban. Optionally delete recent messages (0–7 days).' }, { name: '/ban remove', value: 'Unban a user by their ID. Logs to history and mod-log channel.' }, { name: '/timeout give / remove', value: 'Apply or remove a Discord native timeout. Duration: `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }, { name: '/userinfo', value: 'View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
-    help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands').addFields({ name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' }, { name: '/config view', value: 'View all configured warning levels, roles, durations, and warn DM status.' }, { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access.' }, { name: '/config logchannel', value: 'Set a channel where every mod action is automatically logged.' }, { name: '/config removelogchannel / remove', value: 'Remove the mod-log channel or a warning level from config.' }, { name: '/config warndm', value: "Toggle whether users are DM'd when they receive a warning. Enabled by default." }).setFooter({ text: 'Use the buttons to explore other categories' }),
-    help_escalation: new EmbedBuilder().setColor('#ff9900').setTitle('Escalation Commands').addFields({ name: '/escalation set', value: 'Set a threshold: N warnings at level X → auto-escalate to level X+1.' }, { name: '/escalation remove / setcap / removecap', value: 'Remove a threshold, set or remove the maximum escalation level.' }, { name: '/escalation settimeout', value: 'N warnings at level X → auto level X+1 + a timeout.' }, { name: '/escalation removetimeout', value: 'Remove a timeout escalation rule.' }, { name: '/escalation view', value: 'View all active escalation rules, thresholds, timeouts, and the level cap.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
-    help_notes: new EmbedBuilder().setColor('#9b59b6').setTitle('Note Commands').addFields({ name: '/note add', value: 'Add a private mod note to a user. Not visible to the user.' }, { name: '/note view', value: 'View all notes on a user, with timestamps and which mod added them.' }, { name: '/note delete', value: 'Delete a note by its ID.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands').addFields({ name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' }, { name: '/config view', value: 'View all configured warning levels, roles, durations, and notification status. Use the dropdown here to remove a level.' }, { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access.' }, { name: '/config logchannel', value: 'Set a channel where every mod action is automatically logged. Includes a button to remove it.' }, { name: '/config notifications', value: "Toggle whether users are DM'd when they receive a warning. Enabled by default." }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_escalation: new EmbedBuilder().setColor('#ff9900').setTitle('Escalation Commands').addFields({ name: '/escalation set', value: 'Set a threshold: N warnings at level X → auto-escalate to level X+1.' }, { name: '/escalation setcap', value: 'Set the maximum escalation level.' }, { name: '/escalation settimeout', value: 'N warnings at level X → auto level X+1 + a timeout.' }, { name: '/escalation view', value: 'View all active escalation rules. Use the dropdowns/buttons here to remove thresholds, timeouts, or the level cap.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_notes: new EmbedBuilder().setColor('#9b59b6').setTitle('Note Commands').addFields({ name: '/note add', value: 'Add a private mod note to a user. Not visible to the user.' }, { name: '/note view', value: 'View all notes on a user, with timestamps and which mod added them. Use the dropdown here to remove a note.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_storage: new EmbedBuilder().setColor('#5865F2').setTitle('Database Storage').setDescription('Police Bot uses PostgreSQL to store all data persistently. Nothing is lost on restarts.').addFields({ name: 'warnings', value: 'Active warnings with expiry timestamps, user IDs, role IDs, and channel IDs.' }, { name: 'history', value: 'Full mod history per server — every warn, kick, and ban.' }, { name: 'configs', value: 'Per-server config: warning levels, roles, durations, escalation rules, access role.' }, { name: 'notes', value: 'Private mod notes per user.' }, { name: 'scam_hashes / global_scam_hashes', value: 'Registered scam image hashes, per-guild and global.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_features: new EmbedBuilder().setColor('#9b59b6').setTitle('Other Features').addFields({ name: 'Scam protection', value: 'Upload known scam images — any similar image posted is auto-removed.' }, { name: 'Spam protection', value: 'Detects repeated/similar messages and auto-removes with configurable timeouts.' }, { name: 'Rejoin protection', value: 'If a warned user leaves and rejoins, their warning roles are reapplied.' }, { name: 'Timer restoration', value: 'On bot restart, all active warning timers are restored from the database.' }, { name: '/invite', value: 'Get a pre-configured invite link with all required permissions.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
 };
@@ -302,28 +356,21 @@ client.once('ready', async () => {
         new SlashCommandBuilder().setName('userinfo').setDescription('View user info and mod history').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
         new SlashCommandBuilder().setName('note').setDescription('Manage mod notes')
             .addSubcommand(s => s.setName('add').setDescription('Add a note').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('text').setDescription('Note content').setRequired(true)))
-            .addSubcommand(s => s.setName('view').setDescription('View notes').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
-            .addSubcommand(s => s.setName('delete').setDescription('Delete a note by ID').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addIntegerOption(o => o.setName('id').setDescription('Note ID').setRequired(true))),
+            .addSubcommand(s => s.setName('view').setDescription('View notes').addUserOption(o => o.setName('user').setDescription('User').setRequired(true))),
         new SlashCommandBuilder().setName('config').setDescription('Configure the bot')
             .addSubcommand(s => s.setName('set').setDescription('Set up a warning level').addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)).addRoleOption(o => o.setName('role').setDescription('Role to assign').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View warning levels'))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can use mod commands'))
             .addSubcommand(s => s.setName('logchannel').setDescription('Set the mod-log channel').addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true)))
-            .addSubcommand(s => s.setName('removelogchannel').setDescription('Remove the mod-log channel'))
-            .addSubcommand(s => s.setName('remove').setDescription('Remove a warning level').addIntegerOption(o => o.setName('level').setDescription('Level to remove').setRequired(true)))
             .addSubcommand(s => s.setName('notifications').setDescription('Toggle DM notifications to users').addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable').setRequired(true))),
         new SlashCommandBuilder().setName('escalation').setDescription('Configure auto-escalation rules')
             .addSubcommand(s => s.setName('set').setDescription('Set escalation threshold').addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)).addIntegerOption(o => o.setName('threshold').setDescription('Number of warnings to trigger').setRequired(true)))
-            .addSubcommand(s => s.setName('remove').setDescription('Remove escalation threshold').addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)))
             .addSubcommand(s => s.setName('setcap').setDescription('Set max escalation level').addIntegerOption(o => o.setName('level').setDescription('Cap level').setRequired(true)))
-            .addSubcommand(s => s.setName('removecap').setDescription('Remove the level cap'))
             .addSubcommand(s => s.setName('settimeout').setDescription('Configure timeout-escalation').addIntegerOption(o => o.setName('level').setDescription('Target level (>=2)').setRequired(true)).addIntegerOption(o => o.setName('threshold').setDescription('Warnings needed').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('Timeout duration').setRequired(true)))
-            .addSubcommand(s => s.setName('removetimeout').setDescription('Remove timeout escalation').addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View escalation configuration')),
         new SlashCommandBuilder().setName('help').setDescription('View all commands and features'),
         new SlashCommandBuilder().setName('scam').setDescription('Manage scam image protection')
             .addSubcommand(s => s.setName('add').setDescription('Register a scam image').addAttachmentOption(o => o.setName('image').setDescription('The scam image').setRequired(true)).addStringOption(o => o.setName('label').setDescription('Label').setRequired(true)))
-            .addSubcommand(s => s.setName('remove').setDescription('Remove a scam image by ID').addIntegerOption(o => o.setName('id').setDescription('ID from /scam list').setRequired(true)))
             .addSubcommand(s => s.setName('list').setDescription('List registered scam images'))
             .addSubcommand(s => s.setName('config').setDescription('Configure scam protection').addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable')).addBooleanOption(o => o.setName('delete').setDescription('Delete scam messages')).addStringOption(o => o.setName('timeout').setDescription('Timeout duration or "none"')).addIntegerOption(o => o.setName('threshold').setDescription('Similarity threshold 0-20').setMinValue(0).setMaxValue(20))),
         new SlashCommandBuilder().setName('messages').setDescription('Bulk delete messages')
@@ -412,7 +459,7 @@ client.on('messageCreate', async message => {
         if (cfg2.warnDm !== false) message.author.send({ embeds: [E2('#ff0000','Your message was removed').setDescription(`A message you sent in **${message.guild.name}** was detected as a known scam image and removed.`).addFields({ name: 'Matched Pattern', value: match.label, inline: true }, ...(timedOut ? [{ name: 'Consequence', value: `You have been timed out for ${timeoutDisplay}`, inline: true }] : [])).setFooter({ text: 'If you believe this is a mistake, contact a moderator' })] }).catch(() => {});
         if (logCh) {
             await logCh.send({ embeds: [E2('#ff0000',`Scam Image Auto-Removed${isGlobal ? ' (Global)' : ''}`).addFields({ name: 'User', value: `${message.author} (${message.author.tag})`, inline: true }, { name: 'Channel', value: `${message.channel}`, inline: true }, { name: 'Matched', value: `${match.label}${isGlobal ? ' *(global)*' : ''}`, inline: true }, ...(timedOut ? [{ name: 'Timeout', value: timeoutDisplay, inline: true }] : []), { name: 'Message Deleted', value: (shouldDelete && canDelete) ? 'Yes' : shouldDelete ? 'No (missing ManageMessages)' : 'No', inline: true }, { name: 'Match Distance', value: matchDistance === 0 ? 'Exact' : `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different`, inline: true })] }).catch(() => {});
-            if (matchDistance > 0) await logCh.send({ embeds: [E2('#ff9900','⚠️ Near-Match — Please Review').setDescription(`This image was **similar but not identical** to the registered scam hash for **${match.label}**.\nIf this is a false positive, use \`/scam remove ${match.id}\` or adjust the threshold with \`/scam config threshold\`.`).setImage(att.url).addFields({ name: 'Similarity', value: `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different (threshold: ${isGlobal ? 10 : spc.threshold})`, inline: true })] }).catch(() => {});
+            if (matchDistance > 0) await logCh.send({ embeds: [E2('#ff9900','⚠️ Near-Match — Please Review').setDescription(`This image was **similar but not identical** to the registered scam hash for **${match.label}**.\nIf this is a false positive, use \`/scam list\` to remove it or adjust the threshold with \`/scam config threshold\`.`).setImage(att.url).addFields({ name: 'Similarity', value: `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different (threshold: ${isGlobal ? 10 : spc.threshold})`, inline: true })] }).catch(() => {});
         }
         addHistory(guildId, message.author.id, { guildId, userId: message.author.id, userTag: message.author.tag, type: 'scam_remove', reason: `Scam: ${match.label}`, issuedBy: client.user.tag, issuedAt: Date.now() });
         break;
@@ -435,6 +482,44 @@ client.on('messageCreate', async message => {
 // ── Interactions ───────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
   try {
+    if (interaction.isStringSelectMenu() && customIdMatches(interaction.customId, ['configview_removelevel_','escview_removethreshold_','escview_removetimeout_','scamlist_remove_','noteview_remove_'])) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const { customId, values } = interaction, value = values[0];
+        await interaction.deferUpdate();
+        if (customId.startsWith('configview_removelevel_')) {
+            const guildId = customId.slice(23), cfg = await getConfig(guildId);
+            delete cfg.levels?.[value]; saveConfig(guildId, cfg);
+            const { embeds, components } = await buildConfigViewEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('escview_removethreshold_')) {
+            const guildId = customId.slice(25), cfg = await getConfig(guildId);
+            delete cfg.escalation?.thresholds?.[value]; saveConfig(guildId, cfg);
+            const { embeds, components } = await buildEscalationViewEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('escview_removetimeout_')) {
+            const guildId = customId.slice(22), cfg = await getConfig(guildId);
+            delete cfg.escalation?.timeouts?.[value]; saveConfig(guildId, cfg);
+            const { embeds, components } = await buildEscalationViewEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('scamlist_remove_')) {
+            const guildId = customId.slice(16);
+            await removeScamHash(guildId, parseInt(value));
+            const { embeds, components } = await buildScamListEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('noteview_remove_')) {
+            const parts = customId.slice(16).split('_'), guildId = parts[0], userId = parts[1];
+            await deleteNote(guildId, userId, parseInt(value));
+            const user = await interaction.client.users.fetch(userId).catch(() => null);
+            if (!user) return interaction.editReply({ content: '❌ Could not fetch user.', embeds: [], components: [] });
+            const { embeds, components } = await buildNoteViewEmbed(guildId, user);
+            return interaction.editReply({ embeds, components });
+        }
+        return;
+    }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('unwarn_select_')) {
         if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const pendingId = interaction.customId.slice(14), pending = pendingUnwarns.get(pendingId);
@@ -500,42 +585,39 @@ client.on('interactionCreate', async interaction => {
             if (notes.length) { const shown = notes.slice(-5); embed.addFields({ name: `Notes (${notes.length})`, value: shown.map(n => `\`${n.id}\` <t:${Math.floor(n.addedAt/1000)}:d> by **${n.addedBy}**\n${n.text.slice(0,100)}${n.text.length>100?'…':''}`).join('\n\n') }); if (notes.length > 5) embed.setFooter({ text: `Showing last 5 of ${notes.length} notes` }); }
             return interaction.editReply({ embeds: [embed], components: [refreshBtn(customId)] });
         }
+        if (customId.startsWith('removelogchannel_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            const guildId = customId.slice(18), cfg = await getConfig(guildId);
+            if (!cfg.logChannelId) return interaction.update({ content: '❌ No log channel is currently set.', embeds: [], components: [] });
+            delete cfg.logChannelId; saveConfig(guildId, cfg);
+            return interaction.update({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Mod-Log Channel Removed').setDescription('No mod-log channel is set.')], components: [] });
+        }
         if (customId.startsWith('configview_refresh_')) {
             if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
             await interaction.deferUpdate();
-            const guildId = customId.slice(19), cfg = await getConfig(guildId);
-            if (!cfg.levels || !Object.keys(cfg.levels).length) return interaction.editReply({ content: '📋 No warning levels configured yet.', embeds: [], components: [] });
-            const embed = new EmbedBuilder().setColor('#0099ff').setTitle('Warning Configuration').setTimestamp(), normalLevels = {}, timeoutLevels = {};
-            for (const [lvl, d] of Object.entries(cfg.levels)) { if (d.isTimeoutLevel) timeoutLevels[lvl] = d; else normalLevels[lvl] = d; }
-            if (Object.keys(normalLevels).length) for (const [lvl, d] of Object.entries(normalLevels)) embed.addFields({ name: `Level ${lvl}`, value: `Role: <@&${d.roleId}>\nDuration: ${d.durationDisplay}`, inline: true });
-            if (Object.keys(timeoutLevels).length) embed.addFields({ name: '⏱️ Timeout Levels (Auto-Escalation)', value: Object.entries(timeoutLevels).sort(([a],[b])=>a-b).map(([lvl,t])=>`• **Level ${lvl}** — Timeout: **${t.timeoutDisplay}**`).join('\n'), inline: false });
-            embed.addFields({ name: 'Notifications', value: cfg.warnDm === false ? 'Disabled' : 'Enabled', inline: true });
-            return interaction.editReply({ embeds: [embed], components: [refreshBtn(customId)] });
+            const { embeds, components } = await buildConfigViewEmbed(customId.slice(19));
+            return interaction.editReply({ embeds, components });
         }
         if (customId.startsWith('escalationview_refresh_')) {
             if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
             await interaction.deferUpdate();
-            const guildId = customId.slice(23), cfg = await getConfig(guildId), esc = cfg.escalation ?? {};
-            const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Escalation Configuration').setTimestamp(), th = esc.thresholds ?? {}, to = esc.timeouts ?? {};
-            if (!Object.keys(th).length && !esc.cap && !Object.keys(to).length) embed.setDescription('No escalation rules configured.');
-            else {
-                if (Object.keys(th).length) embed.addFields({ name: 'Thresholds', value: Object.entries(th).sort(([a],[b])=>a-b).map(([l,t])=>`• **${t}x** Level ${l} → auto Level ${parseInt(l)+1}`).join('\n') });
-                if (Object.keys(to).length) embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(to).sort(([a],[b])=>a-b).map(([l,t])=>`• ${t.threshold}x Level ${parseInt(l)-1} → auto Level ${l} + **${t.durationDisplay}** timeout`).join('\n') });
-                embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
-            }
-            return interaction.editReply({ embeds: [embed], components: [refreshBtn(customId)] });
+            const { embeds, components } = await buildEscalationViewEmbed(customId.slice(23));
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('escview_removecap_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferUpdate();
+            const guildId = customId.slice(19), cfg = await getConfig(guildId);
+            delete cfg.escalation?.cap; saveConfig(guildId, cfg);
+            const { embeds, components } = await buildEscalationViewEmbed(guildId);
+            return interaction.editReply({ embeds, components });
         }
         if (customId.startsWith('scamlist_refresh_')) {
             if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
             await interaction.deferUpdate();
             const guildId = customId.slice(17); scamHashCache.delete(guildId);
-            const hashes = await getScamHashes(guildId), spc = await getScamProtConfig(guildId);
-            const E2 = (c,t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
-            if (!hashes.length) return interaction.editReply({ embeds: [E2('#ff0000','Scam Image Registry').setDescription('No scam images registered.')], components: [] });
-            const embed = E2('#ff0000','Scam Image Registry').setDescription(`**${hashes.length}** image${hashes.length>1?'s':''} registered — detection **${spc.enabled?'enabled':'disabled'}**`).addFields({ name: 'Threshold', value: `${spc.threshold} (Hamming distance)`, inline: true }, { name: 'On Detection', value: [spc.deleteMsg?'Delete message':null, spc.timeoutMs?`Timeout ${spc.timeoutDisplay}`:null].filter(Boolean).join(' + ')||'No action', inline: true });
-            for (const h of hashes.slice(0,20)) embed.addFields({ name: `ID ${h.id} — ${h.label}`, value: `Hash: \`${h.hash}\` · Added by ${h.addedBy} <t:${Math.floor(h.addedAt/1000)}:R>` });
-            if (hashes.length > 20) embed.setFooter({ text: `Showing first 20 of ${hashes.length}` });
-            return interaction.editReply({ embeds: [embed], components: [refreshBtn(customId)] });
+            const { embeds, components } = await buildScamListEmbed(guildId);
+            return interaction.editReply({ embeds, components });
         }
         if (customId.startsWith('unwarn_confirm_') || customId.startsWith('unwarn_cancel_')) {
             const isConfirm = customId.startsWith('unwarn_confirm_'), pendingId = customId.slice(isConfirm ? 15 : 13), pending = pendingUnwarns.get(pendingId);
@@ -587,24 +669,12 @@ client.on('interactionCreate', async interaction => {
             saveConfig(guildId, cfg);
             await reply({ embeds: [E('#00ff00','Warning Level Configured').addFields({ name: 'Level', value: `${level}`, inline: true }, { name: 'Role', value: `${role}`, inline: true }, { name: 'Duration', value: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds, dur.isForever), inline: true })], flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'view') {
-            const cfg = await getConfig(guildId); if (!cfg.levels || !Object.keys(cfg.levels).length) return reply('📋 No warning levels configured yet.');
-            const embed = E('#0099ff','Warning Configuration'), normalLevels = {}, timeoutLevels = {};
-            for (const [lvl, d] of Object.entries(cfg.levels)) { if (d.isTimeoutLevel) timeoutLevels[lvl] = d; else normalLevels[lvl] = d; }
-            if (Object.keys(normalLevels).length) for (const [lvl, d] of Object.entries(normalLevels)) embed.addFields({ name: `Level ${lvl}`, value: `Role: <@&${d.roleId}>\nDuration: ${d.durationDisplay}`, inline: true });
-            if (Object.keys(timeoutLevels).length) embed.addFields({ name: '⏱️ Timeout Levels (Auto-Escalation)', value: Object.entries(timeoutLevels).sort(([a],[b])=>a-b).map(([lvl,t])=>`• **Level ${lvl}** — Timeout: **${t.timeoutDisplay}**`).join('\n'), inline: false });
-            embed.addFields({ name: 'Notifications', value: cfg.warnDm === false ? 'Disabled' : 'Enabled', inline: true });
-            await reply({ embeds: [embed], components: [refreshBtn(`configview_refresh_${guildId}`)], flags: [MessageFlags.Ephemeral] });
+            const { embeds, components } = await buildConfigViewEmbed(guildId);
+            await reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'logchannel') {
             const channel = interaction.options.getChannel('channel'); if (!channel.isTextBased()) return reply('❌ Please select a text channel.');
-            const cfg = await getConfig(guildId); cfg.logChannelId = channel.id; saveConfig(guildId, cfg); await reply(`Mod-log channel set to ${channel}.`);
-        } else if (sub === 'removelogchannel') {
-            const cfg = await getConfig(guildId); if (!cfg.logChannelId) return reply('❌ No log channel is currently set.');
-            delete cfg.logChannelId; saveConfig(guildId, cfg); await reply('Mod-log channel removed.');
-        } else if (sub === 'remove') {
-            const level = interaction.options.getInteger('level'), cfg = await getConfig(guildId);
-            if (!cfg.levels?.[level]) return reply(`❌ Level ${level} is not configured.`);
-            const roleName = cfg.levels[level].roleName; delete cfg.levels[level]; saveConfig(guildId, cfg);
-            await reply(`Warning Level ${level} (${roleName}) removed from config.`);
+            const cfg = await getConfig(guildId); cfg.logChannelId = channel.id; saveConfig(guildId, cfg);
+            await reply({ embeds: [E('#00ff00','Mod-Log Channel Set').setDescription(`Mod-log channel set to ${channel}.`)], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`removelogchannel_${guildId}`).setLabel('Remove Log Channel').setStyle(ButtonStyle.Danger))], flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'notifications') {
             const enabled = interaction.options.getBoolean('enabled'), cfg = await getConfig(guildId); cfg.warnDm = enabled; saveConfig(guildId, cfg);
             await reply({ embeds: [E(enabled ? '#00ff00' : '#FFA500', enabled ? 'Notifications Enabled' : 'Notifications Disabled').setDescription(enabled ? "Users will be DM'd for warnings, scam removals, and spam removals." : "Users will **not** be DM'd for warnings, scam removals, or spam removals.")], flags: [MessageFlags.Ephemeral] });
@@ -792,14 +862,8 @@ client.on('interactionCreate', async interaction => {
             addNote(guildId, user.id, note); await reply(`✅ Note added to ${user} (ID: \`${note.id}\`).`);
         } else if (sub === 'view') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const notes = await getNotes(guildId, user.id); if (!notes.length) return interaction.editReply({ content: `📋 No notes found for ${user}.` });
-            const embed = E('#5865F2',`Notes — ${user.tag}`).setDescription(`${notes.length} note${notes.length>1?'s':''} on record.`);
-            for (const n of notes.slice(-10)) embed.addFields({ name: `ID: ${n.id} — <t:${Math.floor(n.addedAt/1000)}:d> — ${n.addedBy}`, value: n.text });
-            if (notes.length > 10) embed.setFooter({ text: `Showing last 10 of ${notes.length} notes` });
-            await interaction.editReply({ embeds: [embed] });
-        } else {
-            const id = interaction.options.getInteger('id'), deleted = await deleteNote(guildId, user.id, id);
-            await reply(deleted ? `✅ Note \`${id}\` deleted.` : `❌ Note ID \`${id}\` not found for ${user}.`);
+            const { embeds, components } = await buildNoteViewEmbed(guildId, user);
+            await interaction.editReply({ embeds, components });
         }
     }
     else if (commandName === 'scam') {
@@ -814,17 +878,10 @@ client.on('interactionCreate', async interaction => {
             for (const e of existing) { if (hammingDistance(hash, e.hash) <= spc.threshold) return reply(`❌ Already registered (or similar to) **${e.label}** (ID: \`${e.id}\`).`); }
             const entry = await addScamHash(guildId, hash, label, interaction.user.tag);
             await reply({ embeds: [E('#00ff00','Scam Image Registered').addFields({ name: 'Label', value: label, inline: true }, { name: 'ID', value: `${entry.id}`, inline: true }, { name: 'Hash', value: `\`${hash}\``, inline: false }).setFooter({ text: 'Any similar image posted in this server will now be actioned' })] });
-        } else if (sub === 'remove') {
-            const id = interaction.options.getInteger('id'), deleted = await removeScamHash(guildId, id);
-            await reply(deleted ? `✅ Scam image \`${id}\` removed.` : `❌ No scam image with ID \`${id}\` found.`);
         } else if (sub === 'list') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const hashes = await getScamHashes(guildId); if (!hashes.length) return reply('📋 No scam images registered. Use `/scam add` to add one.');
-            const spc = await getScamProtConfig(guildId);
-            const embed = E('#ff0000','Scam Image Registry').setDescription(`**${hashes.length}** image${hashes.length>1?'s':''} registered — detection **${spc.enabled?'enabled':'disabled'}**`).addFields({ name: 'Threshold', value: `${spc.threshold} (Hamming distance)`, inline: true }, { name: 'On Detection', value: [spc.deleteMsg?'Delete message':null, spc.timeoutMs?`Timeout ${spc.timeoutDisplay}`:null].filter(Boolean).join(' + ')||'No action', inline: true });
-            for (const h of hashes.slice(0,20)) embed.addFields({ name: `ID ${h.id} — ${h.label}`, value: `Hash: \`${h.hash}\` · Added by ${h.addedBy} <t:${Math.floor(h.addedAt/1000)}:R>` });
-            if (hashes.length > 20) embed.setFooter({ text: `Showing first 20 of ${hashes.length}` });
-            await interaction.editReply({ embeds: [embed], components: [refreshBtn(`scamlist_refresh_${guildId}`)] });
+            const { embeds, components } = await buildScamListEmbed(guildId);
+            await interaction.editReply({ embeds, components });
         } else if (sub === 'config') {
             const enabled = interaction.options.getBoolean('enabled'), del = interaction.options.getBoolean('delete'), toStr = interaction.options.getString('timeout'), thresh = interaction.options.getInteger('threshold');
             const cfg = await getConfig(guildId); cfg.scamProt ??= {};
@@ -904,14 +961,9 @@ client.on('interactionCreate', async interaction => {
             const targetLevel = level + 1; if (!cfg.levels?.[targetLevel]) return reply(`❌ Level ${targetLevel} not configured. Use /config set first.`);
             esc.thresholds[level] = threshold; saveConfig(guildId, cfg);
             await reply(`**${threshold}x** Level ${level} → auto Level ${targetLevel}.`);
-        } else if (sub === 'remove') {
-            const level = interaction.options.getInteger('level'); if (!esc.thresholds[level]) return reply(`❌ No threshold for Level ${level}.`);
-            delete esc.thresholds[level]; saveConfig(guildId, cfg); await reply(`Removed escalation threshold for Level ${level}.`);
         } else if (sub === 'setcap') {
             const level = interaction.options.getInteger('level'); if (level < 1 || level > 100) return reply('❌ Cap must be between 1 and 100.');
             esc.cap = level; saveConfig(guildId, cfg); await reply(`Level cap set to **${level}**.`);
-        } else if (sub === 'removecap') {
-            if (!esc.cap) return reply('❌ No level cap is set.'); delete esc.cap; saveConfig(guildId, cfg); await reply('Level cap removed.');
         } else if (sub === 'settimeout') {
             const level = interaction.options.getInteger('level'), threshold = interaction.options.getInteger('threshold'), durationStr = interaction.options.getString('duration');
             if (level < 2 || level > 100) return reply('❌ Target level must be between 2 and 100.');
@@ -921,18 +973,9 @@ client.on('interactionCreate', async interaction => {
             if (!cfg.levels[level]) cfg.levels[level] = { isTimeoutLevel: true, timeoutDurationMs: dur.totalMs, timeoutDisplay: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds) };
             esc.timeouts ??= {}; esc.timeouts[level] = { durationMs: dur.totalMs, durationDisplay: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds), threshold };
             saveConfig(guildId, cfg); await reply(`Timeout escalation: **${threshold}x** Level ${level-1} → Level ${level} + **${esc.timeouts[level].durationDisplay}** timeout.`);
-        } else if (sub === 'removetimeout') {
-            const level = interaction.options.getInteger('level'); if (!esc.timeouts?.[level]) return reply(`❌ No escalation timeout for Level ${level}.`);
-            delete esc.timeouts[level]; saveConfig(guildId, cfg); await reply(`Removed escalation timeout for Level ${level}.`);
         } else if (sub === 'view') {
-            const embed = E('#5865F2','Escalation Configuration'), th = esc.thresholds ?? {}, to = esc.timeouts ?? {};
-            if (!Object.keys(th).length && !esc.cap && !Object.keys(to).length) embed.setDescription('No escalation rules configured. Use `/escalation set` to add thresholds.');
-            else {
-                if (Object.keys(th).length) embed.addFields({ name: 'Thresholds', value: Object.entries(th).sort(([a],[b])=>a-b).map(([l,t])=>`• **${t}x** Level ${l} → auto Level ${parseInt(l)+1}`).join('\n') });
-                if (Object.keys(to).length) embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(to).sort(([a],[b])=>a-b).map(([l,t])=>`• ${t.threshold}x Level ${parseInt(l)-1} → auto Level ${l} + **${t.durationDisplay}** timeout`).join('\n') });
-                embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
-            }
-            await reply({ embeds: [embed], components: [refreshBtn(`escalationview_refresh_${guildId}`)], flags: [MessageFlags.Ephemeral] });
+            const { embeds, components } = await buildEscalationViewEmbed(guildId);
+            await reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
         }
     }
 
