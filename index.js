@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { Pool } = require('pg');
 const dns = require('dns'); dns.setDefaultResultOrder('ipv4first');
 const http = require('http'), https = require('https');
@@ -277,6 +277,16 @@ async function buildScamListEmbed(guildId) {
     return { embeds: [embed], components };
 }
 
+async function buildLogChannelEmbed(guildId) {
+    const cfg = await getConfig(guildId);
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Mod-Log Channel').setTimestamp()
+        .setDescription(cfg.logChannelId ? `Mod actions are currently logged to <#${cfg.logChannelId}>.` : 'No mod-log channel is currently set.');
+    const row1 = new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId(`logchannel_select_${guildId}`).setPlaceholder('Select a channel…').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setMinValues(1).setMaxValues(1));
+    const components = [row1];
+    if (cfg.logChannelId) components.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`removelogchannel_${guildId}`).setLabel('Remove Log Channel').setStyle(ButtonStyle.Danger)));
+    return { embeds: [embed], components };
+}
+
 async function buildNoteViewEmbed(guildId, user) {
     const notes = await getNotes(guildId, user.id);
     if (!notes.length) return { embeds: [new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`).setDescription('No notes found for this user.')], components: [] };
@@ -322,7 +332,7 @@ async function buildEscalationViewEmbed(guildId) {
 const helpPages = {
     help_warn: new EmbedBuilder().setColor('#ff0000').setTitle('Warning Commands').addFields({ name: '/warning give', value: 'Issue a warning at a configured level. Requires a reason. Triggers escalation checks automatically.' }, { name: '/warning remove', value: 'Remove a warning from a user via a dropdown and confirm prompt.' }, { name: '/warning list', value: 'View all active warnings in the server, paginated 10 users per page.' }, { name: '/warning history', value: 'View the last 10 warning history entries for a specific user.' }, { name: '/mywarnings', value: 'Check your own active warnings and how long is left on each one.' }, { name: '/timeout give', value: 'Apply a Discord native timeout. Duration: `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }, { name: '/userinfo', value: "View a user's full moderation profile — warnings, kicks, bans, notes, and more." }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands').addFields({ name: '/kick', value: 'Kick a user. Sends a DM, logs to history, posts to mod-log.' }, { name: '/ban give', value: 'Ban a user. Optional timed ban with auto-unban. Optionally delete recent messages (0–7 days).' }, { name: '/ban remove', value: 'Unban a user by their ID. Logs to history and mod-log channel.' }, { name: '/timeout give / remove', value: 'Apply or remove a Discord native timeout. Duration: `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }, { name: '/userinfo', value: 'View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
-    help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands').addFields({ name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' }, { name: '/config view', value: 'View all configured warning levels, roles, durations, and notification status. Use the dropdown here to remove a level.' }, { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access.' }, { name: '/config logchannel', value: 'Set a channel where every mod action is automatically logged. Includes a button to remove it.' }, { name: '/config notifications', value: "Toggle whether users are DM'd when they receive a warning. Enabled by default." }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands').addFields({ name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' }, { name: '/config view', value: 'View all configured warning levels, roles, durations, and notification status. Use the dropdown here to remove a level.' }, { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access.' }, { name: '/config logchannel', value: 'Opens a dropdown to select the mod-log channel where every mod action is automatically logged, with a button to remove it.' }, { name: '/config notifications', value: "Toggle whether users are DM'd when they receive a warning. Enabled by default." }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_escalation: new EmbedBuilder().setColor('#ff9900').setTitle('Escalation Commands').addFields({ name: '/escalation set', value: 'Set a threshold: N warnings at level X → auto-escalate to level X+1.' }, { name: '/escalation setcap', value: 'Set the maximum escalation level.' }, { name: '/escalation settimeout', value: 'N warnings at level X → auto level X+1 + a timeout.' }, { name: '/escalation view', value: 'View all active escalation rules. Use the dropdowns/buttons here to remove thresholds, timeouts, or the level cap.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_notes: new EmbedBuilder().setColor('#9b59b6').setTitle('Note Commands').addFields({ name: '/note add', value: 'Add a private mod note to a user. Not visible to the user.' }, { name: '/note view', value: 'View all notes on a user, with timestamps and which mod added them. Use the dropdown here to remove a note.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_storage: new EmbedBuilder().setColor('#5865F2').setTitle('Database Storage').setDescription('Police Bot uses PostgreSQL to store all data persistently. Nothing is lost on restarts.').addFields({ name: 'warnings', value: 'Active warnings with expiry timestamps, user IDs, role IDs, and channel IDs.' }, { name: 'history', value: 'Full mod history per server — every warn, kick, and ban.' }, { name: 'configs', value: 'Per-server config: warning levels, roles, durations, escalation rules, access role.' }, { name: 'notes', value: 'Private mod notes per user.' }, { name: 'scam_hashes / global_scam_hashes', value: 'Registered scam image hashes, per-guild and global.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
@@ -361,7 +371,7 @@ client.once('ready', async () => {
             .addSubcommand(s => s.setName('set').setDescription('Set up a warning level').addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)).addRoleOption(o => o.setName('role').setDescription('Role to assign').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View warning levels'))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can use mod commands'))
-            .addSubcommand(s => s.setName('logchannel').setDescription('Set the mod-log channel').addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true)))
+            .addSubcommand(s => s.setName('logchannel').setDescription('Set or remove the mod-log channel'))
             .addSubcommand(s => s.setName('notifications').setDescription('Toggle DM notifications to users').addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable').setRequired(true))),
         new SlashCommandBuilder().setName('escalation').setDescription('Configure auto-escalation rules')
             .addSubcommand(s => s.setName('set').setDescription('Set escalation threshold').addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)).addIntegerOption(o => o.setName('threshold').setDescription('Number of warnings to trigger').setRequired(true)))
@@ -532,6 +542,15 @@ client.on('interactionCreate', async interaction => {
         await interaction.update({ embeds: [new EmbedBuilder().setColor('#FFA500').setTitle('⚠️ Confirm Unwarn').setDescription(`Remove **Level ${w.level}** warning from <@${pending.targetUserId}>?`).addFields({ name: 'Role', value: role ? `${role}` : w.roleName, inline: true }, { name: 'Issued', value: `<t:${Math.floor(w.issuedAt/1000)}:R>`, inline: true }, { name: 'Reason', value: w.reason || 'No reason' }).setFooter({ text: 'Expires in 60 seconds' }).setTimestamp()], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`unwarn_confirm_${pendingId}`).setLabel('Confirm').setStyle(ButtonStyle.Danger), new ButtonBuilder().setCustomId(`unwarn_cancel_${pendingId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary))] });
         return;
     }
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('logchannel_select_')) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const guildId = interaction.customId.slice(19), channel = interaction.channels.first();
+        if (!channel) return interaction.reply({ content: '❌ No channel selected.', flags: [MessageFlags.Ephemeral] });
+        await interaction.deferUpdate();
+        const cfg = await getConfig(guildId); cfg.logChannelId = channel.id; saveConfig(guildId, cfg);
+        const { embeds, components } = await buildLogChannelEmbed(guildId);
+        return interaction.editReply({ embeds, components });
+    }
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('access_role_')) {
         const guildId = interaction.customId.replace('access_role_', '');
         if (guildId !== interaction.guild.id) return interaction.reply({ content: '❌ Invalid interaction.', flags: [MessageFlags.Ephemeral] });
@@ -587,10 +606,11 @@ client.on('interactionCreate', async interaction => {
         }
         if (customId.startsWith('removelogchannel_')) {
             if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferUpdate();
             const guildId = customId.slice(18), cfg = await getConfig(guildId);
-            if (!cfg.logChannelId) return interaction.update({ content: '❌ No log channel is currently set.', embeds: [], components: [] });
             delete cfg.logChannelId; saveConfig(guildId, cfg);
-            return interaction.update({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Mod-Log Channel Removed').setDescription('No mod-log channel is set.')], components: [] });
+            const { embeds, components } = await buildLogChannelEmbed(guildId);
+            return interaction.editReply({ embeds, components });
         }
         if (customId.startsWith('configview_refresh_')) {
             if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
@@ -672,9 +692,8 @@ client.on('interactionCreate', async interaction => {
             const { embeds, components } = await buildConfigViewEmbed(guildId);
             await reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'logchannel') {
-            const channel = interaction.options.getChannel('channel'); if (!channel.isTextBased()) return reply('❌ Please select a text channel.');
-            const cfg = await getConfig(guildId); cfg.logChannelId = channel.id; saveConfig(guildId, cfg);
-            await reply({ embeds: [E('#00ff00','Mod-Log Channel Set').setDescription(`Mod-log channel set to ${channel}.`)], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`removelogchannel_${guildId}`).setLabel('Remove Log Channel').setStyle(ButtonStyle.Danger))], flags: [MessageFlags.Ephemeral] });
+            const { embeds, components } = await buildLogChannelEmbed(guildId);
+            await reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
         } else if (sub === 'notifications') {
             const enabled = interaction.options.getBoolean('enabled'), cfg = await getConfig(guildId); cfg.warnDm = enabled; saveConfig(guildId, cfg);
             await reply({ embeds: [E(enabled ? '#00ff00' : '#FFA500', enabled ? 'Notifications Enabled' : 'Notifications Disabled').setDescription(enabled ? "Users will be DM'd for warnings, scam removals, and spam removals." : "Users will **not** be DM'd for warnings, scam removals, or spam removals.")], flags: [MessageFlags.Ephemeral] });
