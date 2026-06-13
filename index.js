@@ -534,13 +534,17 @@ client.on('interactionCreate', async interaction => {
         if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const targetUserId = interaction.values[0];
         const modal = new ModalBuilder().setCustomId(`unban_modal_${targetUserId}`).setTitle('Unban User')
-            .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason for unban').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(512).setPlaceholder('No reason provided')));
+            .addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason for unban').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(512).setPlaceholder('No reason provided')),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('invite').setLabel('Send the user an invite back? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(3).setPlaceholder('no'))
+            );
         return interaction.showModal(modal);
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith('unban_modal_')) {
         if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const userId = interaction.customId.slice(12), guildId = interaction.guild.id;
         const reason = (interaction.fields.getTextInputValue('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
+        const sendInvite = ['yes','y','true'].includes((interaction.fields.getTextInputValue('invite') || '').trim().toLowerCase());
         await interaction.deferUpdate();
         try {
             const ban = await interaction.guild.bans.fetch(userId).catch(() => null);
@@ -549,7 +553,20 @@ client.on('interactionCreate', async interaction => {
             const user = ban.user;
             addHistory(guildId, userId, { guildId, userId, userTag: user.tag, type: 'unban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
             logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#00ff00').setTitle('Member Unbanned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }).setTimestamp());
-            await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Member Unbanned').addFields({ name: 'User', value: `${user.tag}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Unbanned by', value: `${interaction.user}` }).setTimestamp()], components: [] });
+            let inviteResult = null;
+            if (sendInvite) {
+                const botMember = interaction.guild.members.me;
+                const channel = interaction.guild.channels.cache.find(c => c.isTextBased() && c.type !== ChannelType.GuildAnnouncement && botMember.permissionsIn(c).has(PermissionFlagsBits.CreateInstantInvite));
+                if (channel) {
+                    try {
+                        const invite = await channel.createInvite({ maxUses: 1, maxAge: 86400, unique: true, reason: `Unban invite for ${user.tag}` });
+                        await user.send({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle("You've been unbanned").setDescription(`You were unbanned from **${interaction.guild.name}**.\n\nHere's an invite back: ${invite.url}\n*(expires in 24h, single use)*`).addFields({ name: 'Reason', value: reason })] });
+                        inviteResult = 'sent';
+                    } catch (e) { console.error('unban invite:', e.message); inviteResult = 'failed'; }
+                } else inviteResult = 'failed';
+            }
+            const inviteField = sendInvite ? [{ name: 'Invite', value: inviteResult === 'sent' ? '✅ Sent via DM' : '❌ Failed to send (DMs closed or no invitable channel)', inline: true }] : [];
+            await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Member Unbanned').addFields({ name: 'User', value: `${user.tag}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Unbanned by', value: `${interaction.user}`, inline: true }, ...inviteField).setTimestamp()], components: [] });
         } catch (e) { console.error(e); await interaction.editReply({ content: '❌ Failed to unban.', embeds: [], components: [] }); }
         return;
     }
