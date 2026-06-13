@@ -12,18 +12,18 @@ The ultimate moderation bot for discord.
 ## Config:
 - **/config set:** Config the warning levels by matching them to roles and setting how long they take to expire.
 - **/config access:** Config what role is needed to access mod commands like /warn and /config.
-- **/config view:** Shows your current warning configuration and allows you to delete configurations.
 - **/config logchannel:** Sets which channel the embeds go to and let's you remove it.
 - **/config notifications:** Toggles DM's to users on or off.
+- **/config view:** Shows your current warning configuration and allows you to delete configurations.
 ## Escalation:
 - **/escalation set:** Configure how many level X warnings you need to automatically bump up to a level Y.
 - **/escalation setcap:** Sets the cap of the warnings, where any additional warning won't escalate.
-- **/escalation view:** Shows the current escalation setup and let's you delete levels, timeout levels and the cap.
 - **/escalation settimeout:** Adds a special threshold where the user gets a configurable timeout.
+- **/escalation view:** Shows the current escalation setup and let's you delete levels, timeout levels and the cap.
 ## Scam Protection:
 - **/scam add:** Upload a known scam image to register it. Any similar image posted in the server will be automatically removed.
-- **/scam list:** Lists all registered scam images with their IDs, labels, who added them and let's you delete them.
 - **/scam config:** Configure scam protection settings including enabling/disabling detection, whether to delete messages, timeout duration, and similarity threshold.
+- **/scam list:** Lists all registered scam images with their IDs, labels, who added them and let's you delete them.
 ## Spam Protection:
 - **/spam config:** Configure spam detection settings including enabling/disabling, how many similar messages trigger it, the time window, similarity threshold, whether to delete messages, and timeout duration.
 - **/spam view:** Shows the current spam protection configuration.
