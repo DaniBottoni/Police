@@ -728,16 +728,18 @@ client.on('interactionCreate', async interaction => {
         if (!member) return reply(`❌ ${user} is not in this server.`);
         const userWarnings = [...activeWarnings.entries()].filter(([, w]) => w.guildId === guildId && w.userId === user.id);
         if (!userWarnings.length) return reply(`❌ ${user} has no active warnings.`);
+        const embed = E('#FFA500','⚠️ Remove a Warning').setDescription(`${user} has **${userWarnings.length}** active warning${userWarnings.length>1?'s':''}. Select one below to remove it.`).setFooter({ text: 'Expires in 60 seconds' });
         const options = userWarnings.slice(0, 25).map(([key, w]) => {
             let expires;
             if (w.isForever) expires = 'Permanent';
             else { const s = Math.max(0, Math.floor((w.expiresAt - Date.now()) / 1000)), d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60), sec = s%60; expires = `Expires in ${[d&&`${d}d`,h&&`${h}h`,m&&`${m}m`,(!d&&!h)&&`${sec}s`].filter(Boolean).join(' ')||'<1m'}`; }
+            embed.addFields({ name: `Level ${w.level} — ${w.roleName}`, value: `${expires}\nReason: ${(w.reason||'No reason').slice(0,100)}` });
             return { label: `Level ${w.level} — ${w.roleName}`, description: `${expires} · ${(w.reason||'No reason').slice(0,50)}`, value: key };
         });
         const pendingId = interaction.id;
         pendingUnwarns.set(pendingId, { targetUserId: user.id, targetUserTag: user.tag, guildId, modId: interaction.user.id });
         setTimeout(() => pendingUnwarns.delete(pendingId), 60_000);
-        await reply({ embeds: [E('#FFA500','⚠️ Remove a Warning').setDescription(`Select which warning to remove from ${user}.`).addFields({ name: 'Active Warnings', value: `${userWarnings.length} warning${userWarnings.length>1?'s':''} on record` }).setFooter({ text: 'Expires in 60 seconds' })], components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`unwarn_select_${pendingId}`).setPlaceholder('Select a warning to remove…').addOptions(options))], flags: [MessageFlags.Ephemeral] });
+        await reply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`unwarn_select_${pendingId}`).setPlaceholder('Select a warning to remove…').addOptions(options))], flags: [MessageFlags.Ephemeral] });
     }
     else if (commandName === 'timeout') {
         const sub = interaction.options.getSubcommand(), user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
