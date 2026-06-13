@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { Pool } = require('pg');
 const dns = require('dns'); dns.setDefaultResultOrder('ipv4first');
 const http = require('http'), https = require('https');
@@ -331,7 +331,7 @@ async function buildEscalationViewEmbed(guildId) {
 
 const helpPages = {
     help_warn: new EmbedBuilder().setColor('#ff0000').setTitle('Warning Commands').addFields({ name: '/warning give', value: 'Issue a warning at a configured level. Requires a reason. Triggers escalation checks automatically.' }, { name: '/warning remove', value: 'Remove a warning from a user via a dropdown and confirm prompt.' }, { name: '/warning list', value: 'View all active warnings in the server, paginated 10 users per page.' }, { name: '/warning history', value: 'View the last 10 warning history entries for a specific user.' }, { name: '/mywarnings', value: 'Check your own active warnings and how long is left on each one.' }, { name: '/timeout give', value: 'Apply a Discord native timeout. Duration: `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }, { name: '/userinfo', value: "View a user's full moderation profile — warnings, kicks, bans, notes, and more." }).setFooter({ text: 'Use the buttons to explore other categories' }),
-    help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands').addFields({ name: '/kick', value: 'Kick a user. Sends a DM, logs to history, posts to mod-log.' }, { name: '/ban give', value: 'Ban a user. Optional timed ban with auto-unban. Optionally delete recent messages (0–7 days).' }, { name: '/ban remove', value: 'Unban a user by their ID. Logs to history and mod-log channel.' }, { name: '/timeout give / remove', value: 'Apply or remove a Discord native timeout. Duration: `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }, { name: '/userinfo', value: 'View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands').addFields({ name: '/kick', value: 'Kick a user. Sends a DM, logs to history, posts to mod-log.' }, { name: '/ban give', value: 'Ban a user. Optional timed ban with auto-unban. Optionally delete recent messages (0–7 days).' }, { name: '/ban remove', value: 'Shows an embed listing all banned users — select one and enter a reason to unban them.' }, { name: '/timeout give / remove', value: 'Apply or remove a Discord native timeout. Duration: `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }, { name: '/userinfo', value: 'View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands').addFields({ name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' }, { name: '/config view', value: 'View all configured warning levels, roles, durations, and notification status. Use the dropdown here to remove a level.' }, { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access.' }, { name: '/config logchannel', value: 'Opens a dropdown to select the mod-log channel where every mod action is automatically logged, with a button to remove it.' }, { name: '/config notifications', value: "Toggle whether users are DM'd when they receive a warning. Enabled by default." }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_escalation: new EmbedBuilder().setColor('#ff9900').setTitle('Escalation Commands').addFields({ name: '/escalation set', value: 'Set a threshold: N warnings at level X → auto-escalate to level X+1.' }, { name: '/escalation cap', value: 'Set the maximum escalation level.' }, { name: '/escalation timeout', value: 'N warnings at level X → auto level X+1 + a timeout.' }, { name: '/escalation view', value: 'View all active escalation rules. Use the dropdowns/buttons here to remove thresholds, timeouts, or the level cap.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_notes: new EmbedBuilder().setColor('#9b59b6').setTitle('Note Commands').addFields({ name: '/note add', value: 'Add a private mod note to a user. Not visible to the user.' }, { name: '/note remove', value: 'View all notes on a user, with timestamps and which mod added them. Use the dropdown here to remove a note.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
@@ -362,7 +362,7 @@ client.once('ready', async () => {
         new SlashCommandBuilder().setName('kick').setDescription('Kick a user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)),
         new SlashCommandBuilder().setName('ban').setDescription('Manage bans')
             .addSubcommand(s => s.setName('give').setDescription('Ban a user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('Optional timed ban duration')).addIntegerOption(o => o.setName('delete_days').setDescription('Days of messages to delete (0-7)').setMinValue(0).setMaxValue(7)).addStringOption(o => o.setName('delete_messages').setDescription('Also delete messages in last X time after ban (e.g. 1:0:0 = 1 hour)')))
-            .addSubcommand(s => s.setName('remove').setDescription('Unban a user').addStringOption(o => o.setName('user_id').setDescription('User ID').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason'))),
+            .addSubcommand(s => s.setName('remove').setDescription('Unban a user')),
         new SlashCommandBuilder().setName('userinfo').setDescription('View user info and mod history').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
         new SlashCommandBuilder().setName('note').setDescription('Manage mod notes')
             .addSubcommand(s => s.setName('add').setDescription('Add a note').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('text').setDescription('Note content').setRequired(true)))
@@ -528,6 +528,29 @@ client.on('interactionCreate', async interaction => {
             const { embeds, components } = await buildNoteViewEmbed(guildId, user);
             return interaction.editReply({ embeds, components });
         }
+        return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('unban_select_')) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const targetUserId = interaction.values[0];
+        const modal = new ModalBuilder().setCustomId(`unban_modal_${targetUserId}`).setTitle('Unban User')
+            .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason for unban').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(512).setPlaceholder('No reason provided')));
+        return interaction.showModal(modal);
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('unban_modal_')) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const userId = interaction.customId.slice(12), guildId = interaction.guild.id;
+        const reason = (interaction.fields.getTextInputValue('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
+        await interaction.deferUpdate();
+        try {
+            const ban = await interaction.guild.bans.fetch(userId).catch(() => null);
+            if (!ban) return interaction.editReply({ content: '❌ That user is no longer banned.', embeds: [], components: [] });
+            await interaction.guild.members.unban(userId, reason);
+            const user = ban.user;
+            addHistory(guildId, userId, { guildId, userId, userTag: user.tag, type: 'unban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
+            logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#00ff00').setTitle('Member Unbanned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }).setTimestamp());
+            await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Member Unbanned').addFields({ name: 'User', value: `${user.tag}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Unbanned by', value: `${interaction.user}` }).setTimestamp()], components: [] });
+        } catch (e) { console.error(e); await interaction.editReply({ content: '❌ Failed to unban.', embeds: [], components: [] }); }
         return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('unwarn_select_')) {
@@ -846,17 +869,15 @@ client.on('interactionCreate', async interaction => {
                 await reply({ embeds: [E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Duration', value: dd || 'Permanent', inline: true }, ...(exTs ? [{ name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []), { name: 'Messages Deleted', value: deleteDays ? `${deleteDays} day(s) via Discord` : delDisplay ? `${deletedMsgCount} msgs in last ${delDisplay}` : 'None', inline: true }, { name: 'Reason', value: reason }, { name: 'Banned by', value: `${interaction.user}` })] });
             } catch (e) { console.error(e); await reply('❌ Failed to ban user.'); }
         } else {
-            const userId = interaction.options.getString('user_id').trim(), reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
-            if (!/^\d{17,20}$/.test(userId)) return reply('❌ Invalid user ID. Must be a Discord snowflake (17-20 digits).');
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            try {
-                const ban = await interaction.guild.bans.fetch(userId).catch(() => null); if (!ban) return reply('❌ That user is not banned.');
-                await interaction.guild.members.unban(userId, reason);
-                const user = ban.user;
-                addHistory(guildId, userId, { guildId, userId, userTag: user.tag, type: 'unban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
-                logMod(interaction.guild, guildId, E('#00ff00','Member Unbanned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }));
-                await reply({ embeds: [E('#00ff00','Member Unbanned').addFields({ name: 'User', value: `${user.tag}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Unbanned by', value: `${interaction.user}` })] });
-            } catch (e) { console.error(e); await reply('❌ Failed to unban.'); }
+            const bans = await interaction.guild.bans.fetch().catch(() => null);
+            if (!bans || !bans.size) return reply('📋 There are no banned users in this server.');
+            const list = [...bans.values()];
+            const embed = E('#ff0000','🔓 Unban a User').setDescription(`This server has **${list.length}** banned user${list.length>1?'s':''}. Select one below to unban.`);
+            for (const b of list.slice(0, 25)) embed.addFields({ name: b.user.tag, value: `Reason: ${(b.reason || 'No reason provided').slice(0,200)}` });
+            if (list.length > 25) embed.setFooter({ text: `Showing first 25 of ${list.length}` });
+            const options = list.slice(0, 25).map(b => ({ label: b.user.tag.slice(0,100), description: `ID: ${b.user.id}`, value: b.user.id }));
+            await interaction.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`unban_select_${guildId}`).setPlaceholder('Select a user to unban…').addOptions(options))] });
         }
     }
     else if (commandName === 'userinfo') {
