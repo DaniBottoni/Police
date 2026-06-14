@@ -185,15 +185,25 @@ async function handleWarningExpiry(key, guildId, userId, roleId, channelId) {
     if (w) addHistory(guildId, userId, { ...w, endedAt: Date.now(), endReason: 'expired' });
     warningTimers.delete(key); deleteWarning(key);
 }
+// setTimeout's delay is a 32-bit signed int (~24.8 days max). For longer delays, chain timeouts recursively.
+const MAX_TIMEOUT_DELAY = 2147483647;
+
 function scheduleWarningRemoval(key, guildId, userId, roleId, expiresAt, channelId) {
     const t = expiresAt - Date.now();
     if (t <= 0) return handleWarningExpiry(key, guildId, userId, roleId, channelId);
-    warningTimers.set(key, setTimeout(() => handleWarningExpiry(key, guildId, userId, roleId, channelId), t));
+    const schedule = (delay) => {
+        if (delay <= MAX_TIMEOUT_DELAY) {
+            warningTimers.set(key, setTimeout(() => handleWarningExpiry(key, guildId, userId, roleId, channelId), delay));
+        } else {
+            warningTimers.set(key, setTimeout(() => schedule(delay - MAX_TIMEOUT_DELAY), MAX_TIMEOUT_DELAY));
+        }
+    };
+    schedule(t);
 }
 function scheduleBanExpiry(guildId, userId, userTag, expiresAt, reason) {
     const t = expiresAt - Date.now(); if (t <= 0) return;
     const key = `${guildId}-${userId}`;
-    banTimers.set(key, setTimeout(async () => {
+    const run = async () => {
         banTimers.delete(key);
         try {
             const guild = client.guilds.cache.get(guildId); if (!guild) return;
@@ -202,7 +212,12 @@ function scheduleBanExpiry(guildId, userId, userTag, expiresAt, reason) {
             addHistory(guildId, userId, { guildId, userId, userTag, type: 'unban', reason: 'Timed ban expired', issuedBy: client.user.tag, issuedAt: Date.now() });
             logMod(guild, guildId, new EmbedBuilder().setColor('#00ff00').setTitle('Timed Ban Expired').addFields({ name: 'User', value: `${userTag} (${userId})`, inline: true }, { name: 'Original Reason', value: reason }).setTimestamp());
         } catch (e) { console.error('Ban expiry failed:', e.message); }
-    }, t));
+    };
+    const schedule = (delay) => {
+        if (delay <= MAX_TIMEOUT_DELAY) banTimers.set(key, setTimeout(run, delay));
+        else banTimers.set(key, setTimeout(() => schedule(delay - MAX_TIMEOUT_DELAY), MAX_TIMEOUT_DELAY));
+    };
+    schedule(t);
 }
 async function applyWarning(guild, member, user, guildId, level, reason, channelId, issuedByTag) {
     const cfg = await getConfig(guildId), lc = cfg.levels[level], role = guild.roles.cache.get(lc?.roleId);
