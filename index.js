@@ -434,7 +434,9 @@ client.once('ready', async () => {
             .addSubcommand(s => s.setName('timeout').setDescription('Configure timeout-escalation').addIntegerOption(o => o.setName('level').setDescription('Target level (>=2)').setRequired(true)).addIntegerOption(o => o.setName('threshold').setDescription('Warnings needed').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('Timeout duration').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View escalation configuration')),
         new SlashCommandBuilder().setName('help').setDescription('View all commands and features'),
-        new SlashCommandBuilder().setName('globalhashes').setDescription('View and manage global scam image hashes (bot owner only)'),
+        new SlashCommandBuilder().setName('globalhashes').setDescription('View and manage global scam image hashes (bot owner only)')
+            .addSubcommand(s => s.setName('view').setDescription('View all global scam hashes'))
+            .addSubcommand(s => s.setName('add').setDescription('Register a global scam image').addAttachmentOption(o => o.setName('image').setDescription('The scam image').setRequired(true)).addStringOption(o => o.setName('label').setDescription('Label').setRequired(true))),
         new SlashCommandBuilder().setName('scam').setDescription('Manage scam image protection')
             .addSubcommand(s => s.setName('add').setDescription('Register a scam image').addAttachmentOption(o => o.setName('image').setDescription('The scam image').setRequired(true)).addStringOption(o => o.setName('label').setDescription('Label').setRequired(true)))
             .addSubcommand(s => s.setName('list').setDescription('List registered scam images'))
@@ -835,9 +837,22 @@ client.on('interactionCreate', async interaction => {
     else if (commandName === 'help') { await reply({ embeds: [helpOverviewEmbed()], components: helpRows(), flags: [MessageFlags.Ephemeral] }); }
     else if (commandName === 'globalhashes') {
         if (interaction.user.id !== OWNER_ID) return reply('❌ This command is restricted to the bot owner.');
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const { embeds, components } = await buildGlobalHashesEmbed();
-        await interaction.editReply({ embeds, components });
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'view') {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const { embeds, components } = await buildGlobalHashesEmbed();
+            await interaction.editReply({ embeds, components });
+        } else if (sub === 'add') {
+            const att = interaction.options.getAttachment('image'), label = interaction.options.getString('label').slice(0,100).replace(/[\x00-\x1F\x7F]/g,'');
+            if (!att.contentType?.startsWith('image/') && !/\.(png|jpg|jpeg|gif|webp)$/i.test(att.name ?? '')) return reply('❌ Please attach an image file (PNG, JPG, GIF, or WebP).');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            let buffer; try { buffer = await fetchImageBuffer(att.url); } catch (e) { return reply(`❌ Failed to download image: ${e.message}`); }
+            let hash; try { hash = await dHash(buffer); } catch (e) { return reply(`❌ Failed to process image: ${e.message}`); }
+            const existing = await getGlobalScamHashes();
+            for (const e of existing) { if (hammingDistance(hash, e.hash) <= 10) return reply(`❌ Already registered (or similar to) **${e.label}** (ID: \`${e.id}\`).`); }
+            const entry = await addGlobalScamHash(hash, label, interaction.user.tag);
+            await reply({ embeds: [E('#00ff00','Global Scam Image Registered').addFields({ name: 'Label', value: label, inline: true }, { name: 'ID', value: `${entry.id}`, inline: true }, { name: 'Hash', value: `\`${hash}\``, inline: false }).setFooter({ text: 'Any similar image posted in any server will now be auto-removed and timed out' })] });
+        }
     }
     else if (commandName === 'config') {
         const sub = interaction.options.getSubcommand();
