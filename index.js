@@ -53,7 +53,15 @@ async function showAccessControlConfig(interaction, guildId) {
     await interaction.reply({ embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('🔒 Access Configuration').setDescription('Select which role should have access to moderation commands:\n\n**Commands affected:**\n• `/warn` `/unwarn` `/timeout` `/config set/view`\n• `/config access` `/warnlist` `/history` `/escalation`\n\n**Note:** Server administrators always have access.').setFooter({ text: 'Select a role from the dropdown below' })], components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`access_role_${guildId}`).setPlaceholder('Select a role for command access').setMinValues(1).setMaxValues(1))], flags: [MessageFlags.Ephemeral] });
 }
 function parseDuration(s) {
+    s = s.trim();
     if (s.toLowerCase() === 'forever') return { days: 0, hours: 0, minutes: 0, seconds: 0, totalMs: null, isForever: true };
+    // Natural shorthand: 1d, 2h, 30m, 90s, or combinations like 1d12h, 1h30m
+    if (/^(\d+d)?(\d+h)?(\d+m)?(\d+s)?$/i.test(s) && /\d/.test(s)) {
+        const m = s.match(/^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i);
+        const days = parseInt(m[1] || 0), hours = parseInt(m[2] || 0), minutes = parseInt(m[3] || 0), seconds = parseInt(m[4] || 0);
+        const totalMs = (days * 86400 + hours * 3600 + minutes * 60 + seconds) * 1000;
+        return (totalMs <= 0 || totalMs > 365 * 86400 * 1000) ? null : { days, hours, minutes, seconds, totalMs, isForever: false };
+    }
     const parts = s.split(':').map(p => { const n = parseInt(p.trim()); return (n < 0 || n > 9999) ? NaN : n; });
     if (parts.some(isNaN) || parts.length < 2 || parts.length > 4) return null;
     let days = 0, hours = 0, minutes = 0, seconds = 0;
@@ -69,15 +77,19 @@ function formatDuration(d, h, m, s, isForever = false) { if (isForever) return '
 async function bulkDeleteInRange(channel, { userId, since, maxCount = Infinity } = {}) {
     let deleted = 0, lastId;
     const MAX_AGE = 1_209_600_000; // 14 days — Discord bulkDelete limit
-    do {
-        const fetched = await channel.messages.fetch({ limit: 100, ...(lastId ? { before: lastId } : {}) });
-        if (!fetched.size) break;
-        const eligible = fetched.filter(m => (!userId || m.author.id === userId) && (!since || m.createdTimestamp >= since) && (Date.now() - m.createdTimestamp < MAX_AGE));
-        const batch = [...eligible.values()].slice(0, maxCount - deleted);
-        if (batch.length) { await channel.bulkDelete(batch).catch(() => {}); deleted += batch.length; }
-        if (deleted >= maxCount || (since && fetched.last()?.createdTimestamp < since)) break;
-        lastId = fetched.last()?.id;
-    } while (true);
+    try {
+        do {
+            const fetched = await channel.messages.fetch({ limit: 100, ...(lastId ? { before: lastId } : {}) });
+            if (!fetched.size) break;
+            const eligible = fetched.filter(m => (!userId || m.author.id === userId) && (!since || m.createdTimestamp >= since) && (Date.now() - m.createdTimestamp < MAX_AGE));
+            const batch = [...eligible.values()].slice(0, maxCount - deleted);
+            if (batch.length) { await channel.bulkDelete(batch).catch(e => console.error(`bulkDelete failed in ${channel.id}:`, e.message)); deleted += batch.length; }
+            if (deleted >= maxCount || (since && fetched.last()?.createdTimestamp < since)) break;
+            lastId = fetched.last()?.id;
+        } while (true);
+    } catch (e) {
+        console.error(`bulkDeleteInRange failed in channel ${channel.id}:`, e.message);
+    }
     return deleted;
 }
 
@@ -99,6 +111,8 @@ function fetchImageBuffer(url) {
     });
 }
 const scamHashCache = new Map();
+// Pending near-match review actions: pendingId -> { hash, label, attUrl, dims }
+const pendingNearMatches = new Map();
 async function getScamHashes(guildId) {
     if (scamHashCache.has(guildId)) return scamHashCache.get(guildId);
     const res = await pool.query('SELECT id, hash, label, added_by, added_at FROM scam_hashes WHERE guild_id = $1 ORDER BY id', [guildId]);
@@ -115,7 +129,16 @@ async function removeScamHash(guildId, id) {
     if (res.rowCount > 0) scamHashCache.set(guildId, (scamHashCache.get(guildId) ?? []).filter(h => h.id !== id));
     return res.rowCount > 0;
 }
-// Global hashes — managed in DB directly:
+async function getImageDimensions(buffer) {
+    try { const meta = await sharp(buffer).metadata(); return { width: meta.width, height: meta.height }; } catch { return null; }
+}
+async function addGlobalScamHash(hash, label, addedBy) {
+    const res = await pool.query('INSERT INTO global_scam_hashes (hash, label, added_by, added_at) VALUES ($1, $2, $3, $4) RETURNING id', [hash, label, addedBy, Date.now()]);
+    const entry = { id: res.rows[0].id, hash, label, global: true };
+    if (globalScamHashCache !== null) globalScamHashCache.push(entry);
+    return entry;
+}
+// Global hashes — can also be managed in DB directly:
 // INSERT INTO global_scam_hashes (hash, label, added_by, added_at) VALUES ('...', 'label', 'admin', extract(epoch from now())*1000);
 let globalScamHashCache = null;
 async function getGlobalScamHashes() {
@@ -484,7 +507,26 @@ client.on('messageCreate', async message => {
         if (cfg2.warnDm !== false) message.author.send({ embeds: [E2('#ff0000','Your message was removed').setDescription(`A message you sent in **${message.guild.name}** was detected as a known scam image and removed.`).addFields({ name: 'Matched Pattern', value: match.label, inline: true }, ...(timedOut ? [{ name: 'Consequence', value: `You have been timed out for ${timeoutDisplay}`, inline: true }] : [])).setFooter({ text: 'If you believe this is a mistake, contact a moderator' })] }).catch(() => {});
         if (logCh) {
             await logCh.send({ embeds: [E2('#ff0000',`Scam Image Auto-Removed${isGlobal ? ' (Global)' : ''}`).addFields({ name: 'User', value: `${message.author} (${message.author.tag})`, inline: true }, { name: 'Channel', value: `${message.channel}`, inline: true }, { name: 'Matched', value: `${match.label}${isGlobal ? ' *(global)*' : ''}`, inline: true }, ...(timedOut ? [{ name: 'Timeout', value: timeoutDisplay, inline: true }] : []), { name: 'Message Deleted', value: (shouldDelete && canDelete) ? 'Yes' : shouldDelete ? 'No (missing ManageMessages)' : 'No', inline: true }, { name: 'Match Distance', value: matchDistance === 0 ? 'Exact' : `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different`, inline: true })] }).catch(() => {});
-            if (matchDistance > 0) await logCh.send({ embeds: [E2('#ff9900','⚠️ Near-Match — Please Review').setDescription(`This image was **similar but not identical** to the registered scam hash for **${match.label}**.\nIf this is a false positive, use \`/scam list\` to remove it or adjust the threshold with \`/scam config threshold\`.`).setImage(att.url).addFields({ name: 'Similarity', value: `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different (threshold: ${isGlobal ? 10 : spc.threshold})`, inline: true })] }).catch(() => {});
+            if (matchDistance > 0) {
+                const incomingDim = await getImageDimensions(buffer);
+                const incomingRatio = incomingDim ? (incomingDim.width / incomingDim.height).toFixed(3) : 'unknown';
+                const dimsField = incomingDim ? `${incomingDim.width}×${incomingDim.height} (ratio ${incomingRatio})` : 'unknown';
+                const pendingId = `${message.id}_${att.id}`;
+                pendingNearMatches.set(pendingId, { hash: imgHash, label: match.label, attUrl: att.url, dims: incomingDim });
+                setTimeout(() => pendingNearMatches.delete(pendingId), 30 * 60 * 1000); // 30 min
+                const reviewEmbed = E2('#ff9900','⚠️ Near-Match — Please Review')
+                    .setDescription(`This image was **similar but not identical** to the registered scam hash for **${match.label}**.\nIf this is a false positive, use \`/scam list\` to remove it or adjust the threshold with \`/scam config threshold\`.\nIf it's a cropped/edited variant of a real scam, use the buttons below to register this exact image as a new hash.`)
+                    .setImage(att.url)
+                    .addFields(
+                        { name: 'Similarity', value: `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different (threshold: ${isGlobal ? 10 : spc.threshold})`, inline: true },
+                        { name: 'Dimensions', value: dimsField, inline: true }
+                    );
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`nearmatch_addserver_${pendingId}`).setLabel('Add to Server Scams').setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder().setCustomId(`nearmatch_addglobal_${pendingId}`).setLabel('Add to Global Scams').setStyle(ButtonStyle.Danger)
+                );
+                await logCh.send({ embeds: [reviewEmbed], components: [row] }).catch(() => {});
+            }
         }
         addHistory(guildId, message.author.id, { guildId, userId: message.author.id, userTag: message.author.tag, type: 'scam_remove', reason: `Scam: ${match.label}`, issuedBy: client.user.tag, issuedAt: Date.now() });
         break;
@@ -619,6 +661,33 @@ client.on('interactionCreate', async interaction => {
     }
     if (interaction.isButton()) {
         const { customId } = interaction;
+        if (customId.startsWith('nearmatch_addserver_') || customId.startsWith('nearmatch_addglobal_')) {
+            const isGlobalAdd = customId.startsWith('nearmatch_addglobal_');
+            if (isGlobalAdd) {
+                if (interaction.user.id !== process.env.OWNER_ID) return interaction.reply({ content: '❌ Only the bot owner can add to the global scam list.', flags: [MessageFlags.Ephemeral] });
+            } else {
+                if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            }
+            const pendingId = customId.slice(20);
+            const pending = pendingNearMatches.get(pendingId);
+            if (!pending) return interaction.reply({ content: '❌ This review has expired (30 min limit). Use `/scam add` with the image manually instead.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const label = `${pending.label} (variant)`;
+            try {
+                if (isGlobalAdd) {
+                    const entry = await addGlobalScamHash(pending.hash, label, interaction.user.tag);
+                    await interaction.editReply(`✅ Added to **global** scam list as "${label}" (ID: \`${entry.id}\`). This image will now be auto-removed in **all servers**.`);
+                } else {
+                    const guildId = interaction.guild.id;
+                    const existing = await getScamHashes(guildId), spc = await getScamProtConfig(guildId);
+                    for (const e of existing) { if (hammingDistance(pending.hash, e.hash) <= spc.threshold) return interaction.editReply(`❌ Already registered (or similar to) **${e.label}** (ID: \`${e.id}\`).`); }
+                    const entry = await addScamHash(guildId, pending.hash, label, interaction.user.tag);
+                    await interaction.editReply(`✅ Added to this server's scam list as "${label}" (ID: \`${entry.id}\`).`);
+                }
+                pendingNearMatches.delete(pendingId);
+            } catch (e) { console.error('nearmatch add:', e.message); await interaction.editReply('❌ Failed to add hash.'); }
+            return;
+        }
         if (customId.startsWith('help_') && customId !== 'help_back') { const embed = helpPages[customId]; if (!embed) return; return interaction.update({ embeds: [embed], components: helpRows(customId) }); }
         if (customId === 'help_back') return interaction.update({ embeds: [helpOverviewEmbed()], components: helpRows() });
         if (customId.startsWith('wl_')) {
