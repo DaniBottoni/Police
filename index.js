@@ -6,6 +6,7 @@ const sharp = require('sharp');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const OWNER_ID = '1193912522999336960';
 
 // ── DB ─────────────────────────────────────────────────────────────────────
 async function initDB() {
@@ -137,6 +138,11 @@ async function addGlobalScamHash(hash, label, addedBy) {
     const entry = { id: res.rows[0].id, hash, label, global: true };
     if (globalScamHashCache !== null) globalScamHashCache.push(entry);
     return entry;
+}
+async function removeGlobalScamHash(id) {
+    const res = await pool.query('DELETE FROM global_scam_hashes WHERE id = $1', [id]);
+    if (res.rowCount > 0 && globalScamHashCache !== null) globalScamHashCache = globalScamHashCache.filter(h => h.id !== id);
+    return res.rowCount > 0;
 }
 // Global hashes — can also be managed in DB directly:
 // INSERT INTO global_scam_hashes (hash, label, added_by, added_at) VALUES ('...', 'label', 'admin', extract(epoch from now())*1000);
@@ -304,6 +310,17 @@ function warnlistRow(page, total, guildId) {
 const refreshBtn = (id) => new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary));
 const customIdMatches = (id, prefixes) => prefixes.some(p => id.startsWith(p));
 
+async function buildGlobalHashesEmbed() {
+    const hashes = await getGlobalScamHashes();
+    if (!hashes.length) return { embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Global Scam Image Registry').setDescription('No global scam images registered.')], components: [] };
+    const embed = new EmbedBuilder().setColor('#ff0000').setTitle('Global Scam Image Registry').setTimestamp().setDescription(`**${hashes.length}** image${hashes.length>1?'s':''} registered — applies to **all servers**, always deletes + times out (10 Hamming distance threshold).`);
+    for (const h of hashes.slice(0,20)) embed.addFields({ name: `ID ${h.id} — ${h.label}`, value: `Hash: \`${h.hash}\`` });
+    if (hashes.length > 20) embed.setFooter({ text: `Showing first 20 of ${hashes.length}` });
+    const components = [refreshBtn('globalhashes_refresh')];
+    components.unshift(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('globalhashes_remove').setPlaceholder('Remove a global scam image…').addOptions(hashes.slice(0,25).map(h => ({ label: `ID ${h.id} — ${h.label}`.slice(0,100), value: `${h.id}` })))));
+    return { embeds: [embed], components };
+}
+
 async function buildScamListEmbed(guildId) {
     const hashes = await getScamHashes(guildId), spc = await getScamProtConfig(guildId);
     if (!hashes.length) return { embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Registry').setDescription('No scam images registered. Use `/scam add` to add one.')], components: [] };
@@ -417,6 +434,7 @@ client.once('ready', async () => {
             .addSubcommand(s => s.setName('timeout').setDescription('Configure timeout-escalation').addIntegerOption(o => o.setName('level').setDescription('Target level (>=2)').setRequired(true)).addIntegerOption(o => o.setName('threshold').setDescription('Warnings needed').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('Timeout duration').setRequired(true)))
             .addSubcommand(s => s.setName('view').setDescription('View escalation configuration')),
         new SlashCommandBuilder().setName('help').setDescription('View all commands and features'),
+        new SlashCommandBuilder().setName('globalhashes').setDescription('View and manage global scam image hashes (bot owner only)'),
         new SlashCommandBuilder().setName('scam').setDescription('Manage scam image protection')
             .addSubcommand(s => s.setName('add').setDescription('Register a scam image').addAttachmentOption(o => o.setName('image').setDescription('The scam image').setRequired(true)).addStringOption(o => o.setName('label').setDescription('Label').setRequired(true)))
             .addSubcommand(s => s.setName('list').setDescription('List registered scam images'))
@@ -549,6 +567,13 @@ client.on('messageCreate', async message => {
 // ── Interactions ───────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
   try {
+    if (interaction.isStringSelectMenu() && interaction.customId === 'globalhashes_remove') {
+        if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: '❌ Restricted to the bot owner.', flags: [MessageFlags.Ephemeral] });
+        await interaction.deferUpdate();
+        await removeGlobalScamHash(parseInt(interaction.values[0]));
+        const { embeds, components } = await buildGlobalHashesEmbed();
+        return interaction.editReply({ embeds, components });
+    }
     if (interaction.isStringSelectMenu() && customIdMatches(interaction.customId, ['configview_removelevel_','escview_removethreshold_','escview_removetimeout_','scamlist_remove_','noteview_remove_'])) {
         if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const { customId, values } = interaction, value = values[0];
@@ -664,7 +689,7 @@ client.on('interactionCreate', async interaction => {
         if (customId.startsWith('nearmatch_addserver_') || customId.startsWith('nearmatch_addglobal_')) {
             const isGlobalAdd = customId.startsWith('nearmatch_addglobal_');
             if (isGlobalAdd) {
-                if (interaction.user.id !== process.env.OWNER_ID) return interaction.reply({ content: '❌ Only the bot owner can add to the global scam list.', flags: [MessageFlags.Ephemeral] });
+                if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: '❌ Only the bot owner can add to the global scam list.', flags: [MessageFlags.Ephemeral] });
             } else {
                 if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
             }
@@ -763,6 +788,13 @@ client.on('interactionCreate', async interaction => {
             const { embeds, components } = await buildScamListEmbed(guildId);
             return interaction.editReply({ embeds, components });
         }
+        if (customId === 'globalhashes_refresh') {
+            if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: '❌ Restricted to the bot owner.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferUpdate();
+            globalScamHashCache = null;
+            const { embeds, components } = await buildGlobalHashesEmbed();
+            return interaction.editReply({ embeds, components });
+        }
         if (customId.startsWith('unwarn_confirm_') || customId.startsWith('unwarn_cancel_')) {
             const isConfirm = customId.startsWith('unwarn_confirm_'), pendingId = customId.slice(isConfirm ? 15 : 13), pending = pendingUnwarns.get(pendingId);
             if (!pending) return interaction.update({ content: '❌ Confirmation expired.', embeds: [], components: [] });
@@ -801,6 +833,12 @@ client.on('interactionCreate', async interaction => {
         return reply({ embeds: [E('#5865F2','➕ Invite Police Bot').setDescription(`[**Click here to invite me**](https://discord.com/oauth2/authorize?client_id=${client.user.id}&permissions=${perms}&scope=bot%20applications.commands)\n\nThis link requests the minimum permissions needed to function correctly.`).addFields({ name: 'Permissions Requested', value: '• Manage Roles — assign/remove warning roles\n• Kick & Ban Members — moderation commands\n• Moderate Members — timeouts\n• Send Messages & Embed Links — responses\n• View Audit Log — detect who added the bot\n• Read Message History — channel access' }).setFooter({ text: 'You can adjust permissions after inviting' })], flags: [MessageFlags.Ephemeral] });
     }
     else if (commandName === 'help') { await reply({ embeds: [helpOverviewEmbed()], components: helpRows(), flags: [MessageFlags.Ephemeral] }); }
+    else if (commandName === 'globalhashes') {
+        if (interaction.user.id !== OWNER_ID) return reply('❌ This command is restricted to the bot owner.');
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const { embeds, components } = await buildGlobalHashesEmbed();
+        await interaction.editReply({ embeds, components });
+    }
     else if (commandName === 'config') {
         const sub = interaction.options.getSubcommand();
         if (sub === 'access') { await showAccessControlConfig(interaction, guildId); }
