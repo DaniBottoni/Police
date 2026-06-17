@@ -7,6 +7,7 @@ const sharp = require('sharp');
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const OWNER_ID = '1193912522999336960';
+const SUPPORT_SERVER_URL = 'https://discord.gg/Qrp82cRhUW';
 
 // ── DB ─────────────────────────────────────────────────────────────────────
 async function initDB() {
@@ -393,7 +394,7 @@ const helpPages = {
     help_storage: new EmbedBuilder().setColor('#5865F2').setTitle('Database Storage').setDescription('Police Bot uses PostgreSQL to store all data persistently. Nothing is lost on restarts.').addFields({ name: 'warnings', value: 'Active warnings with expiry timestamps, user IDs, role IDs, and channel IDs.' }, { name: 'history', value: 'Full mod history per server — every warn, kick, and ban.' }, { name: 'configs', value: 'Per-server config: warning levels, roles, durations, escalation rules, access role.' }, { name: 'notes', value: 'Private mod notes per user.' }, { name: 'scam_hashes / global_scam_hashes', value: 'Registered scam image hashes, per-guild and global.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
     help_features: new EmbedBuilder().setColor('#9b59b6').setTitle('Other Features').addFields({ name: 'Scam protection', value: 'Upload known scam images — any similar image posted is auto-removed.' }, { name: 'Spam protection', value: 'Detects repeated/similar messages and auto-removes with configurable timeouts.' }, { name: 'Rejoin protection', value: 'If a warned user leaves and rejoins, their warning roles are reapplied.' }, { name: 'Timer restoration', value: 'On bot restart, all active warning timers are restored from the database.' }, { name: '/invite', value: 'Get a pre-configured invite link with all required permissions.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
 };
-const helpOverviewEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Police Bot').setDescription("I'm just your friendly neighbourhood policemen, but I do have some tricks up my sleeve. Press the buttons below to learn about my commands.").setFooter({ text: 'Mod commands require the configured access role or Administrator' });
+const helpOverviewEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Police Bot').setDescription(`I'm just your friendly neighbourhood policemen, but I do have some tricks up my sleeve. Press the buttons below to learn about my commands.\n\n📌 **Support Server:** ${SUPPORT_SERVER_URL}`).setFooter({ text: 'Mod commands require the configured access role or Administrator' });
 function helpRows(active = '') {
     const p = (id, label, sec = false) => new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(active === id ? ButtonStyle.Success : sec ? ButtonStyle.Secondary : ButtonStyle.Primary);
     return [new ActionRowBuilder().addComponents(p('help_warn','Warnings'), p('help_mod','Moderation'), p('help_config','Config'), p('help_escalation','Escalation')), new ActionRowBuilder().addComponents(p('help_notes','Notes',true), p('help_storage','Storage',true), p('help_features','Features',true), ...(active ? [p('help_back','Back',true)] : []))];
@@ -473,6 +474,22 @@ client.once('ready', async () => {
             if (!unbanRes.rows.length && data.expiresAt > Date.now()) scheduleBanExpiry(guild_id, user_id, data.userTag, data.expiresAt, data.reason);
         }
     } catch (e) { console.error('❌ DB init failed:', e.message); }
+    // One-time retroactive announcement of the support server link in existing log channels
+    try {
+        let announced = 0;
+        for (const [guildId, cfg] of configCache.entries()) {
+            if (!cfg.logChannelId || cfg.supportLinkAnnounced) continue;
+            const guild = client.guilds.cache.get(guildId);
+            const ch = guild?.channels.cache.get(cfg.logChannelId);
+            if (ch) {
+                await ch.send(`📌 **Join my Support Server:** ${SUPPORT_SERVER_URL}`).catch(() => {});
+                announced++;
+            }
+            cfg.supportLinkAnnounced = true;
+            saveConfig(guildId, cfg);
+        }
+        if (announced) console.log(`✅ Posted support server link in ${announced} existing log channel(s)`);
+    } catch (e) { console.error('❌ Retroactive support link announcement failed:', e.message); }
     keepAlive();
 });
 
@@ -674,7 +691,8 @@ client.on('interactionCreate', async interaction => {
         const guildId = interaction.customId.slice(19), channel = interaction.channels.first();
         if (!channel) return interaction.reply({ content: '❌ No channel selected.', flags: [MessageFlags.Ephemeral] });
         await interaction.deferUpdate();
-        const cfg = await getConfig(guildId); cfg.logChannelId = channel.id; saveConfig(guildId, cfg);
+        const cfg = await getConfig(guildId); cfg.logChannelId = channel.id; cfg.supportLinkAnnounced = true; saveConfig(guildId, cfg);
+        channel.send(`📌 **Join my Support Server:** ${SUPPORT_SERVER_URL}`).catch(() => {});
         const { embeds, components } = await buildLogChannelEmbed(guildId);
         return interaction.editReply({ embeds, components });
     }
