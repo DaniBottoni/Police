@@ -403,7 +403,7 @@ function helpRows(active = '') {
 // ── Bot ready ──────────────────────────────────────────────────────────────
 client.once('ready', async () => {
     console.log(`✅ Police bot online as ${client.user.tag}`);
-    client.user.setPresence({ activities: [{ name: 'Monitoring the security cameras', type: ActivityType.Watching }], status: 'online' });
+    client.user.setPresence({ activities: [{ name: 'Monitoring the security cameras.', type: ActivityType.Watching }], status: 'online' });
     const commands = [
         new SlashCommandBuilder().setName('invite').setDescription('Get a link to invite this bot to another server'),
         new SlashCommandBuilder().setName('warning').setDescription('Manage warnings')
