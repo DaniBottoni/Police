@@ -51,6 +51,27 @@ async function deleteNote(guildId, userId, id) { const res = await pool.query('D
 // ── Helpers ────────────────────────────────────────────────────────────────
 async function logMod(guild, guildId, embed) { const cfg = await getConfig(guildId); const ch = cfg.logChannelId && guild.channels.cache.get(cfg.logChannelId); if (ch) ch.send({ embeds: [embed] }).catch(() => {}); }
 async function hasCommandPermission(interaction, guildId) { if (interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return true; const cfg = await getConfig(guildId); return cfg.accessRoleId ? interaction.member.roles.cache.has(cfg.accessRoleId) : false; }
+function mentionEveryoneRisk(guild) {
+    const risky = [];
+    const everyoneRole = guild.roles.everyone;
+    if (everyoneRole.permissions.has(PermissionFlagsBits.MentionEveryone)) risky.push('@everyone (default role)');
+    for (const role of guild.roles.cache.values()) {
+        if (role.id === guild.id || role.managed) continue;
+        if (role.permissions.has(PermissionFlagsBits.Administrator)) continue; // admins are expected to have this
+        if (role.permissions.has(PermissionFlagsBits.MentionEveryone)) risky.push(role.name);
+    }
+    return risky;
+}
+function mentionEveryoneWarningField(guild) {
+    const risky = mentionEveryoneRisk(guild);
+    if (!risky.length) return null;
+    return {
+        name: '⚠️ @everyone/@here Ping Risk',
+        value: `**${risky.join(', ')}** can currently ping @everyone/@here in this server.\n` +
+            `Scam images are removed instantly, but the **ping itself still goes through** before the message is deleted — everyone gets notified regardless.\n` +
+            `Restrict **"Mention @everyone, @here, and All Roles"** to **Administrators or a trusted role only** to stop scammers abusing this.`
+    };
+}
 async function showAccessControlConfig(interaction, guildId) {
     await interaction.reply({ embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('🔒 Access Configuration').setDescription('Select which role should have access to moderation commands:\n\n**Commands affected:**\n• `/warn` `/unwarn` `/timeout` `/config set/view`\n• `/config access` `/warnlist` `/history` `/escalation`\n\n**Note:** Server administrators always have access.').setFooter({ text: 'Select a role from the dropdown below' })], components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`access_role_${guildId}`).setPlaceholder('Select a role for command access').setMinValues(1).setMaxValues(1))], flags: [MessageFlags.Ephemeral] });
 }
@@ -323,9 +344,10 @@ async function buildGlobalHashesEmbed() {
 }
 
 async function buildScamListEmbed(guildId) {
-    const hashes = await getScamHashes(guildId), spc = await getScamProtConfig(guildId);
-    if (!hashes.length) return { embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Registry').setDescription('No scam images registered. Use `/scam add` to add one.')], components: [] };
+    const hashes = await getScamHashes(guildId), spc = await getScamProtConfig(guildId), meGuild = client.guilds.cache.get(guildId), warnField = meGuild ? mentionEveryoneWarningField(meGuild) : null;
+    if (!hashes.length) { const emptyEmbed = new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Registry').setDescription('No scam images registered. Use `/scam add` to add one.'); if (warnField) emptyEmbed.addFields(warnField); return { embeds: [emptyEmbed], components: [] }; }
     const embed = new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Registry').setTimestamp().setDescription(`**${hashes.length}** image${hashes.length>1?'s':''} registered — detection **${spc.enabled?'enabled':'disabled'}**`).addFields({ name: 'Threshold', value: `${spc.threshold} (Hamming distance)`, inline: true }, { name: 'On Detection', value: [spc.deleteMsg?'Delete message':null, spc.timeoutMs?`Timeout ${spc.timeoutDisplay}`:null].filter(Boolean).join(' + ')||'No action', inline: true });
+    if (warnField) embed.addFields(warnField);
     for (const h of hashes.slice(0,20)) embed.addFields({ name: `ID ${h.id} — ${h.label}`, value: `Hash: \`${h.hash}\` · Added by ${h.addedBy} <t:${Math.floor(h.addedAt/1000)}:R>` });
     if (hashes.length > 20) embed.setFooter({ text: `Showing first 20 of ${hashes.length}` });
     const components = [refreshBtn(`scamlist_refresh_${guildId}`)];
@@ -1111,7 +1133,9 @@ client.on('interactionCreate', async interaction => {
             const existing = await getScamHashes(guildId), spc = await getScamProtConfig(guildId);
             for (const e of existing) { if (hammingDistance(hash, e.hash) <= spc.threshold) return reply(`❌ Already registered (or similar to) **${e.label}** (ID: \`${e.id}\`).`); }
             const entry = await addScamHash(guildId, hash, label, interaction.user.tag);
-            await reply({ embeds: [E('#00ff00','Scam Image Registered').addFields({ name: 'Label', value: label, inline: true }, { name: 'ID', value: `${entry.id}`, inline: true }, { name: 'Hash', value: `\`${hash}\``, inline: false }).setFooter({ text: 'Any similar image posted in this server will now be actioned' })] });
+            const addEmbed = E('#00ff00','Scam Image Registered').addFields({ name: 'Label', value: label, inline: true }, { name: 'ID', value: `${entry.id}`, inline: true }, { name: 'Hash', value: `\`${hash}\``, inline: false }).setFooter({ text: 'Any similar image posted in this server will now be actioned' });
+            const addWarnField = mentionEveryoneWarningField(interaction.guild); if (addWarnField) addEmbed.addFields(addWarnField);
+            await reply({ embeds: [addEmbed] });
         } else if (sub === 'list') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             const { embeds, components } = await buildScamListEmbed(guildId);
@@ -1128,7 +1152,9 @@ client.on('interactionCreate', async interaction => {
             }
             saveConfig(guildId, cfg);
             const spc = { enabled: true, threshold: 10, timeoutMs: 5*60*1000, timeoutDisplay: '5m', deleteMsg: true, ...cfg.scamProt };
-            await reply({ embeds: [E('#5865F2','Scam Protection Config').addFields({ name: 'Detection', value: spc.enabled?'Enabled':'Disabled', inline: true }, { name: 'Delete Messages', value: spc.deleteMsg?'Yes':'No', inline: true }, { name: 'Timeout', value: spc.timeoutMs?spc.timeoutDisplay:'None', inline: true }, { name: 'Threshold', value: `${spc.threshold}`, inline: true })], flags: [MessageFlags.Ephemeral] });
+            const cfgEmbed = E('#5865F2','Scam Protection Config').addFields({ name: 'Detection', value: spc.enabled?'Enabled':'Disabled', inline: true }, { name: 'Delete Messages', value: spc.deleteMsg?'Yes':'No', inline: true }, { name: 'Timeout', value: spc.timeoutMs?spc.timeoutDisplay:'None', inline: true }, { name: 'Threshold', value: `${spc.threshold}`, inline: true });
+            const cfgWarnField = mentionEveryoneWarningField(interaction.guild); if (cfgWarnField) cfgEmbed.addFields(cfgWarnField);
+            await reply({ embeds: [cfgEmbed], flags: [MessageFlags.Ephemeral] });
         }
     }
     else if (commandName === 'spam') {
