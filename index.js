@@ -124,6 +124,29 @@ async function dHash(buffer) {
     return hash.toString(16).padStart(16, '0');
 }
 function hammingDistance(a, b) { let diff = BigInt('0x' + a) ^ BigInt('0x' + b), dist = 0; while (diff) { dist += Number(diff & 1n); diff >>= 1n; } return dist; }
+// Generates dHashes for several cropped sub-regions of an image, so that a registered
+// scam image can still be matched even if it was posted with different padding/framing
+// (e.g. wrapped in a screenshot border, or a slightly different crop).
+// Only called when the full-image hash doesn't already match (see usage below), to keep
+// the common (non-scam) case cheap. ~36 crops, ~200-300ms on a typical image.
+async function generateCropHashes(buffer) {
+    let meta; try { meta = await sharp(buffer).metadata(); } catch { return []; }
+    const { width, height } = meta;
+    if (!width || !height || width < 16 || height < 16) return [];
+    const scales = [0.9, 0.8, 0.7, 0.6];
+    const rects = new Map();
+    for (const scale of scales) {
+        const cw = Math.max(8, Math.round(width * scale)), ch = Math.max(8, Math.round(height * scale));
+        const xs = new Set([0, Math.round((width - cw) / 2), width - cw]);
+        const ys = new Set([0, Math.round((height - ch) / 2), height - ch]);
+        for (const left of xs) for (const top of ys) rects.set(`${left}_${top}_${cw}_${ch}`, { left, top, width: cw, height: ch });
+    }
+    const hashes = [];
+    for (const rect of rects.values()) {
+        try { hashes.push(await dHash(await sharp(buffer).extract(rect).toBuffer())); } catch { /* skip invalid crop */ }
+    }
+    return hashes;
+}
 function fetchImageBuffer(url) {
     return new Promise((resolve, reject) => {
         const mod = url.startsWith('https') ? https : http;
@@ -558,9 +581,18 @@ client.on('messageCreate', async message => {
     for (const att of attachments) {
         let buffer; try { buffer = await fetchImageBuffer(att.url); } catch (e) { console.error('scam: fetch failed:', e.message); continue; }
         let imgHash; try { imgHash = await dHash(buffer); } catch (e) { console.error('scam: hash failed:', e.message); continue; }
-        let match = null, isGlobal = false, matchDistance = 0;
+        let match = null, isGlobal = false, matchDistance = 0, matchedVia = 'full image';
         for (const entry of globalHashes) { const dist = hammingDistance(imgHash, entry.hash); if (dist <= 10) { match = entry; isGlobal = true; matchDistance = dist; break; } }
         if (!match) { for (const entry of hashes) { const dist = hammingDistance(imgHash, entry.hash); if (dist <= spc.threshold) { match = entry; matchDistance = dist; break; } } }
+        if (!match) {
+            // Full image didn't match a registered scam — it may be a cropped/re-framed
+            // version of one, so check a handful of cropped sub-regions before giving up.
+            const cropHashes = await generateCropHashes(buffer).catch(() => []);
+            outer: for (const ch of cropHashes) {
+                for (const entry of globalHashes) { const dist = hammingDistance(ch, entry.hash); if (dist <= 10) { match = entry; isGlobal = true; matchDistance = dist; matchedVia = 'cropped region'; break outer; } }
+                for (const entry of hashes) { const dist = hammingDistance(ch, entry.hash); if (dist <= spc.threshold) { match = entry; matchDistance = dist; matchedVia = 'cropped region'; break outer; } }
+            }
+        }
         if (!match) continue;
         console.log(`🚨 ${isGlobal ? '[GLOBAL] ' : ''}Scam: ${message.author.tag} in ${guildId} ("${match.label}")`);
         const cfg2 = await getConfig(guildId);
@@ -581,8 +613,8 @@ client.on('messageCreate', async message => {
         else if (logCh) logCh.send({ embeds: [detectedEmbed] }).catch(() => {});
         if (cfg2.warnDm !== false) message.author.send({ embeds: [E2('#ff0000','Your message was removed').setDescription(`A message you sent in **${message.guild.name}** was detected as a known scam image and removed.`).addFields({ name: 'Matched Pattern', value: match.label, inline: true }, ...(timedOut ? [{ name: 'Consequence', value: `You have been timed out for ${timeoutDisplay}`, inline: true }] : [])).setFooter({ text: 'If you believe this is a mistake, contact a moderator' })] }).catch(() => {});
         if (logCh) {
-            await logCh.send({ embeds: [E2('#ff0000',`Scam Image Auto-Removed${isGlobal ? ' (Global)' : ''}`).addFields({ name: 'User', value: `${message.author} (${message.author.tag})`, inline: true }, { name: 'Channel', value: `${message.channel}`, inline: true }, { name: 'Matched', value: `${match.label}${isGlobal ? ' *(global)*' : ''}`, inline: true }, ...(timedOut ? [{ name: 'Timeout', value: timeoutDisplay, inline: true }] : []), { name: 'Message Deleted', value: wasDeleted ? 'Yes' : shouldDelete ? 'No (missing ManageMessages)' : 'No', inline: true }, { name: 'Match Distance', value: matchDistance === 0 ? 'Exact' : `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different`, inline: true })] }).catch(() => {});
-            if (matchDistance > 0) {
+            await logCh.send({ embeds: [E2('#ff0000',`Scam Image Auto-Removed${isGlobal ? ' (Global)' : ''}`).addFields({ name: 'User', value: `${message.author} (${message.author.tag})`, inline: true }, { name: 'Channel', value: `${message.channel}`, inline: true }, { name: 'Matched', value: `${match.label}${isGlobal ? ' *(global)*' : ''}`, inline: true }, ...(timedOut ? [{ name: 'Timeout', value: timeoutDisplay, inline: true }] : []), { name: 'Message Deleted', value: wasDeleted ? 'Yes' : shouldDelete ? 'No (missing ManageMessages)' : 'No', inline: true }, { name: 'Match Distance', value: matchDistance === 0 ? 'Exact' : `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different`, inline: true }, { name: 'Match Type', value: matchedVia === 'full image' ? 'Full image' : 'Cropped region', inline: true })] }).catch(() => {});
+            if (matchDistance > 0 || matchedVia === 'cropped region') {
                 const incomingDim = await getImageDimensions(buffer);
                 const incomingRatio = incomingDim ? (incomingDim.width / incomingDim.height).toFixed(3) : 'unknown';
                 const dimsField = incomingDim ? `${incomingDim.width}×${incomingDim.height} (ratio ${incomingRatio})` : 'unknown';
@@ -590,11 +622,12 @@ client.on('messageCreate', async message => {
                 pendingNearMatches.set(pendingId, { hash: imgHash, label: match.label, attUrl: att.url, dims: incomingDim });
                 setTimeout(() => pendingNearMatches.delete(pendingId), 30 * 60 * 1000); // 30 min
                 const reviewEmbed = E2('#ff9900','⚠️ Near-Match — Please Review')
-                    .setDescription(`This image was **similar but not identical** to the registered scam hash for **${match.label}**.\nIf this is a false positive, use \`/scam list\` to remove it or adjust the threshold with \`/scam config threshold\`.\nIf it's a cropped/edited variant of a real scam, use the buttons below to register this exact image as a new hash.`)
+                    .setDescription(`This image was **similar but not identical** to the registered scam hash for **${match.label}**${matchedVia === 'cropped region' ? ' (matched via a cropped sub-region, not the full image)' : ''}.\nIf this is a false positive, use \`/scam list\` to remove it or adjust the threshold with \`/scam config threshold\`.\nIf it's a cropped/edited variant of a real scam, use the buttons below to register this exact image as a new hash.`)
                     .setImage(att.url)
                     .addFields(
                         { name: 'Similarity', value: `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different (threshold: ${isGlobal ? 10 : spc.threshold})`, inline: true },
-                        { name: 'Dimensions', value: dimsField, inline: true }
+                        { name: 'Dimensions', value: dimsField, inline: true },
+                        { name: 'Match Type', value: matchedVia === 'full image' ? 'Full image' : 'Cropped region', inline: true }
                     );
                 const row = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setCustomId(`nearmatch_addserver_${pendingId}`).setLabel('Add to Server Scams').setStyle(ButtonStyle.Primary),
