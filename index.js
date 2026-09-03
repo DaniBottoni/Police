@@ -18,6 +18,7 @@ async function initDB() {
         CREATE TABLE IF NOT EXISTS notes              (id BIGINT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
         CREATE TABLE IF NOT EXISTS scam_hashes        (id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, hash TEXT NOT NULL, label TEXT, added_by TEXT, added_at BIGINT);
         CREATE TABLE IF NOT EXISTS global_scam_hashes (id SERIAL PRIMARY KEY, hash TEXT NOT NULL, label TEXT NOT NULL, added_by TEXT, added_at BIGINT);
+        CREATE TABLE IF NOT EXISTS active_timeouts    (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL, PRIMARY KEY (guild_id, user_id));
         CREATE INDEX IF NOT EXISTS warnings_guild_user ON warnings(guild_id, user_id);
         CREATE INDEX IF NOT EXISTS history_guild_user  ON history(guild_id, user_id);
         CREATE INDEX IF NOT EXISTS notes_guild_user    ON notes(guild_id, user_id);
@@ -25,7 +26,7 @@ async function initDB() {
     `);
 }
 
-const configCache = new Map(), activeWarnings = new Map();
+const configCache = new Map(), activeWarnings = new Map(), activeTimeouts = new Map();
 async function getConfig(guildId) {
     if (configCache.has(guildId)) return configCache.get(guildId);
     const res = await pool.query('SELECT data FROM configs WHERE guild_id = $1', [guildId]);
@@ -41,6 +42,18 @@ function saveWarning(key, data) {
     pool.query('INSERT INTO warnings (key, guild_id, user_id, data) VALUES ($1, $2, $3, $4) ON CONFLICT (key) DO UPDATE SET data = $4', [key, data.guildId, data.userId, data]).catch(e => console.error('saveWarning:', e.message));
 }
 function deleteWarning(key) { activeWarnings.delete(key); pool.query('DELETE FROM warnings WHERE key = $1', [key]).catch(e => console.error('deleteWarning:', e.message)); }
+// Tracks timeouts the bot itself has applied (native Discord timeouts, not warning roles) so they
+// can be surfaced in the active warnings list. One entry per guild+user — Discord only allows one
+// active timeout per member anyway, so a new timeout just overwrites the old tracked entry.
+function timeoutKey(guildId, userId) { return `${guildId}-${userId}`; }
+function saveActiveTimeout(guildId, userId, data) {
+    activeTimeouts.set(timeoutKey(guildId, userId), data);
+    pool.query('INSERT INTO active_timeouts (guild_id, user_id, data) VALUES ($1, $2, $3) ON CONFLICT (guild_id, user_id) DO UPDATE SET data = $3', [guildId, userId, data]).catch(e => console.error('saveActiveTimeout:', e.message));
+}
+function deleteActiveTimeout(guildId, userId) {
+    activeTimeouts.delete(timeoutKey(guildId, userId));
+    pool.query('DELETE FROM active_timeouts WHERE guild_id = $1 AND user_id = $2', [guildId, userId]).catch(e => console.error('deleteActiveTimeout:', e.message));
+}
 function addHistory(guildId, userId, entry) { pool.query('INSERT INTO history (guild_id, user_id, data) VALUES ($1, $2, $3)', [guildId, userId, entry]).catch(e => console.error('addHistory:', e.message)); }
 async function getHistory(guildId, userId) { const res = await pool.query('SELECT data FROM history WHERE guild_id = $1 AND user_id = $2 ORDER BY id DESC LIMIT 10', [guildId, userId]); return res.rows.map(r => r.data).reverse(); }
 async function getAllHistory(guildId, userId) { const res = await pool.query('SELECT data FROM history WHERE guild_id = $1 AND user_id = $2 ORDER BY id', [guildId, userId]); return res.rows.map(r => r.data); }
@@ -228,7 +241,10 @@ async function handleSpam(message, matchedMessages, spc) {
     let timedOut = false;
     if (spc.timeoutMs && botMember.permissions.has(PermissionFlagsBits.ModerateMembers)) {
         const member = guild.members.cache.get(author.id) ?? await guild.members.fetch(author.id).catch(() => null);
-        if (member && !member.permissions.has(PermissionFlagsBits.Administrator)) { await member.timeout(spc.timeoutMs, 'Spam detection').catch(() => {}); timedOut = true; }
+        if (member && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+            timedOut = await member.timeout(spc.timeoutMs, 'Spam detection').then(() => true).catch(() => false);
+            if (timedOut) saveActiveTimeout(guildId, author.id, { guildId, userId: author.id, userTag: author.tag, reason: 'Spam detection', issuedBy: client.user.tag, issuedAt: Date.now(), expiresAt: Date.now() + spc.timeoutMs, durationDisplay: spc.timeoutDisplay });
+        }
     }
     const cfg = await getConfig(guildId);
     const E2 = (c, t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
@@ -315,7 +331,8 @@ async function checkEscalation(guild, member, user, guildId, level, channelId, i
         if (!cfg.levels[nextLevel]) return { noNextLevel: true, nextLevel };
         const r = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
         if (r.error) return { escalationError: r.error };
-        await member.timeout(toCfg.durationMs, `Auto-escalated to Level ${nextLevel}`).catch(() => {});
+        const timeoutOk = await member.timeout(toCfg.durationMs, `Auto-escalated to Level ${nextLevel}`).then(() => true).catch(() => false);
+        if (timeoutOk) saveActiveTimeout(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, reason: `Auto-escalated to Level ${nextLevel}`, issuedBy: issuedByTag, issuedAt: Date.now(), expiresAt: Date.now() + toCfg.durationMs, durationDisplay: toCfg.durationDisplay });
         user.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('⚠️ You Have Been Timed Out').setDescription(`You were auto-timed-out in **${guild.name}** upon reaching Warning Level ${nextLevel}.`).addFields({ name: 'Timeout Duration', value: toCfg.durationDisplay, inline: true }).setTimestamp()] }).catch(() => {});
         return { escalated: true, nextLevel, role: r.role, config: r.config, hitCap: cap != null && nextLevel === cap, timedOut: true, timeoutDisplay: toCfg.durationDisplay };
     }
@@ -334,17 +351,26 @@ function keepAlive() {
 }
 
 // ── Warnlist / Help ────────────────────────────────────────────────────────
+function activeTimeoutsField(guildId) {
+    const now = Date.now();
+    const list = [...activeTimeouts.values()].filter(t => t.guildId === guildId && t.expiresAt > now);
+    if (!list.length) return null;
+    const shown = list.slice(0, 15).map(t => `• ${t.userTag} — ${t.durationDisplay ? `${t.durationDisplay}, ` : ''}expires <t:${Math.floor(t.expiresAt / 1000)}:R>`).join('\n');
+    return { name: `⏱️ Active Timeouts (${list.length})`, value: list.length > 15 ? `${shown}\n*…and ${list.length - 15} more*` : shown };
+}
 function buildWarnlistEmbed(guildId, page) {
     const all = [...activeWarnings.values()].filter(w => w.guildId === guildId), byUser = {};
     for (const w of all) { byUser[w.userId] ??= []; byUser[w.userId].push(w); }
     const userIds = Object.keys(byUser), total = Math.max(1, Math.ceil(userIds.length / 10));
     page = Math.max(0, Math.min(page, total - 1));
     const embed = new EmbedBuilder().setColor('#FFA500').setTitle(`Active Warnings (${all.length})`).setTimestamp().setFooter({ text: total > 1 ? `Page ${page + 1} of ${total}` : `${userIds.length} user(s) warned` });
-    if (!userIds.length) return { embed: embed.setDescription('No active warnings in this server.'), totalPages: total, page };
+    const toField = activeTimeoutsField(guildId);
+    if (!userIds.length) { embed.setDescription('No active warnings in this server.'); if (toField) embed.addFields(toField); return { embed, totalPages: total, page }; }
     for (const uid of userIds.slice(page * 10, (page + 1) * 10)) {
         const w0 = byUser[uid][0];
         embed.addFields({ name: w0.userTag || `<@${uid}>`, value: byUser[uid].map(w => `• Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') });
     }
+    if (page === 0 && toField) embed.addFields(toField);
     return { embed, totalPages: total, page };
 }
 function warnlistRow(page, total, guildId) {
@@ -520,6 +546,17 @@ client.once('ready', async () => {
         for (const { key, data } of wRes.rows) activeWarnings.set(key, data);
         for (const { guild_id, data } of cRes.rows) configCache.set(guild_id, data);
         for (const [key, w] of activeWarnings.entries()) if (!w.isForever) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
+        const atRes = await pool.query('SELECT guild_id, user_id, data FROM active_timeouts');
+        const now = Date.now(); let expiredTimeouts = 0;
+        for (const { guild_id, user_id, data } of atRes.rows) {
+            if (data.expiresAt && data.expiresAt > now) activeTimeouts.set(timeoutKey(guild_id, user_id), data);
+            else { expiredTimeouts++; pool.query('DELETE FROM active_timeouts WHERE guild_id = $1 AND user_id = $2', [guild_id, user_id]).catch(() => {}); }
+        }
+        if (expiredTimeouts) console.log(`🧹 Purged ${expiredTimeouts} already-expired tracked timeout(s)`);
+        setInterval(() => {
+            const cutoff = Date.now();
+            for (const [key, data] of activeTimeouts.entries()) if (data.expiresAt && data.expiresAt <= cutoff) deleteActiveTimeout(data.guildId, data.userId);
+        }, 10 * 60 * 1000);
         const shRes = await pool.query('SELECT guild_id, id, hash, label, added_by, added_at FROM scam_hashes ORDER BY id');
         for (const r of shRes.rows) { const arr = scamHashCache.get(r.guild_id) ?? []; arr.push({ id: r.id, hash: r.hash, label: r.label, addedBy: r.added_by, addedAt: r.added_at }); scamHashCache.set(r.guild_id, arr); }
         await getGlobalScamHashes();
@@ -603,7 +640,10 @@ client.on('messageCreate', async message => {
         let timedOut = false;
         if (shouldTimeout && timeoutMs && canTimeout) {
             const member = message.guild.members.cache.get(message.author.id) ?? await message.guild.members.fetch(message.author.id).catch(() => null);
-            if (member && !member.permissions.has(PermissionFlagsBits.Administrator)) { await member.timeout(timeoutMs, `${isGlobal ? '[Global] ' : ''}Scam: ${match.label}`).catch(() => {}); timedOut = true; }
+            if (member && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+                timedOut = await member.timeout(timeoutMs, `${isGlobal ? '[Global] ' : ''}Scam: ${match.label}`).then(() => true).catch(() => false);
+                if (timedOut) saveActiveTimeout(guildId, message.author.id, { guildId, userId: message.author.id, userTag: message.author.tag, reason: `${isGlobal ? '[Global] ' : ''}Scam: ${match.label}`, issuedBy: client.user.tag, issuedAt: Date.now(), expiresAt: Date.now() + timeoutMs, durationDisplay: timeoutDisplay });
+            }
         }
         const E2 = (c, t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
         const logCh = cfg2.logChannelId && message.guild.channels.cache.get(cfg2.logChannelId);
@@ -1022,6 +1062,7 @@ client.on('interactionCreate', async interaction => {
             try {
                 await member.timeout(dur.totalMs, reason);
                 const dd = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds), exTs = Math.floor((Date.now()+dur.totalMs)/1000);
+                saveActiveTimeout(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), expiresAt: Date.now() + dur.totalMs, durationDisplay: dd });
                 logMod(interaction.guild, guildId, E('#ff6600','Member Timed Out').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
                 user.send({ embeds: [E('#ff6600','You Have Been Timed Out').setDescription(`You were timed out in **${interaction.guild.name}**.`).addFields({ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason })] }).catch(() => {});
                 addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'timeout', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), duration: dd });
@@ -1032,6 +1073,7 @@ client.on('interactionCreate', async interaction => {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             try {
                 await member.timeout(null, reason);
+                deleteActiveTimeout(guildId, user.id);
                 logMod(interaction.guild, guildId, E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
                 addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'timeout_remove', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
                 await reply({ embeds: [E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Removed by', value: `${interaction.user}` })] });
@@ -1059,9 +1101,15 @@ client.on('interactionCreate', async interaction => {
         if (!entries.length) return interaction.editReply({ content: `❌ No warning history found for ${user}.` });
         const embed = E('#5865F2',`Warning History — ${user.tag}`).setDescription(`Showing last ${entries.length} record${entries.length>1?'s':''}.`);
         for (const e of entries) {
-            if (e.type === 'kick') embed.addFields({ name: `Kick — <t:${Math.floor(e.issuedAt/1000)}:d>`, value: `by ${e.issuedBy}\n${e.reason}` });
-            else if (e.type === 'ban') embed.addFields({ name: `Ban — <t:${Math.floor(e.issuedAt/1000)}:d>`, value: `by ${e.issuedBy}\n${e.reason}` });
-            else { const s = e.endReason==='expired'?'Expired':e.endReason==='manual'?'Removed':'Active'; embed.addFields({ name: `Level ${e.level} — ${e.roleName} — <t:${Math.floor(e.issuedAt/1000)}:d>`, value: `${s} • by ${e.issuedBy}\n${e.reason}` }); }
+            const dateStr = `<t:${Math.floor(e.issuedAt/1000)}:d>`;
+            if (e.type === 'kick') embed.addFields({ name: `Kick — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'ban') embed.addFields({ name: `Ban — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'unban') embed.addFields({ name: `Unban — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'timeout') embed.addFields({ name: `Timeout (${e.duration || 'Unknown'}) — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'timeout_remove') embed.addFields({ name: `Timeout Removed — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'scam_remove') embed.addFields({ name: `Scam Message Removed — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'spam_remove') embed.addFields({ name: `Spam Messages Removed — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else { const s = e.endReason==='expired'?'Expired':e.endReason==='manual'?'Removed':'Active'; embed.addFields({ name: `Level ${e.level} — ${e.roleName} — ${dateStr}`, value: `${s} • by ${e.issuedBy}\n${e.reason}` }); }
         }
         await interaction.editReply({ embeds: [embed] });
     }
@@ -1076,6 +1124,7 @@ client.on('interactionCreate', async interaction => {
         try {
             user.send({ embeds: [E('#ff6600','You have been kicked').setDescription(`You were kicked from **${interaction.guild.name}**.`).addFields({ name: 'Reason', value: reason })] }).catch(() => {});
             await member.kick(reason);
+            deleteActiveTimeout(guildId, user.id);
             addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'kick', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
             logMod(interaction.guild, guildId, E('#ff6600','Member Kicked').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }));
             await reply({ embeds: [E('#ff6600','Member Kicked').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Kicked by', value: `${interaction.user}` })] });
@@ -1098,6 +1147,7 @@ client.on('interactionCreate', async interaction => {
                 const dd = dur ? formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds) : null, expiresAt = dur ? Date.now() + dur.totalMs : null, exTs = expiresAt ? Math.floor(expiresAt / 1000) : null;
                 if (member) user.send({ embeds: [E('#ff0000','You have been banned').setDescription(`You were banned from **${interaction.guild.name}**.`).addFields({ name: 'Reason', value: reason }, ...(dd ? [{ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []))] }).catch(() => {});
                 await interaction.guild.members.ban(user, { reason, deleteMessageDays: deleteDays });
+                deleteActiveTimeout(guildId, user.id);
                 addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'ban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), deleteDays, expiresAt });
                 if (expiresAt) scheduleBanExpiry(guildId, user.id, user.tag, expiresAt, reason);
                 // Time-based message deletion across all channels
