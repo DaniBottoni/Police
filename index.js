@@ -1,1728 +1,1348 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { Pool } = require('pg');
-const dns = require('dns');
-const crypto = require('crypto');
-const { URL } = require('url');
+const dns = require('dns'); dns.setDefaultResultOrder('ipv4first');
 const http = require('http'), https = require('https');
-const { XMLParser } = require('fast-xml-parser');
+const sharp = require('sharp');
+// sharp/libvips keeps its own native memory outside the JS heap. We never reuse a decoded
+// image across calls, so its operation cache buys nothing here and only adds RSS — and
+// capping concurrency bounds how many images can be decoded in parallel on a small instance.
+sharp.cache(false);
+sharp.concurrency(parseInt(process.env.SHARP_CONCURRENCY) || 2);
 
-// ── OAuth config (Instagram / TikTok) ───────────────────────────────────────
-// Set these env vars on Render. PUBLIC_BASE_URL should be your Render external
-// URL (e.g. https://yourbot.onrender.com) with no trailing slash — it's used
-// to build the OAuth redirect URIs, which must match EXACTLY what you register
-// in the Meta App dashboard / TikTok Developer Portal.
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
-const LEGAL_BASE_URL = PUBLIC_BASE_URL || 'https://your-app.onrender.com';
-const OAUTH_CONFIG = {
-    instagram: {
-        // These come from Meta App Dashboard → your app → Instagram → "API setup with
-        // Instagram Login" → Business login settings — NOT the app's main Facebook App ID/Secret.
-        clientId: process.env.INSTAGRAM_APP_ID,
-        clientSecret: process.env.INSTAGRAM_APP_SECRET,
-        redirectUri: `${PUBLIC_BASE_URL}/oauth/instagram/callback`,
-        authUrl: 'https://www.instagram.com/oauth/authorize',
-        scope: 'instagram_business_basic',
-        clientIdParam: 'client_id', // standard OAuth naming
-    },
-    tiktok: {
-        clientId: process.env.TIKTOK_CLIENT_KEY,
-        clientSecret: process.env.TIKTOK_CLIENT_SECRET,
-        redirectUri: `${PUBLIC_BASE_URL}/oauth/tiktok/callback`,
-        authUrl: 'https://www.tiktok.com/v2/auth/authorize/',
-        scope: 'user.info.basic,video.list',
-        // TikTok deviates from standard OAuth naming: the authorize endpoint expects
-        // "client_key", not "client_id" — sending the wrong param name here produces
-        // errCode 10003 / error_type=client_key even with a correct, valid key.
-        clientIdParam: 'client_key',
-    },
-};
-// In-memory pending OAuth states: state -> { guildId, userId, platform, expires }
-// A Discord-side "link" always starts and finishes within a few minutes, so
-// memory (rather than the DB) is fine here — if the process restarts mid-flow
-// the user just runs /social link again.
-const pendingOAuthStates = new Map();
-const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
-function createOAuthState(guildId, userId, platform) {
-    const state = crypto.randomBytes(16).toString('hex');
-    const expires = Date.now() + OAUTH_STATE_TTL_MS;
-    pendingOAuthStates.set(state, { guildId, userId, platform, expires });
-    return { state, expires };
-}
-function consumeOAuthState(state) {
-    const entry = pendingOAuthStates.get(state);
-    if (!entry) return null;
-    pendingOAuthStates.delete(state);
-    if (entry.expires < Date.now()) return null;
-    return entry;
-}
-setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of pendingOAuthStates) if (v.expires < now) pendingOAuthStates.delete(k);
-}, 5 * 60 * 1000);
-
-function postForm(urlStr, formData, extraHeaders = {}) {
-    return new Promise((resolve, reject) => {
-        const body = new URLSearchParams(formData).toString();
-        const u = new URL(urlStr);
-        const req = https.request({
-            hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body), ...extraHeaders },
-        }, res => {
-            const chunks = []; res.on('data', c => chunks.push(c));
-            res.on('end', () => {
-                const text = Buffer.concat(chunks).toString('utf8');
-                try { resolve({ status: res.statusCode, json: JSON.parse(text) }); }
-                catch { resolve({ status: res.statusCode, json: null, text }); }
-            });
-        });
-        req.on('error', reject);
-        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
-        req.write(body); req.end();
-    });
-}
-function postJson(urlStr, bodyObj, extraHeaders = {}) {
-    return new Promise((resolve, reject) => {
-        const body = JSON.stringify(bodyObj);
-        const u = new URL(urlStr);
-        const req = https.request({
-            hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...extraHeaders },
-        }, res => {
-            const chunks = []; res.on('data', c => chunks.push(c));
-            res.on('end', () => {
-                const text = Buffer.concat(chunks).toString('utf8');
-                try { resolve({ status: res.statusCode, json: JSON.parse(text) }); }
-                catch { resolve({ status: res.statusCode, json: null, text }); }
-            });
-        });
-        req.on('error', reject);
-        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
-        req.write(body); req.end();
-    });
-}
-function fetchJson(urlStr, headers = {}) {
-    return new Promise((resolve, reject) => {
-        const u = new URL(urlStr);
-        const req = https.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers }, res => {
-            const chunks = []; res.on('data', c => chunks.push(c));
-            res.on('end', () => {
-                const text = Buffer.concat(chunks).toString('utf8');
-                try { resolve({ status: res.statusCode, json: JSON.parse(text) }); }
-                catch { resolve({ status: res.statusCode, json: null, text }); }
-            });
-        });
-        req.on('error', reject);
-        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
-        req.end();
-    });
-}
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-let pool; // created in initDB() after resolving the DB host to IPv4
-pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-pool.on('error', e => console.error('⚠️ Postgres pool error:', e.message));
-
-// Render's managed Postgres hostnames sometimes only resolve to IPv6 on the
-// default resolver, which Render's network can't route (ENETUNREACH). Force
-// an IPv4 lookup and rebuild the pool against the resolved IP if needed.
-async function ensureIPv4Pool() {
-    if (!process.env.DATABASE_URL) return;
-    try {
-        const url = new URL(process.env.DATABASE_URL);
-        console.log(`🔍 DB host from DATABASE_URL: ${url.hostname}:${url.port || 5432}`);
-        const { address } = await new Promise((resolve, reject) =>
-            dns.lookup(url.hostname, { family: 4 }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
-        );
-        if (address && address !== url.hostname) {
-            const original = url.hostname;
-            url.hostname = address;
-            await pool.end().catch(() => {});
-            pool = new Pool({
-                connectionString: url.toString(),
-                ssl: { rejectUnauthorized: false, servername: original }, // keep SNI/cert check against original hostname
-            });
-            pool.on('error', e => console.error('⚠️ Postgres pool error:', e.message));
-            console.log(`🔧 Using IPv4 address ${address} for Postgres host ${original}`);
-        }
-    } catch (e) {
-        console.error('⚠️ IPv4 DB lookup failed, using default resolver:', e.message);
-    }
-}
-const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
-
-const PLATFORMS = {
-    youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
-    // Twitter/X is flagged unavailable — Nitter (the public mirrors this bot reads
-    // through) was shut down by an X Corp cease-and-desist in Aug 2026. See the
-    // in-app warning shown to servers with existing Twitter watches for details.
-    twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2', unavailable: true },
-    twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF' },
-    kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18' },
-    instagram: { label: 'Instagram', emoji: '📸', color: '#E1306C', oauth: true },
-    tiktok:    { label: 'TikTok',    emoji: '🎵', color: '#010101', oauth: true },
-};
-
-// Custom (application) emoji support — optional. Upload each platform's icon as an
-// application emoji (Discord Developer Portal → your app → Emojis, or the API —
-// these work in every server the bot is in, no per-guild upload needed), then set
-// EMOJI_<PLATFORM>_ID (and EMOJI_<PLATFORM>_NAME if it's not just the platform key)
-// as env vars, e.g. EMOJI_YOUTUBE_ID=123456789012345678. Leave unset to keep using
-// the plain Unicode emoji above — nothing breaks either way.
-// p.emojiTag   → for embed/text display, e.g. `${p.emojiTag} ${p.label}`
-// p.emojiButton → for ButtonBuilder.setEmoji(p.emojiButton)
-for (const [key, p] of Object.entries(PLATFORMS)) {
-    const id = process.env[`EMOJI_${key.toUpperCase()}_ID`];
-    const name = process.env[`EMOJI_${key.toUpperCase()}_NAME`] || key;
-    p.emojiTag = id ? `<:${name}:${id}>` : p.emoji;
-    p.emojiButton = id ? { id, name } : p.emoji;
-}
-
-// Notification types per platform. Each watch stores a subset of these in `notify_types` (JSONB array).
-// If null/empty, all types fire (default behaviour / backwards compat).
-const PLATFORM_NOTIFY_TYPES = {
-    youtube:   [
-        { id: 'videos', label: 'Videos',  description: 'Regular uploads (long-form)' },
-        { id: 'shorts', label: 'Shorts',  description: 'YouTube Shorts' },
-        { id: 'live',   label: 'Live',    description: 'Stream goes live' },
-    ],
-    twitter:   [{ id: 'posts', label: 'Posts', description: 'New tweets/posts' }],
-    twitch:    [
-        { id: 'live',   label: 'Live',   description: 'Stream goes live' },
-        { id: 'vods',   label: 'VODs',   description: 'New VOD/past broadcast uploaded' },
-    ],
-    // Kick's official public API currently only exposes live status — no VOD/clip
-    // listing endpoint yet, so this platform launches with just one notify type.
-    kick:      [{ id: 'live', label: 'Live', description: 'Stream goes live' }],
-    instagram: [
-        { id: 'posts',   label: 'Posts',   description: 'Feed photos/videos' },
-        { id: 'reels',   label: 'Reels',   description: 'Reels' },
-        { id: 'stories', label: 'Stories', description: 'Stories (24h, if available)' },
-    ],
-    tiktok:    [{ id: 'videos', label: 'Videos', description: 'New TikTok videos' }],
-};
-
-const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const OWNER_ID = '1193912522999336960';
+const SUPPORT_SERVER_URL = 'https://discord.gg/Qrp82cRhUW';
+const MAX_SCAM_IMAGE_BYTES = parseInt(process.env.MAX_SCAM_IMAGE_BYTES) || 15 * 1024 * 1024; // skip decoding unusually large attachments; scam images are typically small screenshots anyway
 
 // ── DB ─────────────────────────────────────────────────────────────────────
 async function initDB() {
     await pool.query(`
-        CREATE TABLE IF NOT EXISTS configs   (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
-        CREATE TABLE IF NOT EXISTS watches   (
-            id SERIAL PRIMARY KEY,
-            guild_id TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            handle TEXT NOT NULL,
-            channel_id TEXT NOT NULL,
-            message_template TEXT,
-            last_post_id TEXT,
-            last_checked BIGINT,
-            added_by TEXT,
-            added_at BIGINT
-        );
-        CREATE INDEX IF NOT EXISTS watches_guild ON watches(guild_id);
-        CREATE INDEX IF NOT EXISTS watches_platform ON watches(platform);
-        ALTER TABLE watches ADD COLUMN IF NOT EXISTS role_id TEXT;
-        ALTER TABLE watches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
-        ALTER TABLE watches ADD COLUMN IF NOT EXISTS seen_post_ids JSONB NOT NULL DEFAULT '[]';
-        ALTER TABLE watches ADD COLUMN IF NOT EXISTS notify_types JSONB;
-        ALTER TABLE watches ADD COLUMN IF NOT EXISTS message_templates JSONB;
-        ALTER TABLE watches ADD COLUMN IF NOT EXISTS social_link_id INTEGER;
-        ALTER TABLE watches ADD COLUMN IF NOT EXISTS legacy_migrated BOOLEAN NOT NULL DEFAULT FALSE;
-        CREATE TABLE IF NOT EXISTS social_links (
-            id SERIAL PRIMARY KEY,
-            guild_id TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            external_user_id TEXT NOT NULL,
-            external_username TEXT,
-            access_token TEXT NOT NULL,
-            refresh_token TEXT,
-            expires_at BIGINT,
-            linked_by TEXT,
-            linked_at BIGINT,
-            UNIQUE (guild_id, platform, external_user_id)
-        );
-        CREATE INDEX IF NOT EXISTS social_links_guild_platform ON social_links(guild_id, platform);
+        CREATE TABLE IF NOT EXISTS configs            (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS warnings           (key TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS history            (id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS notes              (id BIGINT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS scam_hashes        (id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, hash TEXT NOT NULL, label TEXT, added_by TEXT, added_at BIGINT);
+        CREATE TABLE IF NOT EXISTS global_scam_hashes (id SERIAL PRIMARY KEY, hash TEXT NOT NULL, label TEXT NOT NULL, added_by TEXT, added_at BIGINT);
+        CREATE TABLE IF NOT EXISTS active_timeouts    (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL, PRIMARY KEY (guild_id, user_id));
+        CREATE INDEX IF NOT EXISTS warnings_guild_user ON warnings(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS history_guild_user  ON history(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS notes_guild_user    ON notes(guild_id, user_id);
+        CREATE INDEX IF NOT EXISTS scam_hashes_guild   ON scam_hashes(guild_id);
     `);
-    // Backfill seen_post_ids for existing rows so nothing re-fires after migration
-    await pool.query(`
-        UPDATE watches
-        SET seen_post_ids = jsonb_build_array(last_post_id)
-        WHERE last_post_id IS NOT NULL AND seen_post_ids = '[]'::jsonb
-    `);
-    await migrateLegacyMessages();
 }
 
-// One-time (idempotent) migration: any watch still using the old single
-// message_template (from the removed /social add "message" option) gets that
-// same text copied into every post type under message_templates, so nothing
-// silently stops sending a message once the old field is phased out. Flagged
-// as legacy_migrated so the manage view can warn it hasn't been reviewed —
-// the wording was written for one generic message and may not fit every type.
-async function migrateLegacyMessages() {
-    const res = await pool.query(`
-        SELECT * FROM watches
-        WHERE message_template IS NOT NULL
-        AND (message_templates IS NULL OR message_templates = '{}'::jsonb)
-    `);
-    let migrated = 0;
-    for (const w of res.rows) {
-        const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-        if (types.length <= 1) continue; // single-type platforms have nothing meaningful to split into
-        const templates = {};
-        for (const t of types) templates[t.id] = w.message_template;
-        await pool.query('UPDATE watches SET message_templates = $1, legacy_migrated = TRUE WHERE id = $2', [JSON.stringify(templates), w.id]);
-        migrated++;
-    }
-    if (migrated) console.log(`🔄 Auto-migrated ${migrated} legacy single-message watch(es) to per-type messages.`);
-}
-
-const configCache = new Map();
+const configCache = new Map(), activeWarnings = new Map(), activeTimeouts = new Map();
 async function getConfig(guildId) {
     if (configCache.has(guildId)) return configCache.get(guildId);
     const res = await pool.query('SELECT data FROM configs WHERE guild_id = $1', [guildId]);
-    const data = res.rows[0]?.data ?? {};
+    const data = res.rows[0]?.data ?? { levels: {} };
     configCache.set(guildId, data); return data;
 }
 function saveConfig(guildId, data) {
     configCache.set(guildId, data);
     pool.query('INSERT INTO configs (guild_id, data) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET data = $2', [guildId, data]).catch(e => console.error('saveConfig:', e.message));
 }
-
-const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
-
-// Finds an admin-only channel to post in: a text channel the bot can send in,
-// where @everyone does NOT have ViewChannel (i.e. it's restricted), preferring
-// names containing "admin"/"staff"/"mod". Falls back to the first postable channel.
-function findAnnouncementChannel(guild) {
-    const me = guild.members.me;
-    if (!me) return null;
-    const textChannels = guild.channels.cache.filter(c =>
-        (c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement) &&
-        c.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages) &&
-        c.permissionsFor(me)?.has(PermissionFlagsBits.ViewChannel)
-    );
-    if (!textChannels.size) return null;
-
-    const everyoneRole = guild.roles.everyone;
-    const restricted = textChannels.filter(c => !c.permissionsFor(everyoneRole)?.has(PermissionFlagsBits.ViewChannel));
-    if (restricted.size) {
-        const named = restricted.find(c => /admin|staff|mod|owner/i.test(c.name));
-        return named || restricted.first();
-    }
-    // No restricted channel found — fall back to first available postable channel
-    const named = textChannels.find(c => /admin|staff|mod|owner|general/i.test(c.name));
-    return named || textChannels.first();
+function saveWarning(key, data) {
+    activeWarnings.set(key, data);
+    pool.query('INSERT INTO warnings (key, guild_id, user_id, data) VALUES ($1, $2, $3, $4) ON CONFLICT (key) DO UPDATE SET data = $4', [key, data.guildId, data.userId, data]).catch(e => console.error('saveWarning:', e.message));
 }
-
-async function announceSupportServer(guild) {
-    try {
-        const channel = findAnnouncementChannel(guild);
-        if (!channel) return;
-        const embed = new EmbedBuilder().setColor('#5865F2').setTitle('👋 Thanks for using Notifyer!')
-            .setDescription(`Join the support server for help, updates, and to report issues:\n${SUPPORT_SERVER_URL}`);
-        await channel.send({ embeds: [embed] });
-        console.log(`📨 Sent support server announcement to ${guild.name} (#${channel.name})`);
-    } catch (e) {
-        console.error(`announceSupportServer (${guild.id}):`, e.message);
-    }
+function deleteWarning(key) { activeWarnings.delete(key); pool.query('DELETE FROM warnings WHERE key = $1', [key]).catch(e => console.error('deleteWarning:', e.message)); }
+// Tracks timeouts the bot itself has applied (native Discord timeouts, not warning roles) so they
+// can be surfaced in the active warnings list. One entry per guild+user — Discord only allows one
+// active timeout per member anyway, so a new timeout just overwrites the old tracked entry.
+function timeoutKey(guildId, userId) { return `${guildId}-${userId}`; }
+function saveActiveTimeout(guildId, userId, data) {
+    activeTimeouts.set(timeoutKey(guildId, userId), data);
+    pool.query('INSERT INTO active_timeouts (guild_id, user_id, data) VALUES ($1, $2, $3) ON CONFLICT (guild_id, user_id) DO UPDATE SET data = $3', [guildId, userId, data]).catch(e => console.error('saveActiveTimeout:', e.message));
 }
-
-async function getWatches(guildId) {
-    const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 ORDER BY id', [guildId]);
-    return res.rows;
+function deleteActiveTimeout(guildId, userId) {
+    activeTimeouts.delete(timeoutKey(guildId, userId));
+    pool.query('DELETE FROM active_timeouts WHERE guild_id = $1 AND user_id = $2', [guildId, userId]).catch(e => console.error('deleteActiveTimeout:', e.message));
 }
-async function getAllWatches() {
-    const res = await pool.query('SELECT * FROM watches ORDER BY id');
-    return res.rows;
-}
-async function addWatch({ guildId, platform, handle, channelId, messageTemplate, addedBy }) {
-    const res = await pool.query(
-        'INSERT INTO watches (guild_id, platform, handle, channel_id, message_template, added_by, added_at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-        [guildId, platform, handle, channelId, messageTemplate ?? null, addedBy, Date.now()]
-    );
-    return res.rows[0];
-}
-async function removeWatch(guildId, id) {
-    const res = await pool.query('DELETE FROM watches WHERE guild_id = $1 AND id = $2', [guildId, id]);
-    return res.rowCount > 0;
-}
-async function updateWatchTemplate(guildId, id, template) {
-    await pool.query('UPDATE watches SET message_template = $1 WHERE guild_id = $2 AND id = $3', [template, guildId, id]);
-}
-async function updateWatchRole(guildId, id, roleId) {
-    await pool.query('UPDATE watches SET role_id = $1 WHERE guild_id = $2 AND id = $3', [roleId, guildId, id]);
-}
-async function updateWatchActive(guildId, id, active) {
-    await pool.query('UPDATE watches SET active = $1 WHERE guild_id = $2 AND id = $3', [active, guildId, id]);
-}
-async function updateWatchChannel(guildId, id, channelId) {
-    await pool.query('UPDATE watches SET channel_id = $1 WHERE guild_id = $2 AND id = $3', [channelId, guildId, id]);
-}
-async function updateWatchNotifyTypes(guildId, id, types) {
-    await pool.query('UPDATE watches SET notify_types = $1 WHERE guild_id = $2 AND id = $3', [JSON.stringify(types), guildId, id]);
-}
-async function updateWatchMessageTemplates(guildId, id, templatesObj) {
-    // Saving explicitly counts as "reviewed" — clear the outdated/legacy warning.
-    await pool.query('UPDATE watches SET message_templates = $1, legacy_migrated = FALSE WHERE guild_id = $2 AND id = $3', [JSON.stringify(templatesObj), guildId, id]);
-}
-async function setWatchSocialLink(guildId, id, socialLinkId) {
-    await pool.query('UPDATE watches SET social_link_id = $1 WHERE guild_id = $2 AND id = $3', [socialLinkId, guildId, id]);
-}
-
-// ── Social account links (OAuth) ────────────────────────────────────────────
-async function upsertSocialLink({ guildId, platform, externalUserId, externalUsername, accessToken, refreshToken, expiresAt, linkedBy }) {
-    const res = await pool.query(
-        `INSERT INTO social_links (guild_id, platform, external_user_id, external_username, access_token, refresh_token, expires_at, linked_by, linked_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         ON CONFLICT (guild_id, platform, external_user_id) DO UPDATE SET
-            external_username = EXCLUDED.external_username, access_token = EXCLUDED.access_token,
-            refresh_token = EXCLUDED.refresh_token, expires_at = EXCLUDED.expires_at,
-            linked_by = EXCLUDED.linked_by, linked_at = EXCLUDED.linked_at
-         RETURNING *`,
-        [guildId, platform, externalUserId, externalUsername, accessToken, refreshToken ?? null, expiresAt ?? null, linkedBy, Date.now()]
-    );
-    return res.rows[0];
-}
-async function getSocialLinks(guildId, platform) {
-    const res = await pool.query('SELECT * FROM social_links WHERE guild_id = $1 AND platform = $2 ORDER BY external_username', [guildId, platform]);
-    return res.rows;
-}
-async function getSocialLinkByUsername(guildId, platform, username) {
-    const res = await pool.query('SELECT * FROM social_links WHERE guild_id = $1 AND platform = $2 AND lower(external_username) = lower($3)', [guildId, platform, username]);
-    return res.rows[0] || null;
-}
-async function getSocialLinkById(id) {
-    const res = await pool.query('SELECT * FROM social_links WHERE id = $1', [id]);
-    return res.rows[0] || null;
-}
-async function updateSocialLinkTokens(id, accessToken, refreshToken, expiresAt) {
-    await pool.query('UPDATE social_links SET access_token = $1, refresh_token = COALESCE($2, refresh_token), expires_at = $3 WHERE id = $4', [accessToken, refreshToken, expiresAt, id]);
-}
-async function getWatch(guildId, id) {
-    const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 AND id = $2', [guildId, id]);
-    return res.rows[0] || null;
-}
-const SEEN_HISTORY_SIZE = 20;
-async function updateLastPost(id, lastPostId, seenIds = []) {
-    const updated = [...new Set([lastPostId, ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
-    await pool.query(
-        'UPDATE watches SET last_post_id = $1, last_checked = $2, seen_post_ids = $3 WHERE id = $4',
-        [lastPostId, Date.now(), JSON.stringify(updated), id]
-    );
-}
-async function touchLastChecked(id) {
-    await pool.query('UPDATE watches SET last_checked = $1 WHERE id = $2', [Date.now(), id]);
-}
+function addHistory(guildId, userId, entry) { pool.query('INSERT INTO history (guild_id, user_id, data) VALUES ($1, $2, $3)', [guildId, userId, entry]).catch(e => console.error('addHistory:', e.message)); }
+async function getHistory(guildId, userId) { const res = await pool.query('SELECT data FROM history WHERE guild_id = $1 AND user_id = $2 ORDER BY id DESC LIMIT 10', [guildId, userId]); return res.rows.map(r => r.data).reverse(); }
+async function getAllHistory(guildId, userId) { const res = await pool.query('SELECT data FROM history WHERE guild_id = $1 AND user_id = $2 ORDER BY id', [guildId, userId]); return res.rows.map(r => r.data); }
+async function getNotes(guildId, userId) { const res = await pool.query('SELECT data FROM notes WHERE guild_id = $1 AND user_id = $2 ORDER BY id', [guildId, userId]); return res.rows.map(r => r.data); }
+function addNote(guildId, userId, note) { pool.query('INSERT INTO notes (id, guild_id, user_id, data) VALUES ($1, $2, $3, $4)', [note.id, guildId, userId, note]).catch(e => console.error('addNote:', e.message)); }
+async function deleteNote(guildId, userId, id) { const res = await pool.query('DELETE FROM notes WHERE guild_id = $1 AND user_id = $2 AND id = $3', [guildId, userId, id]); return res.rowCount > 0; }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-const E = (c, t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
-
-function fetchText(url, headers = {}) {
-    return new Promise((resolve, reject) => {
-        const mod = url.startsWith('https') ? https : http;
-        const req = mod.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SocialNotifyBot/1.0)', ...headers } }, res => {
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                return fetchText(res.headers.location, headers).then(resolve, reject);
-            }
-            if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-            const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8'))); res.on('error', reject);
-        });
-        req.on('error', reject);
-        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
-    });
-}
-
-async function hasCommandPermission(interaction, guildId) {
-    if (interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-    const cfg = await getConfig(guildId);
-    return cfg.accessRoleId ? interaction.member.roles.cache.has(cfg.accessRoleId) : false;
-}
-function normalizeHandle(platform, raw) {
-    let h = raw.trim();
-    // Strip full URLs down to the handle/channel identifier
-    h = h.replace(/^https?:\/\/(www\.)?/i, '');
-    if (platform === 'youtube') {
-        h = h.replace(/^(youtube\.com|m\.youtube\.com|youtu\.be)\//i, '');
-        h = h.replace(/^@/, '@'); // keep @handle form if present
-        h = h.replace(/\/(videos|featured|streams|shorts).*$/i, '');
-        h = h.replace(/\/$/, '');
-    } else if (platform === 'twitter') {
-        h = h.replace(/^(twitter\.com|x\.com)\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0];
-    } else if (platform === 'twitch') {
-        h = h.replace(/^twitch\.tv\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0].toLowerCase();
-    } else if (platform === 'kick') {
-        h = h.replace(/^kick\.com\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0].toLowerCase();
-    } else if (platform === 'instagram') {
-        h = h.replace(/^(instagram\.com)\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0];
-    } else if (platform === 'tiktok') {
-        h = h.replace(/^(tiktok\.com)\/@?/i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0];
+async function logMod(guild, guildId, embed) { const cfg = await getConfig(guildId); const ch = cfg.logChannelId && guild.channels.cache.get(cfg.logChannelId); if (ch) ch.send({ embeds: [embed] }).catch(() => {}); }
+async function hasCommandPermission(interaction, guildId) { if (interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return true; const cfg = await getConfig(guildId); return cfg.accessRoleId ? interaction.member.roles.cache.has(cfg.accessRoleId) : false; }
+function mentionEveryoneRisk(guild) {
+    const risky = [];
+    const everyoneRole = guild.roles.everyone;
+    if (everyoneRole.permissions.has(PermissionFlagsBits.MentionEveryone)) risky.push('@everyone (default role)');
+    for (const role of guild.roles.cache.values()) {
+        if (role.id === guild.id || role.managed) continue;
+        if (role.permissions.has(PermissionFlagsBits.Administrator)) continue; // admins are expected to have this
+        if (role.permissions.has(PermissionFlagsBits.MentionEveryone)) risky.push(role.name);
     }
-    return h;
+    return risky;
 }
-function profileUrl(platform, handle) {
-    switch (platform) {
-        case 'youtube': return handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/channel/${handle}`;
-        case 'twitter': return `https://x.com/${handle}`;
-        case 'twitch': return `https://www.twitch.tv/${handle}`;
-        case 'kick': return `https://kick.com/${handle}`;
-        case 'instagram': return `https://www.instagram.com/${handle}`;
-        case 'tiktok': return `https://www.tiktok.com/@${handle}`;
-    }
-}
-
-// ── Platform fetchers: each returns { id, url, title, author, thumbnail, timestamp } or null ──
-async function fetchLatestYouTube(handle) {
-    let channelId = handle;
-    if (handle.startsWith('@') || !/^UC[\w-]{22}$/.test(handle)) {
-        // Resolve handle -> channel id via the channel page.
-        const url = handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/${handle.startsWith('c/') || handle.startsWith('user/') ? handle : '@' + handle}`;
-        const html = await fetchText(url);
-        // Prefer the canonical link (most reliable — points at the page's own channel)
-        let m = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/);
-        // Fall back to the channel metadata's externalId field
-        if (!m) m = html.match(/"externalId":"(UC[\w-]{22})"/);
-        // Last resort: first generic channelId occurrence
-        if (!m) m = html.match(/"channelId":"(UC[\w-]{22})"/);
-        if (!m) throw new Error('Could not resolve YouTube channel ID');
-        channelId = m[1];
-
-        // Sanity check: confirm the resolved channel's handle matches what was requested
-        if (handle.startsWith('@')) {
-            const handleMatch = html.match(/"channelHandleText":\{"runs":\[\{"text":"(@[^"]+)"/) || html.match(/"vanityChannelUrl":"https:\/\/www\.youtube\.com\/(@[^"]+)"/);
-            if (handleMatch && handleMatch[1].toLowerCase() !== handle.toLowerCase()) {
-                throw new Error(`Resolved to a different channel handle (${handleMatch[1]}) than requested (${handle}) — check the spelling/casing`);
-            }
-        }
-    }
-    const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
-    const xml = await fetchText(feedUrl);
-    const data = xmlParser.parse(xml);
-    const entries = data?.feed?.entry;
-    if (!entries) return null;
-    const entry = Array.isArray(entries) ? entries[0] : entries;
-    const videoId = entry['yt:videoId'];
-    const url = entry.link?.['@_href'] || `https://www.youtube.com/watch?v=${videoId}`;
-    const postType = await detectYouTubePostType(videoId, url);
+function mentionEveryoneWarningField(guild) {
+    const risky = mentionEveryoneRisk(guild);
+    if (!risky.length) return null;
     return {
-        id: videoId,
-        url,
-        title: entry.title,
-        author: data?.feed?.author?.name,
-        thumbnail: entry['media:group']?.['media:thumbnail']?.['@_url'],
-        timestamp: entry.published,
-        postType,
+        name: '⚠️ @everyone/@here Ping Risk',
+        value: `**${risky.join(', ')}** can currently ping @everyone/@here in this server.\n` +
+            `Scam images are removed instantly, but the **ping itself still goes through** before the message is deleted — everyone gets notified regardless.\n` +
+            `Restrict **"Mention @everyone, @here, and All Roles"** to **Administrators or a trusted role only** to stop scammers abusing this.`
     };
 }
-
-async function fetchLatestTwitter(handle) {
-    // Twitter/X has no free official API. Query several Nitter mirrors in
-    // parallel and pick whichever returns the newest tweet (by numeric ID),
-    // since individual instances are often stale/cached.
-    const instances = [
-        'https://nitter.net',
-        'https://nitter.privacydev.net',
-        'https://nitter.poast.org',
-        'https://nitter.tiekoetter.com',
-        'https://nitter.cz',
-        'https://lightbrd.com',
-    ];
-
-    const results = await Promise.allSettled(instances.map(async base => {
-        const xml = await fetchText(`${base}/${handle}/rss`);
-        const data = xmlParser.parse(xml);
-        const items = data?.rss?.channel?.item;
-        if (!items) throw new Error('No items in feed');
-        const item = Array.isArray(items) ? items[0] : items;
-        const idMatch = (item.link || item.guid || '').match(/status\/(\d+)/);
-        if (!idMatch) throw new Error('Could not parse tweet ID');
-        return {
-            id: idMatch[1],
-            idNum: BigInt(idMatch[1]),
-            url: (item.link || '').replace(base, 'https://x.com'),
-            title: (item.title || '').slice(0, 200),
-            author: data?.rss?.channel?.title,
-            thumbnail: null,
-            timestamp: item.pubDate,
-            source: base,
-        };
-    }));
-
-    const successes = results.filter(r => r.status === 'fulfilled').map(r => r.value);
-    if (!successes.length) {
-        const errs = results.map((r, i) => `${instances[i]}: ${r.reason?.message || 'unknown error'}`).join('; ');
-        throw new Error(`All Nitter instances failed (${errs})`);
+async function showAccessControlConfig(interaction, guildId) {
+    await interaction.reply({ embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('🔒 Access Configuration').setDescription('Select which role should have access to moderation commands:\n\n**Commands affected:**\n• `/warn` `/unwarn` `/timeout` `/config set/view`\n• `/config access` `/warnlist` `/history` `/escalation`\n\n**Note:** Server administrators always have access.').setFooter({ text: 'Select a role from the dropdown below' })], components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`access_role_${guildId}`).setPlaceholder('Select a role for command access').setMinValues(1).setMaxValues(1))], flags: [MessageFlags.Ephemeral] });
+}
+function parseDuration(s) {
+    s = s.trim();
+    if (s.toLowerCase() === 'forever') return { days: 0, hours: 0, minutes: 0, seconds: 0, totalMs: null, isForever: true };
+    // Natural shorthand: 1d, 2h, 30m, 90s, or combinations like 1d12h, 1h30m
+    if (/^(\d+d)?(\d+h)?(\d+m)?(\d+s)?$/i.test(s) && /\d/.test(s)) {
+        const m = s.match(/^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i);
+        const days = parseInt(m[1] || 0), hours = parseInt(m[2] || 0), minutes = parseInt(m[3] || 0), seconds = parseInt(m[4] || 0);
+        const totalMs = (days * 86400 + hours * 3600 + minutes * 60 + seconds) * 1000;
+        return (totalMs <= 0 || totalMs > 365 * 86400 * 1000) ? null : { days, hours, minutes, seconds, totalMs, isForever: false };
     }
-
-    // Pick the result with the highest (newest) tweet ID — Twitter snowflake
-    // IDs are monotonically increasing over time.
-    successes.sort((a, b) => (b.idNum > a.idNum ? 1 : b.idNum < a.idNum ? -1 : 0));
-    const best = successes[0];
-    delete best.idNum;
-    delete best.source;
-    return best;
+    const parts = s.split(':').map(p => { const n = parseInt(p.trim()); return (n < 0 || n > 9999) ? NaN : n; });
+    if (parts.some(isNaN) || parts.length < 2 || parts.length > 4) return null;
+    let days = 0, hours = 0, minutes = 0, seconds = 0;
+    if (parts.length === 2) [minutes, seconds] = parts;
+    else if (parts.length === 3) [hours, minutes, seconds] = parts;
+    else [days, hours, minutes, seconds] = parts;
+    const totalMs = (days * 86400 + hours * 3600 + minutes * 60 + seconds) * 1000;
+    return (totalMs <= 0 || totalMs > 365 * 86400 * 1000) ? null : { days, hours, minutes, seconds, totalMs, isForever: false };
 }
+function formatDuration(d, h, m, s, isForever = false) { if (isForever) return 'Forever'; return [d && `${d}d`, h && `${h}h`, m && `${m}m`, s && `${s}s`].filter(Boolean).join(' ') || '0s'; }
 
-
-
-async function fetchTwitch(path) {
-    const clientId = process.env.TWITCH_CLIENT_ID;
-    if (!clientId) throw new Error('TWITCH_CLIENT_ID env var not set');
-    const token = await getTwitchToken();
-    const raw = await fetchText(`https://api.twitch.tv/helix/${path}`, {
-        'Client-Id': clientId,
-        'Authorization': `Bearer ${token}`,
-    });
-    return JSON.parse(raw);
-}
-
-// ── Twitch OAuth token management ─────────────────────────────────────────
-let twitchToken = null, twitchTokenExpiry = 0;
-async function getTwitchToken() {
-    if (twitchToken && Date.now() < twitchTokenExpiry - 60_000) return twitchToken;
-    const clientId = process.env.TWITCH_CLIENT_ID, clientSecret = process.env.TWITCH_CLIENT_SECRET;
-    if (!clientId || !clientSecret) throw new Error('TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET env vars not set');
-
-    // Twitch's token endpoint requires POST, so we can't use fetchText (GET-only) here.
-    const res = await new Promise((resolve, reject) => {
-        const body = `client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`;
-        const req = https.request('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, res => {
-            const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))));
-        });
-        req.on('error', reject); req.write(body); req.end();
-    });
-    if (!res.access_token) throw new Error(`Twitch token error: ${JSON.stringify(res)}`);
-    twitchToken = res.access_token;
-    twitchTokenExpiry = Date.now() + (res.expires_in * 1000);
-    return twitchToken;
-}
-
-// Cache login→id mappings to avoid repeated lookups
-const twitchUserIdCache = new Map();
-async function getTwitchUserId(login) {
-    if (twitchUserIdCache.has(login)) return twitchUserIdCache.get(login);
-    const data = await fetchTwitch(`users?login=${encodeURIComponent(login)}`);
-    const user = data.data?.[0];
-    if (!user) throw new Error(`Twitch user "${login}" not found`);
-    twitchUserIdCache.set(login, user.id);
-    return user.id;
-}
-
-// Returns array of posts: [{id, url, title, author, thumbnail, timestamp, postType}]
-async function fetchLatestTwitchAll(handle) {
-    const userId = await getTwitchUserId(handle);
-    const [streamData, vodData] = await Promise.all([
-        fetchTwitch(`streams?user_id=${userId}`),
-        fetchTwitch(`videos?user_id=${userId}&type=archive&first=1`),
-    ]);
-    const results = [];
-
-    const stream = streamData.data?.[0];
-    if (stream) {
-        results.push({
-            id: `live_${stream.id}`,
-            url: `https://www.twitch.tv/${handle}`,
-            title: stream.title || `${handle} is live!`,
-            author: stream.user_name || handle,
-            thumbnail: (stream.thumbnail_url || '').replace('{width}', '1280').replace('{height}', '720'),
-            timestamp: stream.started_at,
-            postType: 'live',
-            isLive: true,
-        });
-    }
-
-    const vod = vodData.data?.[0];
-    if (vod) {
-        results.push({
-            id: vod.id,
-            url: vod.url,
-            title: vod.title,
-            author: vod.user_name || handle,
-            thumbnail: (vod.thumbnail_url || '').replace('%{width}', '1280').replace('%{height}', '720'),
-            timestamp: vod.published_at || vod.created_at,
-            postType: 'vods',
-        });
-    }
-    return results;
-}
-
-// ── Kick ─────────────────────────────────────────────────────────────────
-// Kick's official public API. Live status is public data, so we use an
-// app-level Client Credentials token (no per-channel authorization needed) —
-// unlike Instagram/TikTok, this works for any public Kick channel.
-async function fetchKick(path) {
-    const clientId = process.env.KICK_CLIENT_ID, clientSecret = process.env.KICK_CLIENT_SECRET;
-    if (!clientId || !clientSecret) throw new Error('KICK_CLIENT_ID and KICK_CLIENT_SECRET env vars not set');
-    const token = await getKickAppToken();
-    const { json } = await fetchJson(`https://api.kick.com/public/v1/${path}`, { Authorization: `Bearer ${token}` });
-    return json;
-}
-
-let kickToken = null, kickTokenExpiry = 0;
-async function getKickAppToken() {
-    if (kickToken && Date.now() < kickTokenExpiry - 60_000) return kickToken;
-    const clientId = process.env.KICK_CLIENT_ID, clientSecret = process.env.KICK_CLIENT_SECRET;
-    if (!clientId || !clientSecret) throw new Error('KICK_CLIENT_ID and KICK_CLIENT_SECRET env vars not set');
-    const { json } = await postForm('https://id.kick.com/oauth/token', {
-        client_id: clientId, client_secret: clientSecret, grant_type: 'client_credentials',
-    });
-    if (!json?.access_token) throw new Error(`Kick token error: ${JSON.stringify(json)}`);
-    kickToken = json.access_token;
-    kickTokenExpiry = Date.now() + (json.expires_in * 1000);
-    return kickToken;
-}
-
-// Cache slug→broadcaster_user_id mappings to avoid repeated lookups
-const kickBroadcasterIdCache = new Map();
-async function getKickBroadcasterId(slug) {
-    if (kickBroadcasterIdCache.has(slug)) return kickBroadcasterIdCache.get(slug);
-    const data = await fetchKick(`channels?slug=${encodeURIComponent(slug)}`);
-    const channel = data?.data?.[0];
-    if (!channel) throw new Error(`Kick channel "${slug}" not found`);
-    kickBroadcasterIdCache.set(slug, channel.broadcaster_user_id);
-    return channel.broadcaster_user_id;
-}
-
-// Returns array of posts: [{id, url, title, author, thumbnail, timestamp, postType, isLive}]
-// — only ever 0 or 1 entries, since Kick's public API currently exposes live status only.
-async function fetchLatestKickAll(handle) {
-    const broadcasterId = await getKickBroadcasterId(handle);
-    const data = await fetchKick(`livestreams?broadcaster_user_id=${broadcasterId}`);
-    const stream = data?.data?.[0];
-    if (!stream) return [];
-    return [{
-        id: `live_${stream.id || stream.started_at}`,
-        url: `https://kick.com/${handle}`,
-        title: stream.stream_title || `${handle} is live!`,
-        author: handle,
-        thumbnail: (stream.thumbnail?.url || stream.thumbnail) || null,
-        timestamp: stream.started_at,
-        postType: 'live',
-        isLive: true,
-    }];
-}
-
-// ── YouTube post type detection ────────────────────────────────────────────
-async function detectYouTubePostType(videoId, url) {
-    // Shorts have a distinctive URL pattern after redirect — check via oEmbed
-    if (url?.includes('/shorts/')) return 'shorts';
-    // Check if the video is a live stream via YouTube's oEmbed endpoint
+// Fetch+bulkDelete messages in a channel matching optional userId and since timestamp. Returns count deleted.
+async function bulkDeleteInRange(channel, { userId, since, maxCount = Infinity } = {}) {
+    let deleted = 0, lastId;
+    const MAX_AGE = 1_209_600_000; // 14 days — Discord bulkDelete limit
     try {
-        const raw = await fetchText(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
-        const data = JSON.parse(raw);
-        // oEmbed doesn't directly expose live status, so check if the page HTML has live indicators
-        const html = await fetchText(`https://www.youtube.com/watch?v=${videoId}`);
-        if (/"isLiveBroadcast"\s*:\s*true|"style"\s*:\s*"LIVE"/.test(html)) return 'live';
-        if (html.includes('"shorts"') || url?.includes('/shorts/')) return 'shorts';
-    } catch {}
-    return 'videos';
+        do {
+            const fetched = await channel.messages.fetch({ limit: 100, ...(lastId ? { before: lastId } : {}) });
+            if (!fetched.size) break;
+            const eligible = fetched.filter(m => (!userId || m.author.id === userId) && (!since || m.createdTimestamp >= since) && (Date.now() - m.createdTimestamp < MAX_AGE));
+            const batch = [...eligible.values()].slice(0, maxCount - deleted);
+            if (batch.length) { await channel.bulkDelete(batch).catch(e => console.error(`bulkDelete failed in ${channel.id}:`, e.message)); deleted += batch.length; }
+            if (deleted >= maxCount || (since && fetched.last()?.createdTimestamp < since)) break;
+            lastId = fetched.last()?.id;
+        } while (true);
+    } catch (e) {
+        console.error(`bulkDeleteInRange failed in channel ${channel.id}:`, e.message);
+    }
+    return deleted;
 }
 
-async function fetchLatestPost(platform, handle) {
-    switch (platform) {
-        case 'youtube': return fetchLatestYouTube(handle);
-        case 'twitter': return fetchLatestTwitter(handle);
-        case 'twitch': return null;    // handled separately in pollAll (fetchLatestTwitchAll)
-        case 'kick': return null;      // handled separately in pollAll (fetchLatestKickAll)
-        case 'instagram': return null; // handled separately in pollAll (fetchLatestInstagramAll)
-        case 'tiktok': return null;    // handled separately in pollAll (fetchLatestTikTokAll)
-        default: return null;
-    }
+// ── Scam protection ────────────────────────────────────────────────────────
+async function dHash(buffer) {
+    const result = await sharp(buffer).resize(9, 8, { fit: 'fill' }).greyscale().raw().toBuffer({ resolveWithObject: true });
+    const data = result.data; let hash = 0n;
+    for (let row = 0; row < 8; row++) for (let col = 0; col < 8; col++) if (data[row * 9 + col] > data[row * 9 + col + 1]) hash |= (1n << BigInt(row * 8 + col));
+    return hash.toString(16).padStart(16, '0');
 }
-
-// ── OAuth token refresh (Instagram / TikTok) ───────────────────────────────
-// Refreshes a stored social_links row's access token if it's near expiry.
-// Returns the (possibly updated) row, or throws if refresh fails — callers
-// should treat a throw as "the link is dead, tell the person to /social link again".
-async function ensureFreshToken(link) {
-    const REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000; // refresh if <24h left
-    if (!link.expires_at || link.expires_at - Date.now() > REFRESH_MARGIN_MS) return link;
-
-    if (link.platform === 'instagram') {
-        // Instagram User tokens (Instagram Login flow) refresh via graph.instagram.com directly —
-        // no app client_id/secret needed for this call, just the current valid long-lived token.
-        const { json } = await fetchJson(
-            `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${encodeURIComponent(link.access_token)}`
-        );
-        if (!json?.access_token) throw new Error('Instagram token refresh failed — re-link with /social link.');
-        const expiresAt = Date.now() + (json.expires_in ? json.expires_in * 1000 : 55 * 24 * 60 * 60 * 1000);
-        await updateSocialLinkTokens(link.id, json.access_token, null, expiresAt);
-        return { ...link, access_token: json.access_token, expires_at: expiresAt };
+function hammingDistance(a, b) { let diff = BigInt('0x' + a) ^ BigInt('0x' + b), dist = 0; while (diff) { dist += Number(diff & 1n); diff >>= 1n; } return dist; }
+// Generates dHashes for several cropped sub-regions of an image, so that a registered
+// scam image can still be matched even if it was posted with different padding/framing
+// (e.g. wrapped in a screenshot border, or a slightly different crop).
+// Only called when the full-image hash doesn't already match (see usage below), to keep
+// the common (non-scam) case cheap.
+// IMPORTANT: we downscale once up front and crop from that small copy. Cropping the
+// original directly would re-decode the full-size image on every one of the ~36 crops —
+// on a multi-MB photo that's 36x the decode cost and memory per image, which is what
+// caused the memory spike. Working from a small copy keeps it cheap regardless of how
+// large the original attachment is.
+async function generateCropHashes(buffer) {
+    let small;
+    try { small = await sharp(buffer).resize(256, 256, { fit: 'inside', withoutEnlargement: true }).toBuffer(); } catch { return []; }
+    let meta; try { meta = await sharp(small).metadata(); } catch { return []; }
+    const { width, height } = meta;
+    if (!width || !height || width < 16 || height < 16) return [];
+    const scales = [0.9, 0.8, 0.7, 0.6];
+    const rects = new Map();
+    for (const scale of scales) {
+        const cw = Math.max(8, Math.round(width * scale)), ch = Math.max(8, Math.round(height * scale));
+        const xs = new Set([0, Math.round((width - cw) / 2), width - cw]);
+        const ys = new Set([0, Math.round((height - ch) / 2), height - ch]);
+        for (const left of xs) for (const top of ys) rects.set(`${left}_${top}_${cw}_${ch}`, { left, top, width: cw, height: ch });
     }
+    const hashes = [];
+    for (const rect of rects.values()) {
+        try { hashes.push(await dHash(await sharp(small).extract(rect).toBuffer())); } catch { /* skip invalid crop */ }
+    }
+    return hashes;
+}
+function fetchImageBuffer(url) {
+    return new Promise((resolve, reject) => {
+        const mod = url.startsWith('https') ? https : http;
+        mod.get(url, { headers: { 'User-Agent': 'PoliceBot/1.0' } }, res => {
+            if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+            const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve(Buffer.concat(chunks))); res.on('error', reject);
+        }).on('error', reject);
+    });
+}
+const scamHashCache = new Map();
+// Pending near-match review actions: pendingId -> { hash, label, attUrl, dims }
+const pendingNearMatches = new Map();
+async function getScamHashes(guildId) {
+    if (scamHashCache.has(guildId)) return scamHashCache.get(guildId);
+    const res = await pool.query('SELECT id, hash, label, added_by, added_at FROM scam_hashes WHERE guild_id = $1 ORDER BY id', [guildId]);
+    const hashes = res.rows.map(r => ({ id: r.id, hash: r.hash, label: r.label, addedBy: r.added_by, addedAt: r.added_at }));
+    scamHashCache.set(guildId, hashes); return hashes;
+}
+async function addScamHash(guildId, hash, label, addedBy) {
+    const res = await pool.query('INSERT INTO scam_hashes (guild_id, hash, label, added_by, added_at) VALUES ($1, $2, $3, $4, $5) RETURNING id', [guildId, hash, label, addedBy, Date.now()]);
+    const entry = { id: res.rows[0].id, hash, label, addedBy, addedAt: Date.now() };
+    const cached = scamHashCache.get(guildId) ?? []; cached.push(entry); scamHashCache.set(guildId, cached); return entry;
+}
+async function removeScamHash(guildId, id) {
+    const res = await pool.query('DELETE FROM scam_hashes WHERE guild_id = $1 AND id = $2', [guildId, id]);
+    if (res.rowCount > 0) scamHashCache.set(guildId, (scamHashCache.get(guildId) ?? []).filter(h => h.id !== id));
+    return res.rowCount > 0;
+}
+async function getImageDimensions(buffer) {
+    try { const meta = await sharp(buffer).metadata(); return { width: meta.width, height: meta.height }; } catch { return null; }
+}
+async function addGlobalScamHash(hash, label, addedBy) {
+    const res = await pool.query('INSERT INTO global_scam_hashes (hash, label, added_by, added_at) VALUES ($1, $2, $3, $4) RETURNING id', [hash, label, addedBy, Date.now()]);
+    const entry = { id: res.rows[0].id, hash, label, global: true };
+    if (globalScamHashCache !== null) globalScamHashCache.push(entry);
+    return entry;
+}
+async function removeGlobalScamHash(id) {
+    const res = await pool.query('DELETE FROM global_scam_hashes WHERE id = $1', [id]);
+    if (res.rowCount > 0 && globalScamHashCache !== null) globalScamHashCache = globalScamHashCache.filter(h => h.id !== id);
+    return res.rowCount > 0;
+}
+// Global hashes — can also be managed in DB directly:
+// INSERT INTO global_scam_hashes (hash, label, added_by, added_at) VALUES ('...', 'label', 'admin', extract(epoch from now())*1000);
+let globalScamHashCache = null;
+async function getGlobalScamHashes() {
+    if (globalScamHashCache !== null) return globalScamHashCache;
+    const res = await pool.query('SELECT id, hash, label FROM global_scam_hashes ORDER BY id');
+    globalScamHashCache = res.rows.map(r => ({ id: r.id, hash: r.hash, label: r.label, global: true })); return globalScamHashCache;
+}
+setInterval(() => { globalScamHashCache = null; }, 5 * 60 * 1000);
+async function getScamProtConfig(guildId) { const cfg = await getConfig(guildId); return { enabled: true, threshold: 10, timeoutMs: 5 * 60 * 1000, timeoutDisplay: '5m', deleteMsg: true, ...cfg.scamProt }; }
 
-    if (link.platform === 'tiktok') {
-        const cfg = OAUTH_CONFIG.tiktok;
-        if (!link.refresh_token) throw new Error('TikTok refresh token missing — re-link with /social link.');
-        const { json } = await postForm('https://open.tiktokapis.com/v2/oauth/token/', {
-            client_key: cfg.clientId, client_secret: cfg.clientSecret,
-            grant_type: 'refresh_token', refresh_token: link.refresh_token,
+// ── Spam protection ────────────────────────────────────────────────────────
+const spamTracker = new Map(), spamCooldown = new Set();
+// spamTracker gets a key for every user who posts in a spam-protected server, but only ever
+// deletes a key when that user is actually caught spamming — everyone else's entry sits there
+// forever. Spam window is capped at 60s (see /spam config), so anything older than that is
+// dead weight; sweep it out periodically instead of letting the Map grow with every unique poster.
+setInterval(() => {
+    const cutoff = Date.now() - 65_000;
+    for (const [key, entries] of spamTracker.entries()) {
+        if (!entries.length || entries[entries.length - 1].ts < cutoff) spamTracker.delete(key);
+    }
+}, 10 * 60 * 1000);
+function normalise(s) { return s.trim().toLowerCase().replace(/\s+/g, ' '); }
+function similarity(a, b) {
+    if (a === b) return 1; if (!a.length || !b.length) return 0;
+    if (a.length <= 4 && b.length <= 4 && a.split('').sort().join('') === b.split('').sort().join('')) return 0.9;
+    if (a.length < 2 || b.length < 2) return 0;
+    const bg = s => { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const k = s.slice(i, i+2); m.set(k, (m.get(k) ?? 0) + 1); } return m; };
+    const aMap = bg(a), bMap = bg(b); let ix = 0;
+    for (const [k, c] of aMap) ix += Math.min(c, bMap.get(k) ?? 0);
+    return (2 * ix) / (a.length - 1 + b.length - 1);
+}
+async function getSpamConfig(guildId) { const cfg = await getConfig(guildId); return { enabled: true, count: 5, windowMs: 10_000, timeoutMs: 10 * 60 * 1000, timeoutDisplay: '10m', deleteMsg: true, similarityThreshold: 0.7, ...cfg.spamProt }; }
+async function handleSpam(message, matchedMessages, spc) {
+    const { guild, author, channel } = message, guildId = guild.id, key = `${guildId}-${author.id}`;
+    if (spamCooldown.has(key)) return;
+    spamCooldown.add(key); setTimeout(() => spamCooldown.delete(key), 5000);
+    const botMember = guild.members.me, canDelete = spc.deleteMsg && botMember.permissionsIn(channel).has(PermissionFlagsBits.ManageMessages);
+    if (canDelete) {
+        // Skip messages that have reactions — may be pinned/community content
+        const idsToDelete = matchedMessages.filter(m => !m.hasReactions).map(m => m.msgId);
+        if (idsToDelete.length) channel.bulkDelete(idsToDelete).catch(async () => {
+            for (const id of idsToDelete) { const msg = await channel.messages.fetch(id).catch(() => null); if (msg) msg.delete().catch(() => {}); }
         });
-        if (!json?.access_token) throw new Error('TikTok token refresh failed — re-link with /social link.');
-        const expiresAt = Date.now() + (json.expires_in ? json.expires_in * 1000 : 24 * 60 * 60 * 1000);
-        await updateSocialLinkTokens(link.id, json.access_token, json.refresh_token || link.refresh_token, expiresAt);
-        return { ...link, access_token: json.access_token, refresh_token: json.refresh_token || link.refresh_token, expires_at: expiresAt };
     }
-
-    return link;
-}
-
-// ── Instagram (Meta Graph API) ─────────────────────────────────────────────
-async function fetchLatestInstagramAll(link) {
-    const fresh = await ensureFreshToken(link);
-    const { json } = await fetchJson(
-        `https://graph.instagram.com/me/media?fields=id,caption,media_type,media_product_type,media_url,permalink,timestamp&limit=10&access_token=${encodeURIComponent(fresh.access_token)}`
-    );
-    if (json?.error) throw new Error(`Instagram API: ${json.error.message}`);
-    const items = json?.data || [];
-    return items.map(m => ({
-        id: m.id,
-        url: m.permalink,
-        title: (m.caption || '').slice(0, 200),
-        author: fresh.external_username,
-        thumbnail: m.media_type === 'VIDEO' ? null : m.media_url,
-        timestamp: m.timestamp,
-        // media_product_type: FEED | REELS | STORY (STORY rarely returned — stories expire in 24h and this endpoint mostly covers feed/reels)
-        postType: m.media_product_type === 'REELS' ? 'reels' : m.media_product_type === 'STORY' ? 'stories' : 'posts',
-    }));
-}
-
-// ── TikTok ───────────────────────────────────────────────────────────────
-async function fetchLatestTikTokAll(link) {
-    const fresh = await ensureFreshToken(link);
-    const { json } = await postJson(
-        'https://open.tiktokapis.com/v2/video/list/?fields=id,title,video_description,cover_image_url,share_url,create_time',
-        { max_count: 10 },
-        { Authorization: `Bearer ${fresh.access_token}` }
-    );
-    if (json?.error?.code && json.error.code !== 'ok') throw new Error(`TikTok API: ${json.error.message || json.error.code}`);
-    const items = json?.data?.videos || [];
-    return items.map(v => ({
-        id: v.id,
-        url: v.share_url,
-        title: (v.title || v.video_description || '').slice(0, 200),
-        author: fresh.external_username,
-        thumbnail: v.cover_image_url,
-        timestamp: v.create_time ? v.create_time * 1000 : Date.now(),
-        postType: 'videos',
-    }));
-}
-
-// ── Message templating ────────────────────────────────────────────────────
-const DEFAULT_TEMPLATE = '🔔 **{author}** just posted on {platform}!\n{url}';
-// Resolves the message template for a watch + post, preferring a per-post-type
-// override (w.message_templates[post.postType]) over the watch's single
-// message_template, over the global default.
-function resolveTemplate(w, post) {
-    if (post.postType && w.message_templates && w.message_templates[post.postType]) return w.message_templates[post.postType];
-    return w.message_template || null;
-}
-function renderTemplate(template, post, platform, handle) {
-    const tmpl = template || DEFAULT_TEMPLATE;
-    return tmpl
-        .replace(/\{author\}/g, post.author || handle)
-        .replace(/\{handle\}/g, handle)
-        .replace(/\{platform\}/g, PLATFORMS[platform].label)
-        .replace(/\{title\}/g, post.title || '')
-        .replace(/\{url\}/g, post.url || '');
-}
-
-// ── Polling loop ───────────────────────────────────────────────────────────
-const PLATFORM_MIN_INTERVAL_MS = {};
-
-function shouldNotify(w, post) {
-    const types = Array.isArray(w.notify_types) && w.notify_types.length ? w.notify_types : null;
-    if (!types) return true; // no filter = all types
-    return post.postType ? types.includes(post.postType) : true;
-}
-
-// ── Post-type → button label map (used instead of a generic "View post") ───
-const POST_TYPE_BUTTON_LABEL = {
-    youtube:   { videos: 'Watch Video', shorts: 'Watch Short', live: 'Watch Live' },
-    twitter:   { posts: 'View Tweet' },
-    twitch:    { live: 'Watch Stream', vods: 'Watch VOD' },
-    kick:      { live: 'Watch Stream' },
-    instagram: { posts: 'View Post', reels: 'Watch Reel', stories: 'View Story' },
-    tiktok:    { videos: 'Watch Video' },
-};
-function buttonLabelFor(platform, post) {
-    if (post.isLive) return POST_TYPE_BUTTON_LABEL[platform]?.live || 'Watch Live';
-    return POST_TYPE_BUTTON_LABEL[platform]?.[post.postType] || 'View Post';
-}
-
-// Platforms where Discord will render a native, playable video preview if the
-// raw URL appears in the message content (not just inside a custom embed).
-const NATIVE_VIDEO_PLATFORMS = new Set(['youtube', 'tiktok']);
-
-async function sendNotification(w, post) {
-    const guild = client.guilds.cache.get(w.guild_id);
-    const channel = guild?.channels.cache.get(w.channel_id);
-    if (!channel) return;
-    const p = PLATFORMS[w.platform];
-    const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
-    let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
-    // For YouTube/TikTok, make sure the raw video URL is present on its own so Discord
-    // auto-generates a playable video embed beneath the message (not just a thumbnail).
-    const wantsNativeVideo = NATIVE_VIDEO_PLATFORMS.has(w.platform) && post.url;
-    if (wantsNativeVideo && !content.includes(post.url)) content = `${content}\n${post.url}`;
-    if (w.role_id) content = `<@&${w.role_id}> ${content}`;
-    const linkRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emojiButton)
-    );
-    if (wantsNativeVideo) {
-        // Discord's native video unfurl (from the raw URL above) already shows the title,
-        // thumbnail, and channel/author — a custom embed on top of that is redundant.
-        await channel.send({ content, components: [linkRow] }).catch(e => console.error('send notification:', e.message));
-        return;
+    let timedOut = false;
+    if (spc.timeoutMs && botMember.permissions.has(PermissionFlagsBits.ModerateMembers)) {
+        const member = guild.members.cache.get(author.id) ?? await guild.members.fetch(author.id).catch(() => null);
+        if (member && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+            timedOut = await member.timeout(spc.timeoutMs, 'Spam detection').then(() => true).catch(() => false);
+            if (timedOut) saveActiveTimeout(guildId, author.id, { guildId, userId: author.id, userTag: author.tag, reason: 'Spam detection', issuedBy: client.user.tag, issuedAt: Date.now(), expiresAt: Date.now() + spc.timeoutMs, durationDisplay: spc.timeoutDisplay });
+        }
     }
-    const embed = new EmbedBuilder()
-        .setColor(post.isLive ? '#FF0000' : p.color)
-        .setAuthor({ name: `${post.author || w.handle} • ${p.label}${typeLabel}` })
-        .setURL(post.url)
-        .setDescription(post.title || null)
-        .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
-    if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
-    if (post.thumbnail) embed.setImage(post.thumbnail);
-    await channel.send({ content, embeds: [embed], components: [linkRow] }).catch(e => console.error('send notification:', e.message));
+    const cfg = await getConfig(guildId);
+    const E2 = (c, t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
+    channel.send({ embeds: [E2('#ff6600','Spam Detected').setDescription(`${author}'s repeated messages were removed.`).addFields({ name: 'Messages Removed', value: `${matchedMessages.length}`, inline: true }, ...(timedOut ? [{ name: 'Consequence', value: `Timed out for ${spc.timeoutDisplay}`, inline: true }] : []))] }).catch(() => {});
+    if (cfg.warnDm !== false) author.send({ embeds: [E2('#ff6600','Your messages were removed').setDescription(`You were detected as spamming in **${guild.name}**.`).addFields(...(timedOut ? [{ name: 'Consequence', value: `Timed out for ${spc.timeoutDisplay}`, inline: true }] : [])).setFooter({ text: 'If you believe this is a mistake, contact a moderator' })] }).catch(() => {});
+    logMod(guild, guildId, E2('#ff6600','Spam Auto-Removed').addFields({ name: 'User', value: `${author} (${author.tag})`, inline: true }, { name: 'Channel', value: `${channel}`, inline: true }, { name: 'Messages Removed', value: `${matchedMessages.length}`, inline: true }, ...(timedOut ? [{ name: 'Timeout', value: spc.timeoutDisplay, inline: true }] : []), { name: 'Content', value: matchedMessages[0]?.content?.slice(0, 200) || '(empty)' }));
+    addHistory(guildId, author.id, { guildId, userId: author.id, userTag: author.tag, type: 'spam_remove', reason: `Spam: ${matchedMessages.length}x`, issuedBy: client.user.tag, issuedAt: Date.now() });
 }
 
-let pollInProgress = false;
-async function pollAll() {
-    if (pollInProgress) return;
-    pollInProgress = true;
+// ── Warning timers ─────────────────────────────────────────────────────────
+const warningTimers = new Map(), pendingUnwarns = new Map(), banTimers = new Map();
+const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000;
+async function handleWarningExpiry(key, guildId, userId, roleId, channelId) {
+    const w = activeWarnings.get(key);
     try {
-        const watches = await getAllWatches();
-        for (const w of watches) {
-            if (!w.active) continue;
-            const minInterval = PLATFORM_MIN_INTERVAL_MS[w.platform];
-            if (minInterval && w.last_checked && (Date.now() - w.last_checked) < minInterval) continue;
-            try {
-                const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
-
-                if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'instagram' || w.platform === 'tiktok') {
-                    // These platforms return multiple posts/post-types at once per check
-                    let posts;
-                    if (w.platform === 'twitch') {
-                        posts = await fetchLatestTwitchAll(w.handle);
-                    } else if (w.platform === 'kick') {
-                        posts = await fetchLatestKickAll(w.handle);
-                    } else {
-                        if (!w.social_link_id) { await touchLastChecked(w.id); continue; } // not linked yet — nothing to poll
-                        const link = await getSocialLinkById(w.social_link_id);
-                        if (!link) { await touchLastChecked(w.id); continue; } // link was removed
-                        posts = w.platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
-                    }
-                    let newSeenIds = [...seenIds];
-                    let updated = false;
-                    for (const post of posts) {
-                        if (w.last_post_id === null) continue; // first check — skip all
-                        if (newSeenIds.includes(post.id)) continue;
-                        if (!shouldNotify(w, post)) { newSeenIds = [...new Set([post.id, ...newSeenIds])].slice(0, 20); updated = true; continue; }
-                        newSeenIds = [...new Set([post.id, ...newSeenIds])].slice(0, 20);
-                        updated = true;
-                        await sendNotification(w, post);
-                    }
-                    if (w.last_post_id === null && posts.length) {
-                        // Seed baseline from first check
-                        await updateLastPost(w.id, posts[0].id, posts.map(p => p.id));
-                    } else if (updated) {
-                        await updateLastPost(w.id, newSeenIds[0], newSeenIds);
-                    } else {
-                        await touchLastChecked(w.id);
-                    }
-                } else {
-                    const post = await fetchLatestPost(w.platform, w.handle);
-                    if (!post || !post.id) { await touchLastChecked(w.id); continue; }
-                    if (w.last_post_id === null) {
-                        await updateLastPost(w.id, post.id, seenIds);
-                        continue;
-                    }
-                    if (seenIds.includes(post.id)) { await touchLastChecked(w.id); continue; }
-                    await updateLastPost(w.id, post.id, seenIds);
-                    if (!shouldNotify(w, post)) continue;
-                    await sendNotification(w, post);
-                }
-            } catch (e) {
-                if (/HTTP 429/.test(e.message)) {
-                    console.warn(`poll ${w.platform}/${w.handle}: rate-limited (429), retrying next cycle`);
-                } else {
-                    console.error(`poll ${w.platform}/${w.handle}:`, e.message);
-                }
-                await touchLastChecked(w.id).catch(() => {});
-            }
-            // Stagger with jitter to avoid hammering platforms all at once
-            const jitter = 1000 + Math.random() * 1000;
-            await new Promise(r => setTimeout(r, jitter));
+        const guild = client.guilds.cache.get(guildId); if (!guild) return;
+        const member = await guild.members.fetch(userId).catch(() => null), role = guild.roles.cache.get(roleId);
+        if (member && role && member.roles.cache.has(roleId)) {
+            await member.roles.remove(role);
+            member.user.send({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Warning Expired').setDescription(`Your warning in **${guild.name}** has expired and the role has been removed.`).addFields({ name: 'Warning Level', value: `${w?.level ?? 'Unknown'}`, inline: true }, { name: 'Role Removed', value: role.name, inline: true }).setFooter({ text: 'You no longer carry this warning role' }).setTimestamp()] }).catch(() => {});
+            const ch = guild.channels.cache.get(channelId);
+            if (ch) ch.send({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Warning Expired').setDescription(`<@${userId}>'s warning has expired and the role has been removed.`).setTimestamp()] });
         }
-    } finally {
-        pollInProgress = false;
+    } catch (e) {
+        console.error(`Failed to remove role: ${e}`);
+        try { const ch = client.guilds.cache.get(guildId)?.channels.cache.get(channelId); if (ch) ch.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Warning Removal Failed').setDescription(`Could not remove role from <@${userId}>. Check bot permissions.`).setTimestamp()] }); } catch {}
     }
+    if (w) addHistory(guildId, userId, { ...w, endedAt: Date.now(), endReason: 'expired' });
+    warningTimers.delete(key); deleteWarning(key);
+}
+// setTimeout's delay is a 32-bit signed int (~24.8 days max). For longer delays, chain timeouts recursively.
+const MAX_TIMEOUT_DELAY = 2147483647;
+
+function scheduleWarningRemoval(key, guildId, userId, roleId, expiresAt, channelId) {
+    const t = expiresAt - Date.now();
+    if (t <= 0) return handleWarningExpiry(key, guildId, userId, roleId, channelId);
+    const schedule = (delay) => {
+        if (delay <= MAX_TIMEOUT_DELAY) {
+            warningTimers.set(key, setTimeout(() => handleWarningExpiry(key, guildId, userId, roleId, channelId), delay));
+        } else {
+            warningTimers.set(key, setTimeout(() => schedule(delay - MAX_TIMEOUT_DELAY), MAX_TIMEOUT_DELAY));
+        }
+    };
+    schedule(t);
+}
+function scheduleBanExpiry(guildId, userId, userTag, expiresAt, reason) {
+    const t = expiresAt - Date.now(); if (t <= 0) return;
+    const key = `${guildId}-${userId}`;
+    const run = async () => {
+        banTimers.delete(key);
+        try {
+            const guild = client.guilds.cache.get(guildId); if (!guild) return;
+            const ban = await guild.bans.fetch(userId).catch(() => null); if (!ban) return;
+            await guild.members.unban(userId, 'Timed ban expired');
+            addHistory(guildId, userId, { guildId, userId, userTag, type: 'unban', reason: 'Timed ban expired', issuedBy: client.user.tag, issuedAt: Date.now() });
+            logMod(guild, guildId, new EmbedBuilder().setColor('#00ff00').setTitle('Timed Ban Expired').addFields({ name: 'User', value: `${userTag} (${userId})`, inline: true }, { name: 'Original Reason', value: reason }).setTimestamp());
+        } catch (e) { console.error('Ban expiry failed:', e.message); }
+    };
+    const schedule = (delay) => {
+        if (delay <= MAX_TIMEOUT_DELAY) banTimers.set(key, setTimeout(run, delay));
+        else banTimers.set(key, setTimeout(() => schedule(delay - MAX_TIMEOUT_DELAY), MAX_TIMEOUT_DELAY));
+    };
+    schedule(t);
+}
+async function applyWarning(guild, member, user, guildId, level, reason, channelId, issuedByTag) {
+    const cfg = await getConfig(guildId), lc = cfg.levels[level], role = guild.roles.cache.get(lc?.roleId);
+    if (!lc || !role) return { error: `Level ${level} config or role not found.` };
+    if (role.position >= guild.members.me.roles.highest.position) return { error: `Role hierarchy: my role must be above ${role.name}.` };
+    await member.roles.add(role);
+    if (cfg.warnDm !== false) user.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ You Received a Warning').setDescription(`You have been warned in **${guild.name}**.`).addFields({ name: 'Warning Level', value: `${level}`, inline: true }, { name: 'Duration', value: lc.durationDisplay || 'Unknown', inline: true }, { name: 'Reason', value: reason }).setFooter({ text: `Use /mywarnings in ${guild.name} to check when this warning expires` }).setTimestamp()] }).catch(() => {});
+    const base = { guildId, userId: user.id, userTag: user.tag, roleId: role.id, roleName: role.name, level, reason, issuedBy: issuedByTag, issuedAt: Date.now() };
+    const key = `${guildId}-${user.id}-${level}-${Date.now()}`;
+    if (!lc.isForever) { const expiresAt = Date.now() + lc.durationMs; saveWarning(key, { ...base, expiresAt, channelId, isForever: false }); scheduleWarningRemoval(key, guildId, user.id, role.id, expiresAt, channelId); }
+    else saveWarning(key, { ...base, expiresAt: null, channelId, isForever: true });
+    return { success: true, role, config: lc };
+}
+async function checkEscalation(guild, member, user, guildId, level, channelId, issuedByTag) {
+    const cfg = await getConfig(guildId), esc = cfg.escalation ?? {}, cap = esc.cap, nextLevel = level + 1;
+    if (cap != null && nextLevel > cap) return { atCap: true, cap };
+    const count = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === user.id && w.level === level).length;
+    const toCfg = esc.timeouts?.[nextLevel];
+    if (toCfg?.threshold != null) {
+        if (count < toCfg.threshold) return { counted: true, count, threshold: toCfg.threshold };
+        if (!cfg.levels[nextLevel]) return { noNextLevel: true, nextLevel };
+        const r = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
+        if (r.error) return { escalationError: r.error };
+        const timeoutOk = await member.timeout(toCfg.durationMs, `Auto-escalated to Level ${nextLevel}`).then(() => true).catch(() => false);
+        if (timeoutOk) saveActiveTimeout(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, reason: `Auto-escalated to Level ${nextLevel}`, issuedBy: issuedByTag, issuedAt: Date.now(), expiresAt: Date.now() + toCfg.durationMs, durationDisplay: toCfg.durationDisplay });
+        user.send({ embeds: [new EmbedBuilder().setColor('#ff6600').setTitle('⚠️ You Have Been Timed Out').setDescription(`You were auto-timed-out in **${guild.name}** upon reaching Warning Level ${nextLevel}.`).addFields({ name: 'Timeout Duration', value: toCfg.durationDisplay, inline: true }).setTimestamp()] }).catch(() => {});
+        return { escalated: true, nextLevel, role: r.role, config: r.config, hitCap: cap != null && nextLevel === cap, timedOut: true, timeoutDisplay: toCfg.durationDisplay };
+    }
+    const threshold = esc.thresholds?.[level]; if (!threshold) return null;
+    if (count < threshold) return { counted: true, count, threshold };
+    if (!cfg.levels[nextLevel]) return { noNextLevel: true, nextLevel };
+    const r = await applyWarning(guild, member, user, guildId, nextLevel, `Auto-escalated from Level ${level}`, channelId, issuedByTag);
+    if (r.error) return { escalationError: r.error };
+    return { escalated: true, nextLevel, role: r.role, config: r.config, hitCap: cap != null && nextLevel === cap, timedOut: false };
 }
 
-// ── Embeds / UI builders ──────────────────────────────────────────────────
-const refreshBtn = (id) => new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary);
+// ── Keep-alive ─────────────────────────────────────────────────────────────
+function keepAlive() {
+    const ping = () => { const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`; fetch(`${url}/health`).then(() => console.log('🏓 Keep-alive ping')).catch(() => {}); };
+    setTimeout(ping, 5000); setInterval(ping, 14 * 60 * 1000);
+}
 
-async function buildWatchListEmbed(guildId) {
-    const watches = await getWatches(guildId);
-    if (!watches.length) {
-        return { embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setDescription('No accounts are being tracked yet. Use `/social add` to add one.')], components: [] };
+// ── Warnlist / Help ────────────────────────────────────────────────────────
+function activeTimeoutsField(guildId) {
+    const now = Date.now();
+    const list = [...activeTimeouts.values()].filter(t => t.guildId === guildId && t.expiresAt > now);
+    if (!list.length) return null;
+    const shown = list.slice(0, 15).map(t => `• ${t.userTag} — ${t.durationDisplay ? `${t.durationDisplay}, ` : ''}expires <t:${Math.floor(t.expiresAt / 1000)}:R>`).join('\n');
+    return { name: `⏱️ Active Timeouts (${list.length})`, value: list.length > 15 ? `${shown}\n*…and ${list.length - 15} more*` : shown };
+}
+function buildWarnlistEmbed(guildId, page) {
+    const all = [...activeWarnings.values()].filter(w => w.guildId === guildId), byUser = {};
+    for (const w of all) { byUser[w.userId] ??= []; byUser[w.userId].push(w); }
+    const userIds = Object.keys(byUser), total = Math.max(1, Math.ceil(userIds.length / 10));
+    page = Math.max(0, Math.min(page, total - 1));
+    const embed = new EmbedBuilder().setColor('#FFA500').setTitle(`Active Warnings (${all.length})`).setTimestamp().setFooter({ text: total > 1 ? `Page ${page + 1} of ${total}` : `${userIds.length} user(s) warned` });
+    const toField = activeTimeoutsField(guildId);
+    if (!userIds.length) { embed.setDescription('No active warnings in this server.'); if (toField) embed.addFields(toField); return { embed, totalPages: total, page }; }
+    for (const uid of userIds.slice(page * 10, (page + 1) * 10)) {
+        const w0 = byUser[uid][0];
+        embed.addFields({ name: w0.userTag || `<@${uid}>`, value: byUser[uid].map(w => `• Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') });
     }
-    const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setTimestamp()
-        .setDescription(`Tracking **${watches.length}** account${watches.length > 1 ? 's' : ''}.`);
-    for (const w of watches.slice(0, 25)) {
-        const p = PLATFORMS[w.platform];
-        const lines = [
-            `Posts to <#${w.channel_id}>`,
-            `ID: \`${w.id}\``,
-            w.message_template ? `Custom message: \`${w.message_template.slice(0, 80)}${w.message_template.length > 80 ? '…' : ''}\`` : 'Using default message',
-        ];
-        if (w.role_id) lines.push(`Ping: <@&${w.role_id}>`);
-        if (!w.active) lines.push('⏸️ Paused');
-        if (p.unavailable) {
-            // "Greyed out" look — embeds can't apply literal text color, so we use the
-            // smaller/dimmer subtext style plus a clear label instead.
-            lines.push(`-# ⚠️ ${p.label} is currently unavailable — see \`/help\` → Info for why.`);
-            embed.addFields({
-                name: `${p.emojiTag} ${p.label} — ${w.handle} *(unavailable)*${w.active ? '' : ' (paused)'}`,
-                value: lines.join('\n'),
-                inline: false,
-            });
-            continue;
-        }
-        embed.addFields({
-            name: `${p.emojiTag} ${p.label} — ${w.handle}${w.active ? '' : ' (paused)'}`,
-            value: lines.join('\n'),
-            inline: false,
-        });
-    }
-    if (watches.length > 25) embed.setFooter({ text: `Showing first 25 of ${watches.length}` });
-    const components = [
-        new ActionRowBuilder().addComponents(
-            new StringSelectMenuBuilder().setCustomId(`sociallist_manage_${guildId}`).setPlaceholder('Manage a watch…')
-                .addOptions(watches.slice(0, 25).map(w => ({
-                    label: `${PLATFORMS[w.platform].label}${PLATFORMS[w.platform]?.unavailable ? ' (unavailable)' : ''} — ${w.handle}`.slice(0, 100),
-                    value: `${w.id}`,
-                })))
-        ),
-        new ActionRowBuilder().addComponents(refreshBtn(`sociallist_refresh_${guildId}`)),
-    ];
+    if (page === 0 && toField) embed.addFields(toField);
+    return { embed, totalPages: total, page };
+}
+function warnlistRow(page, total, guildId) {
+    const refresh = new ButtonBuilder().setCustomId(`wl_${page}_${guildId}`).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary);
+    if (total <= 1) return [new ActionRowBuilder().addComponents(refresh)];
+    return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`wl_${page - 1}_${guildId}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(page === 0), refresh, new ButtonBuilder().setCustomId(`wl_${page + 1}_${guildId}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(page === total - 1))];
+}
+const refreshBtn = (id) => new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary));
+const customIdMatches = (id, prefixes) => prefixes.some(p => id.startsWith(p));
+
+async function buildGlobalHashesEmbed() {
+    const hashes = await getGlobalScamHashes();
+    if (!hashes.length) return { embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('Global Scam Image Registry').setDescription('No global scam images registered.')], components: [] };
+    const embed = new EmbedBuilder().setColor('#ff0000').setTitle('Global Scam Image Registry').setTimestamp().setDescription(`**${hashes.length}** image${hashes.length>1?'s':''} registered — applies to **all servers**, always deletes + times out (10 Hamming distance threshold).`);
+    for (const h of hashes.slice(0,20)) embed.addFields({ name: `ID ${h.id} — ${h.label}`, value: `Hash: \`${h.hash}\`` });
+    if (hashes.length > 20) embed.setFooter({ text: `Showing first 20 of ${hashes.length}` });
+    const components = [refreshBtn('globalhashes_refresh')];
+    components.unshift(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('globalhashes_remove').setPlaceholder('Remove a global scam image…').addOptions(hashes.slice(0,25).map(h => ({ label: `ID ${h.id} — ${h.label}`.slice(0,100), value: `${h.id}` })))));
     return { embeds: [embed], components };
 }
 
-// True when a watch's per-type messages were auto-migrated from the old
-// single message_template and haven't been reviewed/edited since.
-function isLegacyMessageFormat(w) {
-    return !!w.legacy_migrated;
+async function buildScamListEmbed(guildId) {
+    const hashes = await getScamHashes(guildId), spc = await getScamProtConfig(guildId), meGuild = client.guilds.cache.get(guildId), warnField = meGuild ? mentionEveryoneWarningField(meGuild) : null;
+    if (!hashes.length) { const emptyEmbed = new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Registry').setDescription('No scam images registered. Use `/scam add` to add one.'); if (warnField) emptyEmbed.addFields(warnField); return { embeds: [emptyEmbed], components: [] }; }
+    const embed = new EmbedBuilder().setColor('#ff0000').setTitle('Scam Image Registry').setTimestamp().setDescription(`**${hashes.length}** image${hashes.length>1?'s':''} registered — detection **${spc.enabled?'enabled':'disabled'}**`).addFields({ name: 'Threshold', value: `${spc.threshold} (Hamming distance)`, inline: true }, { name: 'On Detection', value: [spc.deleteMsg?'Delete message':null, spc.timeoutMs?`Timeout ${spc.timeoutDisplay}`:null].filter(Boolean).join(' + ')||'No action', inline: true });
+    if (warnField) embed.addFields(warnField);
+    for (const h of hashes.slice(0,20)) embed.addFields({ name: `ID ${h.id} — ${h.label}`, value: `Hash: \`${h.hash}\` · Added by ${h.addedBy} <t:${Math.floor(h.addedAt/1000)}:R>` });
+    if (hashes.length > 20) embed.setFooter({ text: `Showing first 20 of ${hashes.length}` });
+    const components = [refreshBtn(`scamlist_refresh_${guildId}`)];
+    components.unshift(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`scamlist_remove_${guildId}`).setPlaceholder('Remove a scam image…').addOptions(hashes.slice(0,25).map(h => ({ label: `ID ${h.id} — ${h.label}`.slice(0,100), value: `${h.id}` })))));
+    return { embeds: [embed], components };
 }
 
-// Shared modal builder used both from the manage view's "Per-Type Messages"
-// button and from the new guided /social add flow, so both stay in sync.
-function buildPerTypeMessageModal(w) {
-    const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-    const templates = w.message_templates || {};
-    const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}`).setTitle(`Per-Type Messages — ${w.handle}`.slice(0, 45));
-    // Discord modals support at most 5 text inputs — every platform we support has ≤3 notify types, so this always fits.
-    modal.addComponents(
-        ...types.slice(0, 5).map(t => new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId(`tmpl_${t.id}`).setLabel(`Message for ${t.label} (blank = default)`)
-                .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)
-                .setValue(templates[t.id] || '')
-                .setPlaceholder('{author} just posted on {platform}!\n{url}')
-        ))
-    );
-    return modal;
+async function buildLogChannelEmbed(guildId) {
+    const cfg = await getConfig(guildId);
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Mod-Log Channel').setTimestamp()
+        .setDescription(cfg.logChannelId ? `Mod actions are currently logged to <#${cfg.logChannelId}>.` : 'No mod-log channel is currently set.');
+    const row1 = new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId(`logchannel_select_${guildId}`).setPlaceholder('Select a channel…').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setMinValues(1).setMaxValues(1));
+    const components = [row1];
+    if (cfg.logChannelId) components.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`removelogchannel_${guildId}`).setLabel('Remove Log Channel').setStyle(ButtonStyle.Danger)));
+    return { embeds: [embed], components };
 }
 
-function buildManageView(w) {
-    const p = PLATFORMS[w.platform];
-    const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-    const templates = w.message_templates || {};
-    const perTypeLines = types.filter(t => templates[t.id]).map(t => `**${t.label}:** \`${templates[t.id].slice(0, 80)}\``);
-    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emojiTag} ${w.handle}`).setTimestamp()
-        .addFields(
-            { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
-            { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },
-            { name: 'Ping role', value: w.role_id ? `<@&${w.role_id}>` : 'None', inline: true },
-            { name: 'Notify types', value: (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : 'All types', inline: true },
-            { name: 'Default message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
-        );
-    if (perTypeLines.length) embed.addFields({ name: 'Per-type message overrides', value: perTypeLines.join('\n') });
-    if (p.unavailable) {
-        embed.addFields({ name: '⚠️ Currently unavailable', value: `${p.label} isn't working right now — see \`/help\` → Info for why. Notifications won't fire until this is resolved, but everything here stays saved.` });
+async function buildNoteViewEmbed(guildId, user) {
+    const notes = await getNotes(guildId, user.id);
+    if (!notes.length) return { embeds: [new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`).setDescription('No notes found for this user.')], components: [] };
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`).setTimestamp().setDescription(`${notes.length} note${notes.length>1?'s':''} on record.`);
+    const shown = notes.slice(-10);
+    for (const n of shown) embed.addFields({ name: `ID: ${n.id} — <t:${Math.floor(n.addedAt/1000)}:d> — ${n.addedBy}`, value: n.text });
+    if (notes.length > 10) embed.setFooter({ text: `Showing last 10 of ${notes.length} notes` });
+    const components = [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`noteview_remove_${guildId}_${user.id}`).setPlaceholder('Remove a note…').addOptions(shown.slice(0,25).map(n => ({ label: `ID ${n.id} — ${n.text.slice(0,80)}`.slice(0,100), value: `${n.id}` }))))];
+    return { embeds: [embed], components };
+}
+
+async function buildNoteListEmbed(guildId, user) {
+    const notes = await getNotes(guildId, user.id);
+    if (!notes.length) return new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`).setDescription('No notes found for this user.');
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle(`Notes — ${user.tag}`).setTimestamp().setDescription(`${notes.length} note${notes.length>1?'s':''} on record.`);
+    const shown = notes.slice(-25);
+    for (const n of shown) embed.addFields({ name: `ID: ${n.id} — <t:${Math.floor(n.addedAt/1000)}:d> — ${n.addedBy}`, value: n.text });
+    if (notes.length > 25) embed.setFooter({ text: `Showing last 25 of ${notes.length} notes` });
+    return embed;
+}
+
+async function buildConfigViewEmbed(guildId) {
+    const cfg = await getConfig(guildId);
+    if (!cfg.levels || !Object.keys(cfg.levels).length) return { embeds: [new EmbedBuilder().setColor('#0099ff').setTitle('Warning Configuration').setDescription('📋 No warning levels configured yet.')], components: [] };
+    const embed = new EmbedBuilder().setColor('#0099ff').setTitle('Warning Configuration').setTimestamp(), normalLevels = {}, timeoutLevels = {};
+    for (const [lvl, d] of Object.entries(cfg.levels)) { if (d.isTimeoutLevel) timeoutLevels[lvl] = d; else normalLevels[lvl] = d; }
+    if (Object.keys(normalLevels).length) for (const [lvl, d] of Object.entries(normalLevels)) embed.addFields({ name: `Level ${lvl}`, value: `Role: <@&${d.roleId}>\nDuration: ${d.durationDisplay}`, inline: true });
+    if (Object.keys(timeoutLevels).length) embed.addFields({ name: '⏱️ Timeout Levels (Auto-Escalation)', value: Object.entries(timeoutLevels).sort(([a],[b])=>a-b).map(([lvl,t])=>`• **Level ${lvl}** — Timeout: **${t.timeoutDisplay}**`).join('\n'), inline: false });
+    embed.addFields({ name: 'Notifications', value: cfg.warnDm === false ? 'Disabled' : 'Enabled', inline: true });
+    const components = [refreshBtn(`configview_refresh_${guildId}`)];
+    const levelKeys = Object.keys(cfg.levels);
+    if (levelKeys.length) components.unshift(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`configview_removelevel_${guildId}`).setPlaceholder('Remove a warning level…').addOptions(levelKeys.slice(0,25).map(lvl => ({ label: `Level ${lvl}${cfg.levels[lvl].roleName ? ` — ${cfg.levels[lvl].roleName}` : ''}`, value: lvl })))));
+    return { embeds: [embed], components };
+}
+
+async function buildEscalationViewEmbed(guildId) {
+    const cfg = await getConfig(guildId), esc = cfg.escalation ?? {}, th = esc.thresholds ?? {}, to = esc.timeouts ?? {};
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Escalation Configuration').setTimestamp();
+    if (!Object.keys(th).length && !esc.cap && !Object.keys(to).length) embed.setDescription('No escalation rules configured. Use `/escalation set` to add thresholds.');
+    else {
+        if (Object.keys(th).length) embed.addFields({ name: 'Thresholds', value: Object.entries(th).sort(([a],[b])=>a-b).map(([l,t])=>`• **${t}x** Level ${l} → auto Level ${parseInt(l)+1}`).join('\n') });
+        if (Object.keys(to).length) embed.addFields({ name: 'Timeouts on Escalation', value: Object.entries(to).sort(([a],[b])=>a-b).map(([l,t])=>`• ${t.threshold}x Level ${parseInt(l)-1} → auto Level ${l} + **${t.durationDisplay}** timeout`).join('\n') });
+        embed.addFields({ name: 'Level Cap', value: esc.cap ? `Level **${esc.cap}**` : 'None' });
     }
-    if (isLegacyMessageFormat(w)) {
-        embed.addFields({ name: '⚠️ Outdated message', value: 'This message was auto-migrated from the old single-message format and hasn\'t been reviewed. It was written as one generic message and may not read well for every post type — check each type below (**Per-Type Messages**) and edit as needed.' });
-    }
-    const row1 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`socialmanage_msg_${w.id}`).setLabel('Edit Message').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(`socialmanage_role_${w.id}`).setLabel('Set/Clear Ping Role').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(`socialmanage_types_${w.id}`).setLabel('Edit Types').setStyle(ButtonStyle.Secondary),
-        ...(types.length > 1 ? [new ButtonBuilder().setCustomId(`socialpertype_open_${w.id}`).setLabel('Per-Type Messages').setStyle(ButtonStyle.Secondary)] : []),
-    );
-    const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`socialmanage_toggle_${w.id}`).setLabel(w.active ? 'Pause' : 'Resume').setStyle(w.active ? ButtonStyle.Secondary : ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`socialmanage_remove_${w.id}`).setLabel('Remove').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`socialmanage_back_${w.guild_id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
-    );
-    return { embeds: [embed], components: [row1, row2] };
+    const components = [];
+    const thKeys = Object.keys(th), toKeys = Object.keys(to);
+    if (thKeys.length) components.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`escview_removethreshold_${guildId}`).setPlaceholder('Remove a threshold…').addOptions(thKeys.slice(0,25).map(l => ({ label: `Level ${l} (${th[l]}x → Level ${parseInt(l)+1})`, value: l })))));
+    if (toKeys.length) components.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`escview_removetimeout_${guildId}`).setPlaceholder('Remove a timeout escalation…').addOptions(toKeys.slice(0,25).map(l => ({ label: `Level ${l} (${to[l].threshold}x → +${to[l].durationDisplay} timeout)`, value: l })))));
+    const lastRow = [refreshBtn(`escalationview_refresh_${guildId}`).components[0]];
+    if (esc.cap) lastRow.push(new ButtonBuilder().setCustomId(`escview_removecap_${guildId}`).setLabel('Remove Level Cap').setStyle(ButtonStyle.Danger));
+    components.push(new ActionRowBuilder().addComponents(...lastRow));
+    return { embeds: [embed], components };
 }
 
-// ── Help (tabbed) ────────────────────────────────────────────────────────
-const HELP_CATEGORIES = [
-    {
-        id: 'general', emoji: '🏠', label: 'General',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — General')
-            .setDescription('Get notified in a channel whenever a tracked account posts new content or goes live.')
-            .addFields(
-                { name: '/help', value: 'Shows this menu.' },
-                { name: '/invite', value: 'Get a link to invite this bot to another server.' },
-            ),
-    },
-    {
-        id: 'tracking', emoji: '📡', label: 'Tracking',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Tracking')
-            .addFields(
-                { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel — you\'ll then choose notification types and set the message. Instagram/TikTok accounts must be linked first (see the Linking tab).' },
-                { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
-                { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
-            ),
-    },
-    {
-        id: 'linking', emoji: '🔗', label: 'Linking',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Linking')
-            .setDescription('Instagram and TikTok only expose their APIs through per-account OAuth consent — an account has to explicitly authorize this bot before it can be tracked.')
-            .addFields(
-                { name: '/social link', value: 'Connect an Instagram or TikTok account via OAuth so it can be tracked. Sends a link the account owner clicks and logs in with.' },
-                { name: '/social links', value: 'View accounts already linked via OAuth in this server.' },
-            ),
-    },
-    {
-        id: 'settings', emoji: '⚙️', label: 'Settings',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Settings')
-            .addFields(
-                { name: '/social access', value: 'Set which role (besides admins) can manage social notifications in this server.' },
-            ),
-    },
-    {
-        id: 'info', emoji: 'ℹ️', label: 'Info',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Info')
-            .addFields(
-                { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') },
-                { name: '⚠️ Twitter/X unavailable', value: 'This bot reads X posts through public Nitter mirrors. X Corp sent legal cease-and-desist letters to the Nitter project in August 2026, and every public mirror has since gone offline — so Twitter/X tracking currently doesn\'t work. Other platforms are unaffected, and this will resume automatically if a mirror ever comes back.' },
-                { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
-                { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
-                { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
-                { name: 'Links', value: `[GitHub](https://github.com/DaniBottoni/Notifyer/tree/main) • [top.gg](https://top.gg/bot/1515779889737896006)` },
-            ),
-    },
-    {
-        id: 'admin', emoji: '🔧', label: 'Admin',
-        build: () => new EmbedBuilder().setColor('#ED4245').setTitle('🔔 Notifyer Beta — Admin')
-            .setDescription('These commands are gated to the bot owner (`BOT_OWNER_ID`) and mainly exist for debugging this beta build.')
-            .addFields(
-                { name: '/social debug', value: 'Show a watch\'s live fetch result vs its stored baseline, to check whether it\'d fire a notification.' },
-                { name: '/social oauthdebug', value: 'Show the exact OAuth config (client ID, redirect URI, scope, full authorize URL) currently being sent for a platform.' },
-                { name: '/killbot', value: 'Suspend the Render service to stop usage/billing. Falls back to crashing the process if RENDER_API_KEY/RENDER_SERVICE_ID aren\'t set.' },
-            ),
-    },
-];
-function buildHelpView(activeId) {
-    const active = HELP_CATEGORIES.find(c => c.id === activeId) || HELP_CATEGORIES[0];
-    const buttons = HELP_CATEGORIES.map(c => new ButtonBuilder()
-        .setCustomId(`help_cat_${c.id}`)
-        .setLabel(c.label)
-        .setEmoji(c.emoji)
-        .setStyle(c.id === active.id ? ButtonStyle.Primary : ButtonStyle.Secondary));
-    // Chunk into rows of up to 5 buttons (Discord's per-row limit)
-    const rows = [];
-    for (let i = 0; i < buttons.length; i += 5) rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
-    return { embeds: [active.build()], components: rows };
+const helpPages = {
+    help_warn: new EmbedBuilder().setColor('#ff0000').setTitle('Warning Commands').addFields({ name: '/warning give', value: 'Issue a warning at a configured level. Requires a reason. Triggers escalation checks automatically.' }, { name: '/warning remove', value: 'Remove a warning from a user via a dropdown and confirm prompt.' }, { name: '/warning list', value: 'View all active warnings in the server, paginated 10 users per page.' }, { name: '/warning history', value: 'View the last 10 warning history entries for a specific user.' }, { name: '/mywarnings', value: 'Check your own active warnings and how long is left on each one.' }, { name: '/timeout give', value: 'Apply a Discord native timeout. Duration: `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }, { name: '/userinfo', value: "View a user's full moderation profile — warnings, kicks, bans, notes, and more." }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_mod: new EmbedBuilder().setColor('#ff6600').setTitle('Moderation Commands').addFields({ name: '/kick', value: 'Kick a user. Sends a DM, logs to history, posts to mod-log.' }, { name: '/ban give', value: 'Ban a user. Optional timed ban with auto-unban. Optionally delete recent messages (0–7 days).' }, { name: '/ban remove', value: 'Shows an embed listing all banned users — select one and enter a reason to unban them.' }, { name: '/timeout give / remove', value: 'Apply or remove a Discord native timeout. Duration: `m:s`, `h:m:s`, or `d:h:m:s` (max 28 days).' }, { name: '/userinfo', value: 'View account info, roles, active warnings, warn counts per level, kicks, bans, and notes for any user.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_config: new EmbedBuilder().setColor('#00ff00').setTitle('Config Commands').addFields({ name: '/config set', value: 'Set up a warning level: assign a role and a duration (`m:s`, `h:m:s`, `d:h:m:s`, or `forever`).' }, { name: '/config view', value: 'View all configured warning levels, roles, durations, and notification status. Use the dropdown here to remove a level.' }, { name: '/config access', value: 'Choose which role can use moderation commands. Admins always have access.' }, { name: '/config logchannel', value: 'Opens a dropdown to select the mod-log channel where every mod action is automatically logged, with a button to remove it.' }, { name: '/config notifications', value: "Toggle whether users are DM'd when they receive a warning. Enabled by default." }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_escalation: new EmbedBuilder().setColor('#ff9900').setTitle('Escalation Commands').addFields({ name: '/escalation set', value: 'Set a threshold: N warnings at level X → auto-escalate to level X+1.' }, { name: '/escalation cap', value: 'Set the maximum escalation level.' }, { name: '/escalation timeout', value: 'N warnings at level X → auto level X+1 + a timeout.' }, { name: '/escalation view', value: 'View all active escalation rules. Use the dropdowns/buttons here to remove thresholds, timeouts, or the level cap.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_notes: new EmbedBuilder().setColor('#9b59b6').setTitle('Note Commands').addFields({ name: '/note add', value: 'Add a private mod note to a user. Not visible to the user.' }, { name: '/note list', value: 'List all notes on a user, with timestamps and which mod added them.' }, { name: '/note remove', value: 'View all notes on a user, with timestamps and which mod added them. Use the dropdown here to remove a note.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_storage: new EmbedBuilder().setColor('#5865F2').setTitle('Database Storage').setDescription('Police Bot uses PostgreSQL to store all data persistently. Nothing is lost on restarts.').addFields({ name: 'warnings', value: 'Active warnings with expiry timestamps, user IDs, role IDs, and channel IDs.' }, { name: 'history', value: 'Full mod history per server — every warn, kick, and ban.' }, { name: 'configs', value: 'Per-server config: warning levels, roles, durations, escalation rules, access role.' }, { name: 'notes', value: 'Private mod notes per user.' }, { name: 'scam_hashes / global_scam_hashes', value: 'Registered scam image hashes, per-guild and global.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
+    help_features: new EmbedBuilder().setColor('#9b59b6').setTitle('Other Features').addFields({ name: 'Scam protection', value: 'Upload known scam images — any similar image posted is auto-removed.' }, { name: 'Spam protection', value: 'Detects repeated/similar messages and auto-removes with configurable timeouts.' }, { name: 'Rejoin protection', value: 'If a warned user leaves and rejoins, their warning roles are reapplied.' }, { name: 'Timer restoration', value: 'On bot restart, all active warning timers are restored from the database.' }, { name: '/invite', value: 'Get a pre-configured invite link with all required permissions.' }).setFooter({ text: 'Use the buttons to explore other categories' }),
+};
+const helpOverviewEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Police Bot').setDescription(`I'm just your friendly neighbourhood policemen, but I do have some tricks up my sleeve. Press the buttons below to learn about my commands.\n\n📌 **Support Server:** ${SUPPORT_SERVER_URL}`).setFooter({ text: 'Mod commands require the configured access role or Administrator' });
+function helpRows(active = '') {
+    const p = (id, label, sec = false) => new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(active === id ? ButtonStyle.Success : sec ? ButtonStyle.Secondary : ButtonStyle.Primary);
+    return [new ActionRowBuilder().addComponents(p('help_warn','Warnings'), p('help_mod','Moderation'), p('help_config','Config'), p('help_escalation','Escalation')), new ActionRowBuilder().addComponents(p('help_notes','Notes',true), p('help_storage','Storage',true), p('help_features','Features',true), ...(active ? [p('help_back','Back',true)] : []))];
 }
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
 client.once('ready', async () => {
-    console.log(`✅ Social notify bot online as ${client.user.tag}`);
-    client.user.setPresence({ activities: [{ name: 'Refreshing social media for new posts', type: ActivityType.Watching }], status: 'online' });
+    console.log(`✅ Police bot online as ${client.user.tag}`);
+    client.user.setPresence({ activities: [{ name: 'Monitoring the security cameras.', type: ActivityType.Watching }], status: 'online' });
     const commands = [
         new SlashCommandBuilder().setName('invite').setDescription('Get a link to invite this bot to another server'),
-        new SlashCommandBuilder().setName('help').setDescription('View commands and features'),
-        new SlashCommandBuilder().setName('social').setDescription('Manage social media notifications')
-            .addSubcommand(s => s.setName('add').setDescription('Track a new account')
-                .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
-                    .addChoices(...Object.entries(PLATFORMS).filter(([, v]) => !v.unavailable).map(([k, v]) => ({ name: v.label, value: k }))))
-                .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
-                .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
-            .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
-            .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
-            .addSubcommand(s => s.setName('debug').setDescription('Show live fetch result vs stored baseline for a watch')
-                .addIntegerOption(o => o.setName('id').setDescription('Watch ID (see /social list)').setRequired(true)))
-            .addSubcommand(s => s.setName('link').setDescription('Connect an Instagram or TikTok account via OAuth so it can be tracked')
-                .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
-                    .addChoices({ name: 'Instagram', value: 'instagram' }, { name: 'TikTok', value: 'tiktok' })))
-            .addSubcommand(s => s.setName('links').setDescription('View accounts linked via OAuth in this server'))
-            .addSubcommand(s => s.setName('oauthdebug').setDescription('Owner only: show the exact OAuth config being sent to a platform')
-                .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
-                    .addChoices({ name: 'Instagram', value: 'instagram' }, { name: 'TikTok', value: 'tiktok' })))
-            .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
-        new SlashCommandBuilder().setName('killbot').setDescription('Owner only: suspend the Render service to stop usage'),
-    ];
-    await client.application.commands.set(commands).catch(e => console.error('command registration:', e));
-
-    // Start polling
-    pollAll().catch(e => console.error('initial poll:', e.message));
-    setInterval(() => pollAll().catch(e => console.error('poll loop:', e.message)), POLL_INTERVAL_MS);
-
-    // Announce the support server to existing guilds, once each.
-    for (const guild of client.guilds.cache.values()) {
-        try {
-            const cfg = await getConfig(guild.id);
-            if (cfg.supportAnnounced) continue;
-            await announceSupportServer(guild);
-            cfg.supportAnnounced = true;
-            saveConfig(guild.id, cfg);
-        } catch (e) {
-            console.error(`support announce (${guild.id}):`, e.message);
-        }
-        await new Promise(r => setTimeout(r, 1000)); // light stagger to avoid rate limits
-    }
-});
-
-client.on('guildCreate', async (guild) => {
+        new SlashCommandBuilder().setName('warning').setDescription('Manage warnings')
+            .addSubcommand(s => s.setName('give').setDescription('Give a warning').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason')))
+            .addSubcommand(s => s.setName('remove').setDescription('Remove a warning').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+            .addSubcommand(s => s.setName('list').setDescription('View all active warnings'))
+            .addSubcommand(s => s.setName('history').setDescription('View warning history').addUserOption(o => o.setName('user').setDescription('User').setRequired(true))),
+        new SlashCommandBuilder().setName('timeout').setDescription('Manage timeouts')
+            .addSubcommand(s => s.setName('give').setDescription('Timeout a user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('m:s / h:m:s / d:h:m:s').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason')))
+            .addSubcommand(s => s.setName('remove').setDescription('Remove a timeout').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason'))),
+        new SlashCommandBuilder().setName('mywarnings').setDescription('Check your active warnings'),
+        new SlashCommandBuilder().setName('kick').setDescription('Kick a user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)),
+        new SlashCommandBuilder().setName('ban').setDescription('Manage bans')
+            .addSubcommand(s => s.setName('give').setDescription('Ban a user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('Optional timed ban duration')).addIntegerOption(o => o.setName('delete_days').setDescription('Days of messages to delete (0-7)').setMinValue(0).setMaxValue(7)).addStringOption(o => o.setName('delete_messages').setDescription('Also delete messages in last X time after ban (e.g. 1:0:0 = 1 hour)')))
+            .addSubcommand(s => s.setName('remove').setDescription('Unban a user')),
+        new SlashCommandBuilder().setName('userinfo').setDescription('View user info and mod history').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+        new SlashCommandBuilder().setName('note').setDescription('Manage mod notes')
+            .addSubcommand(s => s.setName('add').setDescription('Add a note').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('text').setDescription('Note content').setRequired(true)))
+            .addSubcommand(s => s.setName('list').setDescription('List all notes for a user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+            .addSubcommand(s => s.setName('remove').setDescription('View and remove notes').addUserOption(o => o.setName('user').setDescription('User').setRequired(true))),
+        new SlashCommandBuilder().setName('config').setDescription('Configure the bot')
+            .addSubcommand(s => s.setName('set').setDescription('Set up a warning level').addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)).addRoleOption(o => o.setName('role').setDescription('Role to assign').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('d:h:m:s or "forever"').setRequired(true)))
+            .addSubcommand(s => s.setName('view').setDescription('View warning levels'))
+            .addSubcommand(s => s.setName('access').setDescription('Set which role can use mod commands'))
+            .addSubcommand(s => s.setName('logchannel').setDescription('Set or remove the mod-log channel'))
+            .addSubcommand(s => s.setName('notifications').setDescription('Toggle DM notifications to users').addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable').setRequired(true))),
+        new SlashCommandBuilder().setName('escalation').setDescription('Configure auto-escalation rules')
+            .addSubcommand(s => s.setName('set').setDescription('Set escalation threshold').addIntegerOption(o => o.setName('level').setDescription('Warning level').setRequired(true)).addIntegerOption(o => o.setName('threshold').setDescription('Number of warnings to trigger').setRequired(true)))
+            .addSubcommand(s => s.setName('cap').setDescription('Set max escalation level').addIntegerOption(o => o.setName('level').setDescription('Cap level').setRequired(true)))
+            .addSubcommand(s => s.setName('timeout').setDescription('Configure timeout-escalation').addIntegerOption(o => o.setName('level').setDescription('Target level (>=2)').setRequired(true)).addIntegerOption(o => o.setName('threshold').setDescription('Warnings needed').setRequired(true)).addStringOption(o => o.setName('duration').setDescription('Timeout duration').setRequired(true)))
+            .addSubcommand(s => s.setName('view').setDescription('View escalation configuration')),
+        new SlashCommandBuilder().setName('help').setDescription('View all commands and features'),
+        new SlashCommandBuilder().setName('globalhashes').setDescription('View and manage global scam image hashes (bot owner only)')
+            .addSubcommand(s => s.setName('view').setDescription('View all global scam hashes'))
+            .addSubcommand(s => s.setName('add').setDescription('Register a global scam image').addAttachmentOption(o => o.setName('image').setDescription('The scam image').setRequired(true)).addStringOption(o => o.setName('label').setDescription('Label').setRequired(true))),
+        new SlashCommandBuilder().setName('scam').setDescription('Manage scam image protection')
+            .addSubcommand(s => s.setName('add').setDescription('Register a scam image').addAttachmentOption(o => o.setName('image').setDescription('The scam image').setRequired(true)).addStringOption(o => o.setName('label').setDescription('Label').setRequired(true)))
+            .addSubcommand(s => s.setName('list').setDescription('List registered scam images'))
+            .addSubcommand(s => s.setName('config').setDescription('Configure scam protection').addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable')).addBooleanOption(o => o.setName('delete').setDescription('Delete scam messages')).addStringOption(o => o.setName('timeout').setDescription('Timeout duration or "none"')).addIntegerOption(o => o.setName('threshold').setDescription('Similarity threshold 0-20').setMinValue(0).setMaxValue(20))),
+        new SlashCommandBuilder().setName('messages').setDescription('Bulk delete messages')
+            .addSubcommand(s => s.setName('delete').setDescription('Delete messages in this channel')
+                .addUserOption(o => o.setName('user').setDescription('Only delete messages from this user'))
+                .addIntegerOption(o => o.setName('count').setDescription('Max number of messages to delete (default 100)').setMinValue(1).setMaxValue(1000))
+                .addStringOption(o => o.setName('within').setDescription('Only delete messages sent in the last X time (e.g. 1:0:0 = 1 hour)')))
+            .addSubcommand(s => s.setName('purge').setDescription('Delete all messages in all channels in the last X time')
+                .addStringOption(o => o.setName('within').setDescription('Time window (e.g. 1:0:0 = 1 hour)').setRequired(true))
+                .addUserOption(o => o.setName('user').setDescription('Only purge messages from this user'))),
+        new SlashCommandBuilder().setName('spam').setDescription('Configure spam protection')
+            .addSubcommand(s => s.setName('config').setDescription('Configure spam detection').addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable')).addBooleanOption(o => o.setName('delete').setDescription('Delete spam messages')).addIntegerOption(o => o.setName('count').setDescription('Messages to trigger (default 5)').setMinValue(2).setMaxValue(20)).addIntegerOption(o => o.setName('window').setDescription('Time window in seconds (default 10)').setMinValue(3).setMaxValue(60)).addStringOption(o => o.setName('timeout').setDescription('Timeout duration or "none"')).addIntegerOption(o => o.setName('similarity').setDescription('Similarity % (default 70)').setMinValue(50).setMaxValue(100)))
+            .addSubcommand(s => s.setName('view').setDescription('View spam protection settings')),
+    ].map(c => c.toJSON());
+    client.application.commands.set(commands);
+    console.log('✅ Commands registered');
     try {
-        const cfg = await getConfig(guild.id);
-        if (cfg.supportAnnounced) return;
-        await announceSupportServer(guild);
-        cfg.supportAnnounced = true;
-        saveConfig(guild.id, cfg);
-    } catch (e) {
-        console.error(`guildCreate announce (${guild.id}):`, e.message);
+        await initDB();
+        const [wRes, cRes] = await Promise.all([pool.query('SELECT key, data FROM warnings'), pool.query('SELECT guild_id, data FROM configs')]);
+        for (const { key, data } of wRes.rows) activeWarnings.set(key, data);
+        for (const { guild_id, data } of cRes.rows) configCache.set(guild_id, data);
+        for (const [key, w] of activeWarnings.entries()) if (!w.isForever) scheduleWarningRemoval(key, w.guildId, w.userId, w.roleId, w.expiresAt, w.channelId);
+        const atRes = await pool.query('SELECT guild_id, user_id, data FROM active_timeouts');
+        const now = Date.now(); let expiredTimeouts = 0;
+        for (const { guild_id, user_id, data } of atRes.rows) {
+            if (data.expiresAt && data.expiresAt > now) activeTimeouts.set(timeoutKey(guild_id, user_id), data);
+            else { expiredTimeouts++; pool.query('DELETE FROM active_timeouts WHERE guild_id = $1 AND user_id = $2', [guild_id, user_id]).catch(() => {}); }
+        }
+        if (expiredTimeouts) console.log(`🧹 Purged ${expiredTimeouts} already-expired tracked timeout(s)`);
+        setInterval(() => {
+            const cutoff = Date.now();
+            for (const [key, data] of activeTimeouts.entries()) if (data.expiresAt && data.expiresAt <= cutoff) deleteActiveTimeout(data.guildId, data.userId);
+        }, 10 * 60 * 1000);
+        const shRes = await pool.query('SELECT guild_id, id, hash, label, added_by, added_at FROM scam_hashes ORDER BY id');
+        for (const r of shRes.rows) { const arr = scamHashCache.get(r.guild_id) ?? []; arr.push({ id: r.id, hash: r.hash, label: r.label, addedBy: r.added_by, addedAt: r.added_at }); scamHashCache.set(r.guild_id, arr); }
+        await getGlobalScamHashes();
+        console.log(`✅ Loaded scam hashes for ${scamHashCache.size} guild(s), ${globalScamHashCache?.length ?? 0} global`);
+        const banRes = await pool.query("SELECT guild_id, user_id, data FROM history WHERE data->>'type' = 'ban' AND data->>'expiresAt' IS NOT NULL ORDER BY id DESC");
+        const seenBans = new Set();
+        for (const { guild_id, user_id, data } of banRes.rows) {
+            const bkey = `${guild_id}-${user_id}`; if (seenBans.has(bkey)) continue; seenBans.add(bkey);
+            const unbanRes = await pool.query("SELECT id FROM history WHERE guild_id = $1 AND user_id = $2 AND data->>'type' = 'unban' AND id > (SELECT id FROM history WHERE guild_id = $1 AND user_id = $2 AND data = $3::jsonb LIMIT 1) LIMIT 1", [guild_id, user_id, JSON.stringify(data)]);
+            if (!unbanRes.rows.length && data.expiresAt > Date.now()) scheduleBanExpiry(guild_id, user_id, data.userTag, data.expiresAt, data.reason);
+        }
+    } catch (e) { console.error('❌ DB init failed:', e.message); }
+    // One-time retroactive announcement of the support server link in existing log channels
+    try {
+        let announced = 0;
+        for (const [guildId, cfg] of configCache.entries()) {
+            if (!cfg.logChannelId || cfg.supportLinkAnnounced) continue;
+            const guild = client.guilds.cache.get(guildId);
+            const ch = guild?.channels.cache.get(cfg.logChannelId);
+            if (ch) {
+                await ch.send(`📌 **Join my Support Server:** ${SUPPORT_SERVER_URL}`).catch(() => {});
+                announced++;
+            }
+            cfg.supportLinkAnnounced = true;
+            saveConfig(guildId, cfg);
+        }
+        if (announced) console.log(`✅ Posted support server link in ${announced} existing log channel(s)`);
+    } catch (e) { console.error('❌ Retroactive support link announcement failed:', e.message); }
+    keepAlive();
+});
+
+client.on('guildCreate', async guild => {
+    const cfg = await getConfig(guild.id); if (!cfg.levels) saveConfig(guild.id, { levels: {} });
+    try {
+        const logs = await guild.fetchAuditLogs({ type: 28, limit: 5 });
+        const entry = logs.entries.find(e => e.target?.id === client.user.id && Date.now() - e.createdTimestamp < 60000);
+        if (guild.systemChannel) guild.systemChannel.send({ embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('👋 Thanks for adding Police Bot!').setDescription(`${entry?.executor?.id ? `<@${entry.executor.id}>, please` : 'An administrator should'} run \`/config access\` to set up command permissions.\n\n**Quick Start:**\n1. \`/config access\` — set the moderator role\n2. \`/config set\` — set up warning levels\n3. \`/warn\` — start moderating!`).setFooter({ text: 'Use /help to see all commands' })] }).catch(() => {});
+    } catch (e) { console.error('guildCreate error:', e); }
+});
+
+client.on('guildMemberAdd', async member => {
+    const userWarnings = [...activeWarnings.entries()].filter(([, w]) => w.guildId === member.guild.id && w.userId === member.id);
+    if (!userWarnings.length) return;
+    for (const [, w] of userWarnings) { const role = member.guild.roles.cache.get(w.roleId); if (role) await member.roles.add(role).catch(() => {}); }
+    member.send({ embeds: [new EmbedBuilder().setColor('#ff0000').setTitle('⚠️ Warning Reinstated').setDescription(`Your active warning(s) in **${member.guild.name}** have been reapplied because you rejoined.`).addFields({ name: 'Active Warnings', value: userWarnings.map(([, w]) => `Level ${w.level} — ${w.isForever ? 'Permanent' : `expires <t:${Math.floor(w.expiresAt / 1000)}:R>`}`).join('\n') }).setTimestamp()] }).catch(() => {});
+});
+
+// ── Scam detection ─────────────────────────────────────────────────────────
+client.on('messageCreate', async message => {
+    if (!message.guild || message.author.bot) return;
+    const attachments = [...message.attachments.values()].filter(a => (/\.(png|jpg|jpeg|gif|webp)$/i.test(a.name ?? '') || a.contentType?.startsWith('image/')) && a.size <= MAX_SCAM_IMAGE_BYTES);
+    if (!attachments.length) return;
+    const guildId = message.guild.id, spc = await getScamProtConfig(guildId);
+    if (!spc.enabled) return;
+    const hashes = await getScamHashes(guildId), globalHashes = await getGlobalScamHashes();
+    if (!hashes.length && !globalHashes.length) return;
+    const botMember = message.guild.members.me;
+    const canTimeout = botMember.permissions.has(PermissionFlagsBits.ModerateMembers);
+    for (const att of attachments) {
+        let buffer; try { buffer = await fetchImageBuffer(att.url); } catch (e) { console.error('scam: fetch failed:', e.message); continue; }
+        let imgHash; try { imgHash = await dHash(buffer); } catch (e) { console.error('scam: hash failed:', e.message); continue; }
+        let match = null, isGlobal = false, matchDistance = 0, matchedVia = 'full image';
+        for (const entry of globalHashes) { const dist = hammingDistance(imgHash, entry.hash); if (dist <= 10) { match = entry; isGlobal = true; matchDistance = dist; break; } }
+        if (!match) { for (const entry of hashes) { const dist = hammingDistance(imgHash, entry.hash); if (dist <= spc.threshold) { match = entry; matchDistance = dist; break; } } }
+        if (!match) {
+            // Full image didn't match a registered scam — it may be a cropped/re-framed
+            // version of one, so check a handful of cropped sub-regions before giving up.
+            const cropHashes = await generateCropHashes(buffer).catch(() => []);
+            outer: for (const ch of cropHashes) {
+                for (const entry of globalHashes) { const dist = hammingDistance(ch, entry.hash); if (dist <= 10) { match = entry; isGlobal = true; matchDistance = dist; matchedVia = 'cropped region'; break outer; } }
+                for (const entry of hashes) { const dist = hammingDistance(ch, entry.hash); if (dist <= spc.threshold) { match = entry; matchDistance = dist; matchedVia = 'cropped region'; break outer; } }
+            }
+        }
+        if (!match) continue;
+        console.log(`🚨 ${isGlobal ? '[GLOBAL] ' : ''}Scam: ${message.author.tag} in ${guildId} ("${match.label}")`);
+        const cfg2 = await getConfig(guildId);
+        const shouldDelete = isGlobal ? true : spc.deleteMsg, shouldTimeout = isGlobal ? true : !!spc.timeoutMs;
+        const timeoutMs = isGlobal ? (spc.timeoutMs ?? 5 * 60 * 1000) : spc.timeoutMs, timeoutDisplay = isGlobal ? (spc.timeoutDisplay ?? '5m') : spc.timeoutDisplay;
+        const canDelete = shouldDelete && botMember.permissionsIn(message.channel).has(PermissionFlagsBits.ManageMessages);
+        if (shouldDelete) { if (canDelete) message.delete().catch(e => console.error('scam: delete failed:', e.message)); else console.error(`scam: cannot delete in ${message.channel.id} — missing ManageMessages`); }
+        let timedOut = false;
+        if (shouldTimeout && timeoutMs && canTimeout) {
+            const member = message.guild.members.cache.get(message.author.id) ?? await message.guild.members.fetch(message.author.id).catch(() => null);
+            if (member && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+                timedOut = await member.timeout(timeoutMs, `${isGlobal ? '[Global] ' : ''}Scam: ${match.label}`).then(() => true).catch(() => false);
+                if (timedOut) saveActiveTimeout(guildId, message.author.id, { guildId, userId: message.author.id, userTag: message.author.tag, reason: `${isGlobal ? '[Global] ' : ''}Scam: ${match.label}`, issuedBy: client.user.tag, issuedAt: Date.now(), expiresAt: Date.now() + timeoutMs, durationDisplay: timeoutDisplay });
+            }
+        }
+        const E2 = (c, t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
+        const logCh = cfg2.logChannelId && message.guild.channels.cache.get(cfg2.logChannelId);
+        const wasDeleted = shouldDelete && canDelete;
+        const detectedEmbed = E2('#ff0000','Scam Image Detected').setDescription(wasDeleted ? `${message.author}'s message was removed — it matched a known scam image.` : `${message.author}'s message in ${message.channel} matched a known scam image but **was not deleted** (missing permissions or delete disabled).`).addFields({ name: 'Matched', value: match.label, inline: true }, ...(timedOut ? [{ name: 'Consequence', value: `Timed out for ${timeoutDisplay}`, inline: true }] : []));
+        if (wasDeleted) message.channel.send({ embeds: [detectedEmbed] }).catch(() => {});
+        else if (logCh) logCh.send({ embeds: [detectedEmbed] }).catch(() => {});
+        if (cfg2.warnDm !== false) message.author.send({ embeds: [E2('#ff0000','Your message was removed').setDescription(`A message you sent in **${message.guild.name}** was detected as a known scam image and removed.`).addFields({ name: 'Matched Pattern', value: match.label, inline: true }, ...(timedOut ? [{ name: 'Consequence', value: `You have been timed out for ${timeoutDisplay}`, inline: true }] : [])).setFooter({ text: 'If you believe this is a mistake, contact a moderator' })] }).catch(() => {});
+        if (logCh) {
+            await logCh.send({ embeds: [E2('#ff0000',`Scam Image Auto-Removed${isGlobal ? ' (Global)' : ''}`).addFields({ name: 'User', value: `${message.author} (${message.author.tag})`, inline: true }, { name: 'Channel', value: `${message.channel}`, inline: true }, { name: 'Matched', value: `${match.label}${isGlobal ? ' *(global)*' : ''}`, inline: true }, ...(timedOut ? [{ name: 'Timeout', value: timeoutDisplay, inline: true }] : []), { name: 'Message Deleted', value: wasDeleted ? 'Yes' : shouldDelete ? 'No (missing ManageMessages)' : 'No', inline: true }, { name: 'Match Distance', value: matchDistance === 0 ? 'Exact' : `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different`, inline: true }, { name: 'Match Type', value: matchedVia === 'full image' ? 'Full image' : 'Cropped region', inline: true })] }).catch(() => {});
+            if (matchDistance > 0 || matchedVia === 'cropped region') {
+                const incomingDim = await getImageDimensions(buffer);
+                const incomingRatio = incomingDim ? (incomingDim.width / incomingDim.height).toFixed(3) : 'unknown';
+                const dimsField = incomingDim ? `${incomingDim.width}×${incomingDim.height} (ratio ${incomingRatio})` : 'unknown';
+                const pendingId = `${message.id}_${att.id}`;
+                pendingNearMatches.set(pendingId, { hash: imgHash, label: match.label, attUrl: att.url, dims: incomingDim });
+                setTimeout(() => pendingNearMatches.delete(pendingId), 30 * 60 * 1000); // 30 min
+                const reviewEmbed = E2('#ff9900','⚠️ Near-Match — Please Review')
+                    .setDescription(`This image was **similar but not identical** to the registered scam hash for **${match.label}**${matchedVia === 'cropped region' ? ' (matched via a cropped sub-region, not the full image)' : ''}.\nIf this is a false positive, use \`/scam list\` to remove it or adjust the threshold with \`/scam config threshold\`.\nIf it's a cropped/edited variant of a real scam, use the buttons below to register this exact image as a new hash.`)
+                    .setImage(att.url)
+                    .addFields(
+                        { name: 'Similarity', value: `${matchDistance} bit${matchDistance !== 1 ? 's' : ''} different (threshold: ${isGlobal ? 10 : spc.threshold})`, inline: true },
+                        { name: 'Dimensions', value: dimsField, inline: true },
+                        { name: 'Match Type', value: matchedVia === 'full image' ? 'Full image' : 'Cropped region', inline: true }
+                    );
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`nearmatch_addserver_${pendingId}`).setLabel('Add to Server Scams').setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder().setCustomId(`nearmatch_addglobal_${pendingId}`).setLabel('Add to Global Scams').setStyle(ButtonStyle.Danger)
+                );
+                await logCh.send({ embeds: [reviewEmbed], components: [row] }).catch(() => {});
+            }
+        }
+        addHistory(guildId, message.author.id, { guildId, userId: message.author.id, userTag: message.author.tag, type: 'scam_remove', reason: `Scam: ${match.label}`, issuedBy: client.user.tag, issuedAt: Date.now() });
+        break;
     }
 });
 
-// ── Interaction handling ────────────────────────────────────────────────────
-const pendingMessageEdits = new Map(); // userId_watchId -> { guildId }
+// ── Spam detection ─────────────────────────────────────────────────────────
+client.on('messageCreate', async message => {
+    if (!message.guild || message.author.bot || !message.content) return;
+    const guildId = message.guild.id, spc2 = await getSpamConfig(guildId);
+    if (!spc2.enabled) return;
+    const spamKey = `${guildId}-${message.author.id}`, now = Date.now();
+    const fresh = (spamTracker.get(spamKey) ?? []).filter(e => now - e.ts < spc2.windowMs);
+    fresh.push({ content: normalise(message.content), msgId: message.id, channelId: message.channel.id, ts: now, hasReactions: message.reactions.cache.size > 0 });
+    spamTracker.set(spamKey, fresh);
+    const latest = normalise(message.content), matches = fresh.filter(e => e.channelId === message.channel.id && similarity(e.content, latest) >= spc2.similarityThreshold);
+    if (matches.length >= spc2.count) { spamTracker.delete(spamKey); await handleSpam(message, matches, spc2); }
+});
 
+// ── Interactions ───────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
   try {
-    const guildId = interaction.guild?.id;
-    if (!guildId) return;
-    const reply = (payload) => {
-        const opts = typeof payload === 'string' ? { content: payload, flags: [MessageFlags.Ephemeral] } : payload;
-        return interaction.replied || interaction.deferred ? interaction.editReply(opts) : interaction.reply(opts);
-    };
-
-    if (interaction.isChatInputCommand()) {
-        const { commandName } = interaction;
-
-        if (commandName === 'invite') {
-            const inviteUrl = `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=2147485696&scope=bot%20applications.commands`;
-            return reply({ embeds: [E('#5865F2', 'Invite Social Notify Bot').setDescription(`[Click here to invite this bot to another server](${inviteUrl})`)], flags: [MessageFlags.Ephemeral] });
-        }
-
-        if (commandName === 'help') {
-            return reply({ ...buildHelpView('general'), flags: [MessageFlags.Ephemeral] });
-        }
-
-        if (commandName === 'social') {
-            const sub = interaction.options.getSubcommand();
-
-            if (sub === 'access') {
-                if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return reply('❌ Only administrators can change access settings.');
-                await interaction.reply({
-                    embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('🔒 Access Configuration').setDescription('Select which role should have access to `/social` commands.\n\n**Note:** Server administrators always have access.').setFooter({ text: 'Select a role from the dropdown below' })],
-                    components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`social_access_role_${guildId}`).setPlaceholder('Select a role for access').setMinValues(1).setMaxValues(1))],
-                    flags: [MessageFlags.Ephemeral],
-                });
-                return;
-            }
-
-            if (!await hasCommandPermission(interaction, guildId)) return reply('❌ No permission. An administrator must configure access with `/social access`.');
-
-            if (sub === 'add') {
-                const platform = interaction.options.getString('platform');
-                if (PLATFORMS[platform]?.unavailable) {
-                    return reply(`❌ ${PLATFORMS[platform].label} is temporarily unavailable and can't be added right now (see \`/help\` → Info for details).`);
-                }
-                const rawHandle = interaction.options.getString('handle');
-                const channel = interaction.options.getChannel('channel');
-                const handle = normalizeHandle(platform, rawHandle);
-                if (!handle) return reply('❌ Could not parse that handle/URL.');
-
-                await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-
-                const watches = await getWatches(guildId);
-                if (watches.some(w => w.platform === platform && w.handle.toLowerCase() === handle.toLowerCase() && w.channel_id === channel.id)) {
-                    return interaction.editReply('❌ That account is already being tracked in this channel.');
-                }
-                if (watches.length >= 50) return interaction.editReply('❌ This server has reached the maximum of 50 tracked accounts.');
-
-                let post = null;
-                let socialLinkId = null;
-                if (PLATFORMS[platform].oauth) {
-                    // Instagram/TikTok can only be watched for accounts that have gone through
-                    // /social link — there's no way to poll an arbitrary public account via
-                    // their official APIs without that account's consent.
-                    const link = await getSocialLinkByUsername(guildId, platform, handle);
-                    if (!link) {
-                        return interaction.editReply(`❌ **${handle}** hasn't been linked yet. That account needs to run \`/social link\` and authorize with ${PLATFORMS[platform].label} first — this bot can't watch ${PLATFORMS[platform].label} accounts that haven't consented.\nUse \`/social links\` to see what's already linked in this server.`);
-                    }
-                    socialLinkId = link.id;
-                    try {
-                        const posts = platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
-                        post = posts[0] || null;
-                    } catch (e) {
-                        return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}`);
-                    }
-                } else {
-                    try {
-                        if (platform === 'twitch') {
-                            const posts = await fetchLatestTwitchAll(handle);
-                            post = posts[0] || null;
-                        } else if (platform === 'kick') {
-                            const posts = await fetchLatestKickAll(handle);
-                            post = posts[0] || null;
-                        } else {
-                            post = await fetchLatestPost(platform, handle);
-                        }
-                    } catch (e) {
-                        if (/HTTP 429/.test(e.message)) {
-                            // Rate-limited on verify — account likely exists, proceed anyway
-                            post = null;
-                        } else {
-                            return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}\nDouble-check the handle/URL and try again.`);
-                        }
-                    }
-                }
-
-                const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, addedBy: interaction.user.tag });
-                if (socialLinkId) await setWatchSocialLink(guildId, watch.id, socialLinkId);
-                // Seed last_post_id so the first poll doesn't fire a notification for existing content
-                await updateLastPost(watch.id, post?.id || null);
-
-                const p = PLATFORMS[platform];
-                const types = PLATFORM_NOTIFY_TYPES[platform];
-                const successEmbed = E('#00ff00', 'Now Tracking').addFields(
-                    { name: 'Platform', value: `${p.emojiTag} ${p.label}`, inline: true },
-                    { name: 'Account', value: handle, inline: true },
-                    { name: 'Channel', value: `${channel}`, inline: true },
-                    post?.title
-                        ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }
-                        : { name: 'Baseline', value: 'No posts found yet — will track from first post.' },
-                );
-
-                // Single-type platforms (TikTok, Twitter) skip the type-choice step entirely —
-                // there's only one kind of post, so go straight to a "set your message" button.
-                if (types.length <= 1) {
-                    successEmbed.setDescription('One more step — set the notification message below.');
-                    const msgRow = new ActionRowBuilder().addComponents(
-                        new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}`).setLabel('Set Message').setStyle(ButtonStyle.Primary)
-                    );
-                    await interaction.editReply({ embeds: [successEmbed], components: [msgRow] });
-                    return;
-                }
-
-                // Multi-type platforms: choose notification types first — selecting (or skipping)
-                // chains straight into the per-type message form, so this is a single guided path
-                // instead of separate optional buttons.
-                const typeEmbed = new EmbedBuilder().setColor('#5865F2')
-                    .setTitle(`${p.emojiTag} Choose Notification Types`)
-                    .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`);
-                const typeRow = new ActionRowBuilder().addComponents(
-                    new StringSelectMenuBuilder()
-                        .setCustomId(`socialtypeadd_select_${watch.id}`)
-                        .setPlaceholder('Select notification types…')
-                        .setMinValues(1).setMaxValues(types.length)
-                        .addOptions(types.map(t => ({ label: t.label, value: t.id, description: t.description })))
-                );
-                const skipRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
-                );
-                await interaction.editReply({ embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] });
-                return;
-            }
-
-            if (sub === 'list') {
-                const { embeds, components } = await buildWatchListEmbed(guildId);
-                return reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
-            }
-
-            if (sub === 'check') {
-                await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-                await pollAll();
-                return interaction.editReply('✅ Checked all tracked accounts for new posts.');
-            }
-
-            if (sub === 'debug') {
-                await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-                const id = interaction.options.getInteger('id');
-                const watches = await getWatches(guildId);
-                const w = watches.find(x => x.id === id);
-                if (!w) return interaction.editReply(`❌ No watch with ID \`${id}\` in this server. Use \`/social list\` to see IDs.`);
-
-                let post = null, fetchError = null;
-                try {
-                    if (w.platform === 'twitch') post = (await fetchLatestTwitchAll(w.handle))[0] || null;
-                    else if (w.platform === 'kick') post = (await fetchLatestKickAll(w.handle))[0] || null;
-                    else if (w.platform === 'instagram' || w.platform === 'tiktok') {
-                        if (!w.social_link_id) throw new Error('Not linked — run /social link first.');
-                        const link = await getSocialLinkById(w.social_link_id);
-                        if (!link) throw new Error('Linked account no longer found — re-link with /social link.');
-                        post = (w.platform === 'instagram' ? (await fetchLatestInstagramAll(link)) : (await fetchLatestTikTokAll(link)))[0] || null;
-                    } else {
-                        post = await fetchLatestPost(w.platform, w.handle);
-                    }
-                }
-                catch (e) { fetchError = e.message; }
-
-                const embed = E('#5865F2', `Debug — ${PLATFORMS[w.platform].label} ${w.handle}`)
-                    .addFields(
-                        { name: 'Most recent post ID', value: w.last_post_id ? `\`${w.last_post_id}\`` : '*(none yet)*' },
-                        { name: 'Recently seen IDs', value: Array.isArray(w.seen_post_ids) && w.seen_post_ids.length ? w.seen_post_ids.slice(0, 10).map(id => `\`${id}\``).join(', ') : '*(none yet)*' },
-                        { name: 'Last checked', value: w.last_checked ? `<t:${Math.floor(w.last_checked / 1000)}:R>` : '*(never)*' },
-                    );
-                if (fetchError) {
-                    embed.addFields({ name: 'Live fetch', value: `❌ Error: ${fetchError}` }).setColor('#ff0000');
-                } else if (!post) {
-                    embed.addFields({ name: 'Live fetch', value: '⚠️ Returned no post (account empty or unparsable).' });
-                } else {
-                    const alreadySeen = Array.isArray(w.seen_post_ids) && w.seen_post_ids.includes(post.id);
-                    embed.addFields(
-                        { name: 'Live fetch — latest post ID', value: `\`${post.id}\`` },
-                        { name: 'Already notified for this?', value: alreadySeen ? '✅ Yes — no notification will fire' : '🆕 New — notification should fire on next poll/check' },
-                        { name: 'Live post', value: post.title ? `[${post.title.slice(0, 150)}](${post.url})` : (post.url || 'N/A') },
-                    );
-                }
-                return interaction.editReply({ embeds: [embed] });
-            }
-
-            if (sub === 'link') {
-                const platform = interaction.options.getString('platform');
-                const cfg = OAUTH_CONFIG[platform];
-                if (!cfg.clientId || !cfg.clientSecret) {
-                    return reply(`❌ ${PLATFORMS[platform].label} OAuth isn't configured on this bot yet (missing app credentials env vars). Ask the bot owner to set them up.`);
-                }
-                if (!PUBLIC_BASE_URL) {
-                    return reply('❌ PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL) isn\'t set, so OAuth redirects have nowhere to go. Ask the bot owner to configure it.');
-                }
-                const { state, expires } = createOAuthState(guildId, interaction.user.id, platform);
-                const authUrl = `${cfg.authUrl}?${cfg.clientIdParam}=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
-                const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setLabel(`Authorize with ${PLATFORMS[platform].label}`).setStyle(ButtonStyle.Link).setURL(authUrl)
-                );
-                return reply({
-                    embeds: [E('#5865F2', `Link ${PLATFORMS[platform].label}`).setDescription(`Click below and log in with the **${PLATFORMS[platform].label} account you want this bot to track**. That account has to authorize this app — the bot can't watch accounts that haven't consented.\n\nThis link expires <t:${Math.floor(expires / 1000)}:R>.`)],
-                    components: [row],
-                    flags: [MessageFlags.Ephemeral],
-                });
-            }
-
-            if (sub === 'links') {
-                const igLinks = await getSocialLinks(guildId, 'instagram');
-                const ttLinks = await getSocialLinks(guildId, 'tiktok');
-                const embed = E('#5865F2', 'Linked Accounts').setDescription('Accounts authorized via `/social link` in this server. Only these can be added with `/social add`.');
-                embed.addFields(
-                    { name: '📸 Instagram', value: igLinks.length ? igLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
-                    { name: '🎵 TikTok', value: ttLinks.length ? ttLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
-                );
-                return reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
-            }
-
-            if (sub === 'oauthdebug') {
-                const ownerId = process.env.BOT_OWNER_ID;
-                if (!ownerId || interaction.user.id !== ownerId) {
-                    return reply('❌ This command is owner-only (it can reveal partial app credentials).');
-                }
-                const platform = interaction.options.getString('platform');
-                const cfg = OAUTH_CONFIG[platform];
-                const maskedSecret = cfg.clientSecret ? `${cfg.clientSecret.slice(0, 4)}${'*'.repeat(Math.max(0, cfg.clientSecret.length - 8))}${cfg.clientSecret.slice(-4)}` : '(not set)';
-                const { state } = createOAuthState(guildId, interaction.user.id, platform);
-                const authUrl = `${cfg.authUrl}?${cfg.clientIdParam}=${encodeURIComponent(cfg.clientId || '')}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
-                const embed = E('#5865F2', `OAuth Debug — ${PLATFORMS[platform].label}`).setDescription(
-                    'This is exactly what the bot is sending right now, read live from environment variables — compare each value character-by-character against the platform\'s developer dashboard.'
-                ).addFields(
-                    { name: 'client_id (full)', value: `\`${cfg.clientId || '(not set)'}\`` },
-                    { name: 'client_secret (masked)', value: `\`${maskedSecret}\`` },
-                    { name: 'redirect_uri', value: `\`${cfg.redirectUri}\`` },
-                    { name: 'scope', value: `\`${cfg.scope}\`` },
-                    { name: 'PUBLIC_BASE_URL resolved to', value: `\`${PUBLIC_BASE_URL || '(empty!)'}\`` },
-                    { name: 'Full authorize URL', value: authUrl.length > 1000 ? authUrl.slice(0, 1000) + '…' : authUrl },
-                );
-                return reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
-            }
-        }
-        if (commandName === 'invite' || commandName === 'help' || commandName === 'social') return;
+    if (interaction.isStringSelectMenu() && interaction.customId === 'globalhashes_remove') {
+        if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: '❌ Restricted to the bot owner.', flags: [MessageFlags.Ephemeral] });
+        await interaction.deferUpdate();
+        await removeGlobalScamHash(parseInt(interaction.values[0]));
+        const { embeds, components } = await buildGlobalHashesEmbed();
+        return interaction.editReply({ embeds, components });
     }
-
-    if (interaction.isChatInputCommand() && interaction.commandName === 'killbot') {
-        const ownerId = process.env.BOT_OWNER_ID;
-        if (!ownerId || interaction.user.id !== ownerId) {
-            return interaction.reply({ content: '❌ This command is owner-only.', flags: [MessageFlags.Ephemeral] });
+    if (interaction.isStringSelectMenu() && customIdMatches(interaction.customId, ['configview_removelevel_','escview_removethreshold_','escview_removetimeout_','scamlist_remove_','noteview_remove_'])) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const { customId, values } = interaction, value = values[0];
+        await interaction.deferUpdate();
+        if (customId.startsWith('configview_removelevel_')) {
+            const guildId = customId.slice(23), cfg = await getConfig(guildId);
+            delete cfg.levels?.[value]; saveConfig(guildId, cfg);
+            const { embeds, components } = await buildConfigViewEmbed(guildId);
+            return interaction.editReply({ embeds, components });
         }
-        await interaction.reply({ content: '🛑 Suspending the Render service…', flags: [MessageFlags.Ephemeral] });
-        const renderKey = process.env.RENDER_API_KEY, serviceId = process.env.RENDER_SERVICE_ID;
-        if (renderKey && serviceId) {
-            try {
-                const { status } = await postJson(`https://api.render.com/v1/services/${serviceId}/suspend`, {}, { Authorization: `Bearer ${renderKey}` });
-                if (status >= 200 && status < 300) {
-                    await interaction.followUp({ content: '✅ Render service suspended — it will stay off (and stop using hours) until manually resumed from the Render dashboard.', flags: [MessageFlags.Ephemeral] }).catch(() => {});
-                } else {
-                    await interaction.followUp({ content: `⚠️ Render API returned status ${status}. Falling back to crashing the process.`, flags: [MessageFlags.Ephemeral] }).catch(() => {});
-                    process.exit(1);
-                }
-            } catch (e) {
-                await interaction.followUp({ content: `⚠️ Render suspend call failed (${e.message}). Falling back to crashing the process.`, flags: [MessageFlags.Ephemeral] }).catch(() => {});
-                process.exit(1);
+        if (customId.startsWith('escview_removethreshold_')) {
+            const guildId = customId.slice(25), cfg = await getConfig(guildId);
+            delete cfg.escalation?.thresholds?.[value]; saveConfig(guildId, cfg);
+            const { embeds, components } = await buildEscalationViewEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('escview_removetimeout_')) {
+            const guildId = customId.slice(22), cfg = await getConfig(guildId);
+            delete cfg.escalation?.timeouts?.[value]; saveConfig(guildId, cfg);
+            const { embeds, components } = await buildEscalationViewEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('scamlist_remove_')) {
+            const guildId = customId.slice(16);
+            await removeScamHash(guildId, parseInt(value));
+            const { embeds, components } = await buildScamListEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('noteview_remove_')) {
+            const parts = customId.slice(16).split('_'), guildId = parts[0], userId = parts[1];
+            await deleteNote(guildId, userId, parseInt(value));
+            const user = await interaction.client.users.fetch(userId).catch(() => null);
+            if (!user) return interaction.editReply({ content: '❌ Could not fetch user.', embeds: [], components: [] });
+            const { embeds, components } = await buildNoteViewEmbed(guildId, user);
+            return interaction.editReply({ embeds, components });
+        }
+        return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('unban_select_')) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const targetUserId = interaction.values[0];
+        const modal = new ModalBuilder().setCustomId(`unban_modal_${targetUserId}`).setTitle('Unban User')
+            .addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason for unban').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(512).setPlaceholder('No reason provided')),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('invite').setLabel('Send the user an invite back? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(3).setPlaceholder('no'))
+            );
+        return interaction.showModal(modal);
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('unban_modal_')) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const userId = interaction.customId.slice(12), guildId = interaction.guild.id;
+        const reason = (interaction.fields.getTextInputValue('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
+        const sendInvite = ['yes','y','true'].includes((interaction.fields.getTextInputValue('invite') || '').trim().toLowerCase());
+        await interaction.deferUpdate();
+        try {
+            const ban = await interaction.guild.bans.fetch(userId).catch(() => null);
+            if (!ban) return interaction.editReply({ content: '❌ That user is no longer banned.', embeds: [], components: [] });
+            await interaction.guild.members.unban(userId, reason);
+            const user = ban.user;
+            addHistory(guildId, userId, { guildId, userId, userTag: user.tag, type: 'unban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
+            logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#00ff00').setTitle('Member Unbanned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }).setTimestamp());
+            let inviteResult = null;
+            if (sendInvite) {
+                const botMember = interaction.guild.members.me;
+                const channel = interaction.guild.channels.cache.find(c => c.isTextBased() && c.type !== ChannelType.GuildAnnouncement && botMember.permissionsIn(c).has(PermissionFlagsBits.CreateInstantInvite));
+                if (channel) {
+                    try {
+                        const invite = await channel.createInvite({ maxUses: 1, maxAge: 86400, unique: true, reason: `Unban invite for ${user.tag}` });
+                        await user.send({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle("You've been unbanned").setDescription(`You were unbanned from **${interaction.guild.name}**.\n\nHere's an invite back: ${invite.url}\n*(expires in 24h, single use)*`).addFields({ name: 'Reason', value: reason })] });
+                        inviteResult = 'sent';
+                    } catch (e) { console.error('unban invite:', e.message); inviteResult = 'failed'; }
+                } else inviteResult = 'failed';
             }
-        } else {
-            await interaction.followUp({ content: '⚠️ RENDER_API_KEY/RENDER_SERVICE_ID not set, so I can\'t properly suspend the service — just crashing the process instead. Note: on most Render plans this alone gets restarted automatically and will keep using hours. Set those two env vars for a real stop.', flags: [MessageFlags.Ephemeral] }).catch(() => {});
-            process.exit(1);
+            const inviteField = sendInvite ? [{ name: 'Invite', value: inviteResult === 'sent' ? '✅ Sent via DM' : '❌ Failed to send (DMs closed or no invitable channel)', inline: true }] : [];
+            await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Member Unbanned').addFields({ name: 'User', value: `${user.tag}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Unbanned by', value: `${interaction.user}`, inline: true }, ...inviteField).setTimestamp()], components: [] });
+        } catch (e) { console.error(e); await interaction.editReply({ content: '❌ Failed to unban.', embeds: [], components: [] }); }
+        return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('unwarn_select_')) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const pendingId = interaction.customId.slice(14), pending = pendingUnwarns.get(pendingId);
+        if (!pending) return interaction.update({ content: '❌ Confirmation expired.', embeds: [], components: [] });
+        if (interaction.user.id !== pending.modId) return interaction.reply({ content: '❌ Only the moderator who ran this command can use this.', flags: [MessageFlags.Ephemeral] });
+        const selectedKey = interaction.values[0], w = activeWarnings.get(selectedKey);
+        if (!w) return interaction.update({ content: '❌ Warning no longer exists.', embeds: [], components: [] });
+        pendingUnwarns.set(pendingId, { ...pending, selectedKey, roleId: w.roleId, level: w.level });
+        const role = interaction.guild.roles.cache.get(w.roleId);
+        await interaction.update({ embeds: [new EmbedBuilder().setColor('#FFA500').setTitle('⚠️ Confirm Unwarn').setDescription(`Remove **Level ${w.level}** warning from <@${pending.targetUserId}>?`).addFields({ name: 'Role', value: role ? `${role}` : w.roleName, inline: true }, { name: 'Issued', value: `<t:${Math.floor(w.issuedAt/1000)}:R>`, inline: true }, { name: 'Reason', value: w.reason || 'No reason' }).setFooter({ text: 'Expires in 60 seconds' }).setTimestamp()], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`unwarn_confirm_${pendingId}`).setLabel('Confirm').setStyle(ButtonStyle.Danger), new ButtonBuilder().setCustomId(`unwarn_cancel_${pendingId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary))] });
+        return;
+    }
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('logchannel_select_')) {
+        if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const guildId = interaction.customId.slice(19), channel = interaction.channels.first();
+        if (!channel) return interaction.reply({ content: '❌ No channel selected.', flags: [MessageFlags.Ephemeral] });
+        await interaction.deferUpdate();
+        const cfg = await getConfig(guildId); cfg.logChannelId = channel.id; cfg.supportLinkAnnounced = true; saveConfig(guildId, cfg);
+        channel.send(`📌 **Join my Support Server:** ${SUPPORT_SERVER_URL}`).catch(() => {});
+        const { embeds, components } = await buildLogChannelEmbed(guildId);
+        return interaction.editReply({ embeds, components });
+    }
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('access_role_')) {
+        const guildId = interaction.customId.replace('access_role_', '');
+        if (guildId !== interaction.guild.id) return interaction.reply({ content: '❌ Invalid interaction.', flags: [MessageFlags.Ephemeral] });
+        const role = interaction.roles.first();
+        if (!role) return interaction.reply({ content: '❌ No role selected.', flags: [MessageFlags.Ephemeral] });
+        if (role.id === interaction.guild.id) return interaction.update({ content: '❌ Cannot use @everyone.', components: [] });
+        if (role.managed) return interaction.update({ content: '❌ Cannot use managed/bot roles.', components: [] });
+        const cfg = await getConfig(guildId); cfg.accessRoleId = role.id; saveConfig(guildId, cfg);
+        await interaction.update({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Access Control Updated').setDescription(`Members with the ${role} role can now use moderation commands.\n\n*Server administrators always have access.*`).setTimestamp()], components: [] });
+        return;
+    }
+    if (interaction.isButton()) {
+        const { customId } = interaction;
+        if (customId.startsWith('nearmatch_addserver_') || customId.startsWith('nearmatch_addglobal_')) {
+            const isGlobalAdd = customId.startsWith('nearmatch_addglobal_');
+            if (isGlobalAdd) {
+                if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: '❌ Only the bot owner can add to the global scam list.', flags: [MessageFlags.Ephemeral] });
+            } else {
+                if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            }
+            const pendingId = customId.slice(20);
+            const pending = pendingNearMatches.get(pendingId);
+            if (!pending) return interaction.reply({ content: '❌ This review has expired (30 min limit). Use `/scam add` with the image manually instead.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const label = `${pending.label} (variant)`;
+            try {
+                if (isGlobalAdd) {
+                    const entry = await addGlobalScamHash(pending.hash, label, interaction.user.tag);
+                    await interaction.editReply(`✅ Added to **global** scam list as "${label}" (ID: \`${entry.id}\`). This image will now be auto-removed in **all servers**.`);
+                } else {
+                    const guildId = interaction.guild.id;
+                    const existing = await getScamHashes(guildId), spc = await getScamProtConfig(guildId);
+                    for (const e of existing) { if (hammingDistance(pending.hash, e.hash) <= spc.threshold) return interaction.editReply(`❌ Already registered (or similar to) **${e.label}** (ID: \`${e.id}\`).`); }
+                    const entry = await addScamHash(guildId, pending.hash, label, interaction.user.tag);
+                    await interaction.editReply(`✅ Added to this server's scam list as "${label}" (ID: \`${entry.id}\`).`);
+                }
+                pendingNearMatches.delete(pendingId);
+            } catch (e) { console.error('nearmatch add:', e.message); await interaction.editReply('❌ Failed to add hash.'); }
+            return;
+        }
+        if (customId.startsWith('help_') && customId !== 'help_back') { const embed = helpPages[customId]; if (!embed) return; return interaction.update({ embeds: [embed], components: helpRows(customId) }); }
+        if (customId === 'help_back') return interaction.update({ embeds: [helpOverviewEmbed()], components: helpRows() });
+        if (customId.startsWith('wl_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            const parts = customId.split('_'), page = parseInt(parts[1]), guildId = parts.slice(2).join('_');
+            const { embed, totalPages, page: p } = buildWarnlistEmbed(guildId, page);
+            return interaction.update({ embeds: [embed], components: warnlistRow(p, totalPages, guildId) });
+        }
+        if (customId.startsWith('mywarnings_refresh_')) {
+            const ownerId = customId.slice(19);
+            if (interaction.user.id !== ownerId) return interaction.reply({ content: '❌ This button is not for you.', flags: [MessageFlags.Ephemeral] });
+            const guildId = interaction.guild.id, userWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === interaction.user.id);
+            if (!userWarnings.length) return interaction.update({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Your Active Warnings').setDescription('You have no active warnings!').setTimestamp()], components: [] });
+            const cfg = await getConfig(guildId), embed = new EmbedBuilder().setColor('#FFA500').setTitle('Your Active Warnings').setDescription(`You have ${userWarnings.length} active warning${userWarnings.length>1?'s':''}`).setFooter({ text: 'Warnings are automatically removed when they expire' }).setTimestamp();
+            for (const w of userWarnings) {
+                const lc = cfg.levels?.[w.level], name = `Level ${w.level} — ${lc?.roleName||'Unknown Role'}`;
+                if (w.isForever) embed.addFields({ name, value: ' **Duration:** Forever\n **Status:** Permanent' });
+                else { const t = w.expiresAt - Date.now(); embed.addFields({ name, value: t <= 0 ? 'Expired (will be removed shortly)' : (() => { const s = Math.floor(t/1000); return `**Time Left:** ${formatDuration(Math.floor(s/86400),Math.floor((s%86400)/3600),Math.floor((s%3600)/60),s%60)}\n**Expires:** <t:${Math.floor(w.expiresAt/1000)}:F>`; })() }); }
+            }
+            return interaction.update({ embeds: [embed], components: [refreshBtn(customId)] });
+        }
+        if (customId.startsWith('userinfo_refresh_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            const parts = customId.slice(17).split('_'), userId = parts[0], guildId = parts[1];
+            await interaction.deferUpdate();
+            const user = await interaction.client.users.fetch(userId).catch(() => null);
+            if (!user) return interaction.editReply({ content: '❌ Could not fetch user.', embeds: [], components: [] });
+            const [member, history, notes] = await Promise.all([interaction.guild.members.fetch(userId).catch(() => null), getAllHistory(guildId, userId), getNotes(guildId, userId)]);
+            const embed = new EmbedBuilder().setColor('#5865F2').setAuthor({ name: user.tag, iconURL: user.displayAvatarURL({ size: 256 }) }).setThumbnail(user.displayAvatarURL({ size: 256 })).addFields({ name: 'Account Created', value: `<t:${Math.floor(user.createdTimestamp/1000)}:F>\n<t:${Math.floor(user.createdTimestamp/1000)}:R>`, inline: true }, { name: 'Joined Server', value: member ? `<t:${Math.floor(member.joinedTimestamp/1000)}:F>\n<t:${Math.floor(member.joinedTimestamp/1000)}:R>` : '*Not in server*', inline: true }).setTimestamp();
+            const activeUserWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === userId), activeByLevel = {};
+            for (const w of activeUserWarnings) activeByLevel[w.level] = (activeByLevel[w.level] || 0) + 1;
+            embed.addFields({ name: 'Active Warnings', value: Object.keys(activeByLevel).length ? Object.entries(activeByLevel).sort(([a],[b])=>a-b).map(([l,c])=>`Level ${l}: **${c}**`).join('\n') : 'None', inline: true });
+            const warnCounts = {}, timeoutCount = history.filter(e => e.type === 'timeout').length, kickCount = history.filter(e => e.type === 'kick').length, banCount = history.filter(e => e.type === 'ban').length;
+            for (const e of history) if (e.level != null) warnCounts[e.level] = (warnCounts[e.level] || 0) + 1;
+            if (Object.keys(warnCounts).length) embed.addFields({ name: 'Warn History', value: Object.entries(warnCounts).sort(([a],[b])=>a-b).map(([l,c])=>`Level ${l}: **${c}**`).join('\n'), inline: true });
+            const modLines = [...(timeoutCount?[`Timeouts: **${timeoutCount}**`]:[]), ...(kickCount?[`Kicks: **${kickCount}**`]:[]), ...(banCount?[`Bans: **${banCount}**`]:[])];
+            if (modLines.length) embed.addFields({ name: 'Mod Actions', value: modLines.join('\n'), inline: true });
+            if (notes.length) { const shown = notes.slice(-5); embed.addFields({ name: `Notes (${notes.length})`, value: shown.map(n => `\`${n.id}\` <t:${Math.floor(n.addedAt/1000)}:d> by **${n.addedBy}**\n${n.text.slice(0,100)}${n.text.length>100?'…':''}`).join('\n\n') }); if (notes.length > 5) embed.setFooter({ text: `Showing last 5 of ${notes.length} notes` }); }
+            return interaction.editReply({ embeds: [embed], components: [refreshBtn(customId)] });
+        }
+        if (customId.startsWith('removelogchannel_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferUpdate();
+            const guildId = customId.slice(18), cfg = await getConfig(guildId);
+            delete cfg.logChannelId; saveConfig(guildId, cfg);
+            const { embeds, components } = await buildLogChannelEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('configview_refresh_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferUpdate();
+            const { embeds, components } = await buildConfigViewEmbed(customId.slice(19));
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('escalationview_refresh_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferUpdate();
+            const { embeds, components } = await buildEscalationViewEmbed(customId.slice(23));
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('escview_removecap_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferUpdate();
+            const guildId = customId.slice(19), cfg = await getConfig(guildId);
+            delete cfg.escalation?.cap; saveConfig(guildId, cfg);
+            const { embeds, components } = await buildEscalationViewEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('scamlist_refresh_')) {
+            if (!await hasCommandPermission(interaction, interaction.guild.id)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferUpdate();
+            const guildId = customId.slice(17); scamHashCache.delete(guildId);
+            const { embeds, components } = await buildScamListEmbed(guildId);
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId === 'globalhashes_refresh') {
+            if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: '❌ Restricted to the bot owner.', flags: [MessageFlags.Ephemeral] });
+            await interaction.deferUpdate();
+            globalScamHashCache = null;
+            const { embeds, components } = await buildGlobalHashesEmbed();
+            return interaction.editReply({ embeds, components });
+        }
+        if (customId.startsWith('unwarn_confirm_') || customId.startsWith('unwarn_cancel_')) {
+            const isConfirm = customId.startsWith('unwarn_confirm_'), pendingId = customId.slice(isConfirm ? 15 : 13), pending = pendingUnwarns.get(pendingId);
+            if (!pending) return interaction.update({ content: '❌ Confirmation expired.', embeds: [], components: [] });
+            if (interaction.user.id !== pending.modId) return interaction.reply({ content: '❌ Only the moderator who ran this command can confirm.', flags: [MessageFlags.Ephemeral] });
+            if (!isConfirm) { pendingUnwarns.delete(pendingId); return interaction.update({ content: 'Unwarn cancelled.', embeds: [], components: [] }); }
+            pendingUnwarns.delete(pendingId);
+            const { targetUserId, targetUserTag, level, guildId, roleId, selectedKey } = pending;
+            const member = interaction.guild.members.cache.get(targetUserId), role = interaction.guild.roles.cache.get(roleId);
+            if (!member) return interaction.update({ content: '❌ User is no longer in this server.', embeds: [], components: [] });
+            if (!role) return interaction.update({ content: '❌ Role not found.', embeds: [], components: [] });
+            await member.roles.remove(role);
+            const keys = selectedKey ? [selectedKey] : [...activeWarnings.entries()].filter(([, w]) => w.userId === targetUserId && w.guildId === guildId && w.level === level).map(([k]) => k);
+            for (const k of keys) { addHistory(guildId, targetUserId, { ...activeWarnings.get(k), endedAt: Date.now(), endReason: 'manual' }); clearTimeout(warningTimers.get(k)); warningTimers.delete(k); deleteWarning(k); }
+            logMod(interaction.guild, guildId, new EmbedBuilder().setColor('#00ff00').setTitle('Warning Removed').addFields({ name: 'User', value: `<@${targetUserId}> (${targetUserTag})`, inline: true }, { name: 'Level', value: `${level}`, inline: true }, { name: 'Role', value: `${role}`, inline: true }, { name: 'Removed by', value: `${interaction.user}` }).setTimestamp());
+            await interaction.update({ embeds: [new EmbedBuilder().setColor('#00ff00').setTitle('Warning Removed').addFields({ name: 'User', value: `<@${targetUserId}>`, inline: true }, { name: 'Level', value: `${level}`, inline: true }, { name: 'Role', value: `${role}`, inline: true }, { name: 'Removed by', value: `${interaction.user}` }).setTimestamp()], components: [] });
         }
         return;
     }
 
-    // ── Role select: access role ──────────────────────────────────────────
-    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('social_access_role_')) {
-        if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ content: '❌ Only administrators can do this.', flags: [MessageFlags.Ephemeral] });
-        const role = interaction.values[0];
+    if (!interaction.isChatInputCommand()) return;
+    const { commandName, guildId } = interaction;
+    if (!interaction.guild) return interaction.reply({ content: '❌ Server only.', flags: [MessageFlags.Ephemeral] });
+    const restricted = ['config','warning','timeout','kick','ban','note','userinfo','escalation','scam','spam','messages'];
+    if (restricted.includes(commandName) && !await hasCommandPermission(interaction, guildId)) {
         const cfg = await getConfig(guildId);
-        cfg.accessRoleId = role; saveConfig(guildId, cfg);
-        return interaction.update({ embeds: [E('#00ff00', '✅ Access Updated').setDescription(`<@&${role}> can now manage social notifications.`)], components: [] });
+        return interaction.reply({ content: `❌ No permission.\n\n**Required:** Administrator OR ${cfg.accessRoleId ? `<@&${cfg.accessRoleId}>` : 'no role configured'}\n\nAsk an admin to run \`/config access\`.`, flags: [MessageFlags.Ephemeral] });
     }
+    const E = (color, title) => new EmbedBuilder().setColor(color).setTitle(title).setTimestamp();
+    const reply = (opts) => {
+        if (interaction.deferred) { if (typeof opts === 'string') return interaction.editReply({ content: opts }); const { flags, ...rest } = opts; return interaction.editReply(rest); }
+        return interaction.reply(typeof opts === 'string' ? { content: opts, flags: [MessageFlags.Ephemeral] } : opts);
+    };
 
-    // ── Buttons: /help category tabs ─────────────────────────────────────────
-    if (interaction.isButton() && interaction.customId.startsWith('help_cat_')) {
-        const catId = interaction.customId.slice(9);
-        return interaction.update(buildHelpView(catId));
+    if (commandName === 'invite') {
+        const perms = PermissionFlagsBits.ManageRoles | PermissionFlagsBits.KickMembers | PermissionFlagsBits.BanMembers | PermissionFlagsBits.ModerateMembers | PermissionFlagsBits.ViewChannel | PermissionFlagsBits.SendMessages | PermissionFlagsBits.EmbedLinks | PermissionFlagsBits.ReadMessageHistory | PermissionFlagsBits.ViewAuditLog;
+        return reply({ embeds: [E('#5865F2','➕ Invite Police Bot').setDescription(`[**Click here to invite me**](https://discord.com/oauth2/authorize?client_id=${client.user.id}&permissions=${perms}&scope=bot%20applications.commands)\n\nThis link requests the minimum permissions needed to function correctly.`).addFields({ name: 'Permissions Requested', value: '• Manage Roles — assign/remove warning roles\n• Kick & Ban Members — moderation commands\n• Moderate Members — timeouts\n• Send Messages & Embed Links — responses\n• View Audit Log — detect who added the bot\n• Read Message History — channel access' }).setFooter({ text: 'You can adjust permissions after inviting' })], flags: [MessageFlags.Ephemeral] });
     }
-
-    // ── Buttons: refresh list ───────────────────────────────────────────────
-    if (interaction.isButton() && interaction.customId.startsWith('sociallist_refresh_')) {
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const { embeds, components } = await buildWatchListEmbed(guildId);
-        return interaction.update({ embeds, components });
-    }
-
-    // ── Select: open manage view for a watch ────────────────────────────────
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sociallist_manage_')) {
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = parseInt(interaction.values[0], 10);
-        const w = await getWatch(guildId, id);
-        if (!w) return interaction.reply({ content: '❌ Watch not found (it may have been removed).', flags: [MessageFlags.Ephemeral] });
-        const { embeds, components } = buildManageView(w);
-        return interaction.update({ embeds, components });
-    }
-
-    // ── Buttons: manage view actions ─────────────────────────────────────────
-    if (interaction.isButton() && interaction.customId.startsWith('socialmanage_')) {
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const [, action, idStr] = interaction.customId.split('_');
-
-        if (action === 'back') {
-            const { embeds, components } = await buildWatchListEmbed(guildId);
-            return interaction.update({ embeds, components });
-        }
-
-        const id = parseInt(idStr, 10);
-        const w = await getWatch(guildId, id);
-        if (!w) return interaction.update({ content: '❌ Watch not found (it may have been removed).', embeds: [], components: [] });
-
-        if (action === 'msg') {
-            const modal = new ModalBuilder().setCustomId(`socialmsg_modal_${id}`).setTitle('Edit Notification Message')
-                .addComponents(
-                    new ActionRowBuilder().addComponents(
-                        new TextInputBuilder().setCustomId('template').setLabel('Custom message (leave blank for default)')
-                            .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)
-                            .setValue(w.message_template || '')
-                            .setPlaceholder('{author} just posted on {platform}!\n{url}')
-                    )
-                );
-            return interaction.showModal(modal);
-        }
-
-        if (action === 'channel') {
-            return interaction.update({
-                embeds: [E('#5865F2', `Change Channel — ${w.handle}`).setDescription('Select the new channel for this watch\'s notifications.')],
-                components: [new ActionRowBuilder().addComponents(
-                    new ChannelSelectMenuBuilder().setCustomId(`socialchannel_select_${id}`).setPlaceholder('Select a channel…')
-                        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-                )],
-            });
-        }
-
-        if (action === 'role') {
-            return interaction.update({
-                embeds: [E('#5865F2', `Ping Role — ${w.handle}`).setDescription('Select a role to ping on every notification, or click "Clear Role" to remove it.')],
-                components: [
-                    new ActionRowBuilder().addComponents(
-                        new RoleSelectMenuBuilder().setCustomId(`socialrole_select_${id}`).setPlaceholder('Select a role…')
-                    ),
-                    new ActionRowBuilder().addComponents(
-                        new ButtonBuilder().setCustomId(`socialrole_clear_${id}`).setLabel('Clear Role').setStyle(ButtonStyle.Danger),
-                        new ButtonBuilder().setCustomId(`socialmanage_backto_${id}`).setLabel('← Back').setStyle(ButtonStyle.Secondary),
-                    ),
-                ],
-            });
-        }
-
-        if (action === 'types') {
-            const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-            if (types.length <= 1) return interaction.update({ content: 'This platform only has one notification type.', embeds: [], components: [] });
-            const current = Array.isArray(w.notify_types) && w.notify_types.length ? w.notify_types : types.map(t => t.id);
-            return interaction.update({
-                embeds: [E('#5865F2', `Notification Types — ${w.handle}`).setDescription(`Choose which **${PLATFORMS[w.platform].label}** content types to get notified for.`)],
-                components: [
-                    new ActionRowBuilder().addComponents(
-                        new StringSelectMenuBuilder().setCustomId(`socialtype_select_${id}`)
-                            .setPlaceholder('Select types…').setMinValues(1).setMaxValues(types.length)
-                            .addOptions(types.map(t => ({ label: t.label, value: t.id, description: t.description, default: current.includes(t.id) })))
-                    ),
-                    new ActionRowBuilder().addComponents(
-                        new ButtonBuilder().setCustomId(`socialmanage_backto_${id}`).setLabel('← Back').setStyle(ButtonStyle.Secondary),
-                    ),
-                ],
-            });
-        }
-
-        if (action === 'toggle') {
-            await updateWatchActive(guildId, id, !w.active);
-            const updated = await getWatch(guildId, id);
-            const { embeds, components } = buildManageView(updated);
-            return interaction.update({ embeds, components });
-        }
-
-        if (action === 'remove') {
-            await removeWatch(guildId, id);
-            const { embeds, components } = await buildWatchListEmbed(guildId);
-            return interaction.update({ content: `✅ Removed ${PLATFORMS[w.platform].label} — ${w.handle}.`, embeds, components });
-        }
-
-        if (action === 'backto') {
-            const { embeds, components } = buildManageView(w);
-            return interaction.update({ content: null, embeds, components });
+    else if (commandName === 'help') { await reply({ embeds: [helpOverviewEmbed()], components: helpRows(), flags: [MessageFlags.Ephemeral] }); }
+    else if (commandName === 'globalhashes') {
+        if (interaction.user.id !== OWNER_ID) return reply('❌ This command is restricted to the bot owner.');
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'view') {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const { embeds, components } = await buildGlobalHashesEmbed();
+            await interaction.editReply({ embeds, components });
+        } else if (sub === 'add') {
+            const att = interaction.options.getAttachment('image'), label = interaction.options.getString('label').slice(0,100).replace(/[\x00-\x1F\x7F]/g,'');
+            if (!att.contentType?.startsWith('image/') && !/\.(png|jpg|jpeg|gif|webp)$/i.test(att.name ?? '')) return reply('❌ Please attach an image file (PNG, JPG, GIF, or WebP).');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            let buffer; try { buffer = await fetchImageBuffer(att.url); } catch (e) { return reply(`❌ Failed to download image: ${e.message}`); }
+            let hash; try { hash = await dHash(buffer); } catch (e) { return reply(`❌ Failed to process image: ${e.message}`); }
+            const existing = await getGlobalScamHashes();
+            for (const e of existing) { if (hammingDistance(hash, e.hash) <= 10) return reply(`❌ Already registered (or similar to) **${e.label}** (ID: \`${e.id}\`).`); }
+            const entry = await addGlobalScamHash(hash, label, interaction.user.tag);
+            await reply({ embeds: [E('#00ff00','Global Scam Image Registered').addFields({ name: 'Label', value: label, inline: true }, { name: 'ID', value: `${entry.id}`, inline: true }, { name: 'Hash', value: `\`${hash}\``, inline: false }).setFooter({ text: 'Any similar image posted in any server will now be auto-removed and timed out' })] });
         }
     }
-
-    // ── Select/skip: notification types from the guided /social add flow —
-    // chains straight into the per-type message modal instead of just confirming.
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialtypeadd_select_')) {
-        const id = parseInt(interaction.customId.slice(21), 10);
-        const w = await getWatch(guildId, id);
-        if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
-        await updateWatchNotifyTypes(guildId, id, interaction.values);
-        const updated = await getWatch(guildId, id);
-        return interaction.showModal(buildPerTypeMessageModal(updated));
-    }
-    if (interaction.isButton() && interaction.customId.startsWith('socialtypeadd_skip_')) {
-        const id = parseInt(interaction.customId.slice(19), 10);
-        const w = await getWatch(guildId, id);
-        if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
-        await updateWatchNotifyTypes(guildId, id, null);
-        const updated = await getWatch(guildId, id);
-        return interaction.showModal(buildPerTypeMessageModal(updated));
-    }
-
-    // ── Select: notification types (post-add and manage flows) ──────────────
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialtype_select_')) {
-        const id = parseInt(interaction.customId.slice(18), 10);
-        const w = await getWatch(guildId, id);
-        if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
-        await updateWatchNotifyTypes(guildId, id, interaction.values);
-        const typeNames = interaction.values.map(v => PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === v)?.label || v).join(', ');
-        const updated = await getWatch(guildId, id);
-        const { embeds, components } = buildManageView(updated);
-        return interaction.update({ content: `✅ Notification types set to: **${typeNames}**`, embeds, components });
-    }
-
-    // ── Button: skip type selector (all types) ───────────────────────────────
-    if (interaction.isButton() && interaction.customId.startsWith('socialtype_skip_')) {
-        const id = parseInt(interaction.customId.slice(16), 10);
-        const w = await getWatch(guildId, id);
-        if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
-        await updateWatchNotifyTypes(guildId, id, null);
-        const updated = await getWatch(guildId, id);
-        const { embeds, components } = buildManageView(updated);
-        return interaction.update({ content: '✅ Will notify for all content types.', embeds, components });
-    }
-
-    // ── Select: change channel ───────────────────────────────────────────────
-    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('socialchannel_select_')) {
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = parseInt(interaction.customId.slice(21), 10);
-        const channelId = interaction.values[0];
-        await updateWatchChannel(guildId, id, channelId);
-        const w = await getWatch(guildId, id);
-        const { embeds, components } = buildManageView(w);
-        return interaction.update({ embeds, components });
-    }
-
-    // ── Select: set ping role ────────────────────────────────────────────────
-    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('socialrole_select_')) {
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = parseInt(interaction.customId.slice(18), 10);
-        const roleId = interaction.values[0];
-        await updateWatchRole(guildId, id, roleId);
-        const w = await getWatch(guildId, id);
-        const { embeds, components } = buildManageView(w);
-        return interaction.update({ embeds, components });
-    }
-
-    // ── Button: clear ping role ──────────────────────────────────────────────
-    if (interaction.isButton() && interaction.customId.startsWith('socialrole_clear_')) {
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = parseInt(interaction.customId.slice(17), 10);
-        await updateWatchRole(guildId, id, null);
-        const w = await getWatch(guildId, id);
-        const { embeds, components } = buildManageView(w);
-        return interaction.update({ embeds, components });
-    }
-
-    // ── Modal: save custom message ──────────────────────────────────────────
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('socialmsg_modal_')) {
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = parseInt(interaction.customId.slice(16), 10);
-        const template = interaction.fields.getTextInputValue('template').trim() || null;
-        await updateWatchTemplate(guildId, id, template);
-        await interaction.deferUpdate();
-        const w = await getWatch(guildId, id);
-        const { embeds, components } = buildManageView(w);
-        return interaction.editReply({ embeds, components });
-    }
-
-    // ── Button: open per-post-type custom message popup form ────────────────
-    if (interaction.isButton() && interaction.customId.startsWith('socialpertype_open_')) {
-        const id = parseInt(interaction.customId.slice(19), 10);
-        const w = await getWatch(guildId, id);
-        if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        return interaction.showModal(buildPerTypeMessageModal(w));
-    }
-
-    // ── Modal: save per-post-type custom messages ────────────────────────────
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('socialpertype_modal_')) {
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = parseInt(interaction.customId.slice(20), 10);
-        const w = await getWatch(guildId, id);
-        if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
-        const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-        const updatedTemplates = {};
-        for (const t of types.slice(0, 5)) {
-            const val = interaction.fields.getTextInputValue(`tmpl_${t.id}`).trim();
-            if (val) updatedTemplates[t.id] = val;
+    else if (commandName === 'config') {
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'access') { await showAccessControlConfig(interaction, guildId); }
+        else if (sub === 'set') {
+            const level = interaction.options.getInteger('level'), role = interaction.options.getRole('role'), durationStr = interaction.options.getString('duration');
+            if (level < 1 || level > 100) return reply('❌ Level must be between 1 and 100.');
+            const dur = parseDuration(durationStr); if (!dur) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, `d:h:m:s`, or `forever`. Max 365 days.');
+            const cfg = await getConfig(guildId); cfg.levels ??= {};
+            cfg.levels[level] = { roleId: role.id, roleName: role.name, durationMs: dur.totalMs, isForever: dur.isForever, durationDisplay: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds, dur.isForever) };
+            saveConfig(guildId, cfg);
+            await reply({ embeds: [E('#00ff00','Warning Level Configured').addFields({ name: 'Level', value: `${level}`, inline: true }, { name: 'Role', value: `${role}`, inline: true }, { name: 'Duration', value: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds, dur.isForever), inline: true })], flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'view') {
+            const { embeds, components } = await buildConfigViewEmbed(guildId);
+            await reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'logchannel') {
+            const { embeds, components } = await buildLogChannelEmbed(guildId);
+            await reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
+        } else if (sub === 'notifications') {
+            const enabled = interaction.options.getBoolean('enabled'), cfg = await getConfig(guildId); cfg.warnDm = enabled; saveConfig(guildId, cfg);
+            await reply({ embeds: [E(enabled ? '#00ff00' : '#FFA500', enabled ? 'Notifications Enabled' : 'Notifications Disabled').setDescription(enabled ? "Users will be DM'd for warnings, scam removals, and spam removals." : "Users will **not** be DM'd for warnings, scam removals, or spam removals.")], flags: [MessageFlags.Ephemeral] });
         }
-        await updateWatchMessageTemplates(guildId, id, updatedTemplates);
-        await interaction.deferUpdate();
-        const updated = await getWatch(guildId, id);
-        const { embeds, components } = buildManageView(updated);
-        return interaction.editReply({ embeds, components });
+    }
+    else if (commandName === 'warning' && interaction.options.getSubcommand() === 'give') {
+        const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
+        const level = interaction.options.getInteger('level'), reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,1000).replace(/[\x00-\x1F\x7F]/g,'');
+        if (level < 1 || level > 100) return reply('❌ Level must be between 1 and 100.');
+        if (!member) return reply(`❌ ${user} is not in this server.`);
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const cfg = await getConfig(guildId);
+        if (!cfg.levels?.[level]) return reply(`❌ Level ${level} is not configured. Use /config set first.`);
+        const botMember = interaction.guild.members.me, configRole = interaction.guild.roles.cache.get(cfg.levels[level].roleId);
+        if (!configRole) return reply('❌ Configured role not found. Please re-run /config set.');
+        if (configRole.position >= botMember.roles.highest.position) return reply(`❌ My role must be above ${configRole} in the role list.`);
+        if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) return reply('❌ I need the "Manage Roles" permission.');
+        try {
+            const result = await applyWarning(interaction.guild, member, user, guildId, level, reason, interaction.channel.id, interaction.user.tag);
+            if (result.error) return reply(`❌ ${result.error}`);
+            logMod(interaction.guild, guildId, E('#ff0000','Warning Issued').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Level', value: `${level}`, inline: true }, { name: 'Duration', value: result.config.durationDisplay||'Unknown', inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
+            await reply({ embeds: [E('#ff0000','Warning Issued').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Level', value: `${level}`, inline: true }, { name: 'Role', value: `${result.role}`, inline: true }, { name: 'Duration', value: result.config.durationDisplay||'Unknown', inline: true }, { name: 'Reason', value: reason }, { name: 'Issued by', value: `${interaction.user}` })] });
+            const esc = await checkEscalation(interaction.guild, member, user, guildId, level, interaction.channel.id, interaction.user.tag);
+            if (esc?.escalated) await interaction.followUp({ content: `${user} auto-escalated to **Level ${esc.nextLevel}** (${esc.role}).${esc.timedOut?` Timeout: **${esc.timeoutDisplay}**.`:''}${esc.hitCap?`\nReached cap (Level ${esc.nextLevel}).`:''}`, flags: [MessageFlags.Ephemeral] });
+            else if (esc?.atCap) await interaction.followUp({ content: `Threshold hit for Level ${level}, but cap (Level ${esc.cap}) prevents further escalation.`, flags: [MessageFlags.Ephemeral] });
+            else if (esc?.noNextLevel) await interaction.followUp({ content: `Threshold hit for Level ${level}, but Level ${esc.nextLevel} isn't configured.`, flags: [MessageFlags.Ephemeral] });
+            else if (esc?.counted) await interaction.followUp({ content: `Escalation: ${esc.count}/${esc.threshold} warnings at Level ${level}.`, flags: [MessageFlags.Ephemeral] });
+        } catch (e) { console.error(e); await reply('❌ Failed to assign warning. Check permissions.'); }
+    }
+    else if (commandName === 'warning' && interaction.options.getSubcommand() === 'remove') {
+        const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
+        if (!member) return reply(`❌ ${user} is not in this server.`);
+        const userWarnings = [...activeWarnings.entries()].filter(([, w]) => w.guildId === guildId && w.userId === user.id);
+        if (!userWarnings.length) return reply(`❌ ${user} has no active warnings.`);
+        const embed = E('#FFA500','⚠️ Remove a Warning').setDescription(`${user} has **${userWarnings.length}** active warning${userWarnings.length>1?'s':''}. Select one below to remove it.`).setFooter({ text: 'Expires in 60 seconds' });
+        const options = userWarnings.slice(0, 25).map(([key, w]) => {
+            let expires;
+            if (w.isForever) expires = 'Permanent';
+            else { const s = Math.max(0, Math.floor((w.expiresAt - Date.now()) / 1000)), d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60), sec = s%60; expires = `Expires in ${[d&&`${d}d`,h&&`${h}h`,m&&`${m}m`,(!d&&!h)&&`${sec}s`].filter(Boolean).join(' ')||'<1m'}`; }
+            embed.addFields({ name: `Level ${w.level} — ${w.roleName}`, value: `${expires}\nReason: ${(w.reason||'No reason').slice(0,100)}` });
+            return { label: `Level ${w.level} — ${w.roleName}`, description: `${expires} · ${(w.reason||'No reason').slice(0,50)}`, value: key };
+        });
+        const pendingId = interaction.id;
+        pendingUnwarns.set(pendingId, { targetUserId: user.id, targetUserTag: user.tag, guildId, modId: interaction.user.id });
+        setTimeout(() => pendingUnwarns.delete(pendingId), 60_000);
+        await reply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`unwarn_select_${pendingId}`).setPlaceholder('Select a warning to remove…').addOptions(options))], flags: [MessageFlags.Ephemeral] });
+    }
+    else if (commandName === 'timeout') {
+        const sub = interaction.options.getSubcommand(), user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
+        const reason = (interaction.options.getString('reason') || 'No reason provided').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
+        if (!member) return reply(`❌ ${user} is not in this server.`);
+        const botMember = interaction.guild.members.me;
+        if (!botMember.permissions.has(PermissionFlagsBits.ModerateMembers)) return reply('❌ I need the "Moderate Members" permission.');
+        if (member.roles.highest.position >= botMember.roles.highest.position) return reply(`❌ Cannot ${sub === 'give' ? 'timeout' : 'remove timeout from'} this user — their role is equal to or above mine.`);
+        if (sub === 'give') {
+            const dur = parseDuration(interaction.options.getString('duration'));
+            if (!dur || dur.isForever) return reply('❌ Invalid duration. Use `m:s`, `h:m:s`, or `d:h:m:s`. Max 28 days.');
+            if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Discord timeouts cannot exceed 28 days.');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            try {
+                await member.timeout(dur.totalMs, reason);
+                const dd = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds), exTs = Math.floor((Date.now()+dur.totalMs)/1000);
+                saveActiveTimeout(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), expiresAt: Date.now() + dur.totalMs, durationDisplay: dd });
+                logMod(interaction.guild, guildId, E('#ff6600','Member Timed Out').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
+                user.send({ embeds: [E('#ff6600','You Have Been Timed Out').setDescription(`You were timed out in **${interaction.guild.name}**.`).addFields({ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason })] }).catch(() => {});
+                addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'timeout', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), duration: dd });
+                await reply({ embeds: [E('#ff6600','Timeout Applied').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }, { name: 'Reason', value: reason }, { name: 'Issued by', value: `${interaction.user}` })] });
+            } catch (e) { console.error(e); await reply('❌ Failed to apply timeout.'); }
+        } else {
+            if (!member.communicationDisabledUntilTimestamp || member.communicationDisabledUntilTimestamp < Date.now()) return reply(`❌ ${user} is not currently timed out.`);
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            try {
+                await member.timeout(null, reason);
+                deleteActiveTimeout(guildId, user.id);
+                logMod(interaction.guild, guildId, E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Reason', value: reason }, { name: 'Moderator', value: `${interaction.user}` }));
+                addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'timeout_remove', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
+                await reply({ embeds: [E('#00ff00','Timeout Removed').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Removed by', value: `${interaction.user}` })] });
+            } catch (e) { console.error(e); await reply('❌ Failed to remove timeout.'); }
+        }
+    }
+    else if (commandName === 'mywarnings') {
+        const userWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === interaction.user.id);
+        if (!userWarnings.length) return reply('You have no active warnings!');
+        const cfg = await getConfig(guildId), embed = E('#FFA500','Your Active Warnings').setDescription(`You have ${userWarnings.length} active warning${userWarnings.length>1?'s':''}`).setFooter({ text: 'Warnings are automatically removed when they expire' });
+        for (const w of userWarnings) {
+            const lc = cfg.levels?.[w.level], name = `Level ${w.level} — ${lc?.roleName||'Unknown Role'}`;
+            if (w.isForever) embed.addFields({ name, value: ' **Duration:** Forever\n **Status:** Permanent' });
+            else { const t = w.expiresAt - Date.now(); embed.addFields({ name, value: t <= 0 ? 'Expired (will be removed shortly)' : (() => { const s = Math.floor(t/1000); return `**Time Left:** ${formatDuration(Math.floor(s/86400),Math.floor((s%86400)/3600),Math.floor((s%3600)/60),s%60)}\n**Expires:** <t:${Math.floor(w.expiresAt/1000)}:F>`; })() }); }
+        }
+        await reply({ embeds: [embed], components: [refreshBtn(`mywarnings_refresh_${interaction.user.id}`)], flags: [MessageFlags.Ephemeral] });
+    }
+    else if (commandName === 'warning' && interaction.options.getSubcommand() === 'list') {
+        const { embed, totalPages, page } = buildWarnlistEmbed(guildId, 0);
+        await reply({ embeds: [embed], components: warnlistRow(page, totalPages, guildId) });
+    }
+    else if (commandName === 'warning' && interaction.options.getSubcommand() === 'history') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const user = interaction.options.getUser('user'), entries = await getHistory(guildId, user.id);
+        if (!entries.length) return interaction.editReply({ content: `❌ No warning history found for ${user}.` });
+        const embed = E('#5865F2',`Warning History — ${user.tag}`).setDescription(`Showing last ${entries.length} record${entries.length>1?'s':''}.`);
+        for (const e of entries) {
+            const dateStr = `<t:${Math.floor(e.issuedAt/1000)}:d>`;
+            if (e.type === 'kick') embed.addFields({ name: `Kick — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'ban') embed.addFields({ name: `Ban — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'unban') embed.addFields({ name: `Unban — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'timeout') embed.addFields({ name: `Timeout (${e.duration || 'Unknown'}) — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'timeout_remove') embed.addFields({ name: `Timeout Removed — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'scam_remove') embed.addFields({ name: `Scam Message Removed — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else if (e.type === 'spam_remove') embed.addFields({ name: `Spam Messages Removed — ${dateStr}`, value: `by ${e.issuedBy}\n${e.reason}` });
+            else { const s = e.endReason==='expired'?'Expired':e.endReason==='manual'?'Removed':'Active'; embed.addFields({ name: `Level ${e.level} — ${e.roleName} — ${dateStr}`, value: `${s} • by ${e.issuedBy}\n${e.reason}` }); }
+        }
+        await interaction.editReply({ embeds: [embed] });
+    }
+    else if (commandName === 'kick') {
+        const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
+        const reason = interaction.options.getString('reason').slice(0,512).replace(/[\x00-\x1F\x7F]/g,'');
+        if (!member) return reply(`❌ ${user} is not in this server.`);
+        const botMember = interaction.guild.members.me;
+        if (!botMember.permissions.has(PermissionFlagsBits.KickMembers)) return reply('❌ I need the "Kick Members" permission.');
+        if (member.roles.highest.position >= botMember.roles.highest.position) return reply('❌ Cannot kick this user — their role is equal to or above mine.');
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        try {
+            user.send({ embeds: [E('#ff6600','You have been kicked').setDescription(`You were kicked from **${interaction.guild.name}**.`).addFields({ name: 'Reason', value: reason })] }).catch(() => {});
+            await member.kick(reason);
+            deleteActiveTimeout(guildId, user.id);
+            addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'kick', reason, issuedBy: interaction.user.tag, issuedAt: Date.now() });
+            logMod(interaction.guild, guildId, E('#ff6600','Member Kicked').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Reason', value: reason }));
+            await reply({ embeds: [E('#ff6600','Member Kicked').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Reason', value: reason }, { name: 'Kicked by', value: `${interaction.user}` })] });
+        } catch (e) { console.error(e); await reply('❌ Failed to kick user.'); }
+    }
+    else if (commandName === 'ban') {
+        const sub = interaction.options.getSubcommand(), botMember = interaction.guild.members.me;
+        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) return reply('❌ I need the "Ban Members" permission.');
+        if (sub === 'give') {
+            const user = interaction.options.getUser('user'), member = interaction.guild.members.cache.get(user.id);
+            const reason = interaction.options.getString('reason').slice(0,512).replace(/[ -]/g,''), deleteDays = interaction.options.getInteger('delete_days') ?? 0;
+            const durationStr = interaction.options.getString('duration'), dur = durationStr ? parseDuration(durationStr) : null;
+            const deleteMessagesStr = interaction.options.getString('delete_messages');
+            const delMsgDur = deleteMessagesStr ? parseDuration(deleteMessagesStr) : null;
+            if (durationStr && (!dur || dur.isForever)) return reply('❌ Invalid duration. Omit for permanent ban.');
+            if (deleteMessagesStr && (!delMsgDur || delMsgDur.isForever)) return reply('❌ Invalid delete_messages duration. Use `m:s`, `h:m:s`, or `d:h:m:s`.');
+            if (member && member.roles.highest.position >= botMember.roles.highest.position) return reply('❌ Cannot ban this user — their role is equal to or above mine.');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            try {
+                const dd = dur ? formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds) : null, expiresAt = dur ? Date.now() + dur.totalMs : null, exTs = expiresAt ? Math.floor(expiresAt / 1000) : null;
+                if (member) user.send({ embeds: [E('#ff0000','You have been banned').setDescription(`You were banned from **${interaction.guild.name}**.`).addFields({ name: 'Reason', value: reason }, ...(dd ? [{ name: 'Duration', value: dd, inline: true }, { name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []))] }).catch(() => {});
+                await interaction.guild.members.ban(user, { reason, deleteMessageDays: deleteDays });
+                deleteActiveTimeout(guildId, user.id);
+                addHistory(guildId, user.id, { guildId, userId: user.id, userTag: user.tag, type: 'ban', reason, issuedBy: interaction.user.tag, issuedAt: Date.now(), deleteDays, expiresAt });
+                if (expiresAt) scheduleBanExpiry(guildId, user.id, user.tag, expiresAt, reason);
+                // Time-based message deletion across all channels
+                let deletedMsgCount = 0;
+                if (delMsgDur) {
+                    const since = Date.now() - delMsgDur.totalMs;
+                    const channels = interaction.guild.channels.cache.filter(c => c.isTextBased() && c.permissionsFor(interaction.guild.members.me).has(PermissionFlagsBits.ManageMessages));
+                    for (const ch of channels.values()) deletedMsgCount += await bulkDeleteInRange(ch, { userId: user.id, since }).catch(() => 0);
+                }
+                const delDisplay = delMsgDur ? formatDuration(delMsgDur.days, delMsgDur.hours, delMsgDur.minutes, delMsgDur.seconds) : null;
+                logMod(interaction.guild, guildId, E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user} (${user.tag})`, inline: true }, { name: 'Moderator', value: `${interaction.user}`, inline: true }, { name: 'Duration', value: dd || 'Permanent', inline: true }, ...(exTs ? [{ name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []), { name: 'Messages Deleted', value: deleteDays ? `${deleteDays} day(s) via Discord` : delDisplay ? `${deletedMsgCount} msgs in last ${delDisplay}` : 'None', inline: true }, { name: 'Reason', value: reason }));
+                await reply({ embeds: [E('#ff0000','Member Banned').addFields({ name: 'User', value: `${user}`, inline: true }, { name: 'Duration', value: dd || 'Permanent', inline: true }, ...(exTs ? [{ name: 'Expires', value: `<t:${exTs}:R>`, inline: true }] : []), { name: 'Messages Deleted', value: deleteDays ? `${deleteDays} day(s) via Discord` : delDisplay ? `${deletedMsgCount} msgs in last ${delDisplay}` : 'None', inline: true }, { name: 'Reason', value: reason }, { name: 'Banned by', value: `${interaction.user}` })] });
+            } catch (e) { console.error(e); await reply('❌ Failed to ban user.'); }
+        } else {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const bans = await interaction.guild.bans.fetch().catch(() => null);
+            if (!bans || !bans.size) return reply('📋 There are no banned users in this server.');
+            const list = [...bans.values()];
+            const embed = E('#ff0000','🔓 Unban a User').setDescription(`This server has **${list.length}** banned user${list.length>1?'s':''}. Select one below to unban.`);
+            for (const b of list.slice(0, 25)) embed.addFields({ name: b.user.tag, value: `Reason: ${(b.reason || 'No reason provided').slice(0,200)}` });
+            if (list.length > 25) embed.setFooter({ text: `Showing first 25 of ${list.length}` });
+            const options = list.slice(0, 25).map(b => ({ label: b.user.tag.slice(0,100), description: `ID: ${b.user.id}`, value: b.user.id }));
+            await interaction.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`unban_select_${guildId}`).setPlaceholder('Select a user to unban…').addOptions(options))] });
+        }
+    }
+    else if (commandName === 'userinfo') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const user = interaction.options.getUser('user');
+        const [member, history, notes] = await Promise.all([interaction.guild.members.fetch(user.id).catch(() => null), getAllHistory(guildId, user.id), getNotes(guildId, user.id)]);
+        const embed = new EmbedBuilder().setColor('#5865F2').setAuthor({ name: user.tag, iconURL: user.displayAvatarURL({ size: 256 }) }).setThumbnail(user.displayAvatarURL({ size: 256 })).addFields({ name: 'Account Created', value: `<t:${Math.floor(user.createdTimestamp/1000)}:F>\n<t:${Math.floor(user.createdTimestamp/1000)}:R>`, inline: true }, { name: 'Joined Server', value: member ? `<t:${Math.floor(member.joinedTimestamp/1000)}:F>\n<t:${Math.floor(member.joinedTimestamp/1000)}:R>` : '*Not in server*', inline: true }).setTimestamp();
+        const activeUserWarnings = [...activeWarnings.values()].filter(w => w.guildId === guildId && w.userId === user.id), activeByLevel = {};
+        for (const w of activeUserWarnings) activeByLevel[w.level] = (activeByLevel[w.level] || 0) + 1;
+        embed.addFields({ name: 'Active Warnings', value: Object.keys(activeByLevel).length ? Object.entries(activeByLevel).sort(([a],[b])=>a-b).map(([l,c])=>`Level ${l}: **${c}**`).join('\n') : 'None', inline: true });
+        const warnCounts = {}, timeoutCount = history.filter(e => e.type === 'timeout').length, kickCount = history.filter(e => e.type === 'kick').length, banCount = history.filter(e => e.type === 'ban').length;
+        for (const e of history) if (e.level != null) warnCounts[e.level] = (warnCounts[e.level] || 0) + 1;
+        if (Object.keys(warnCounts).length) embed.addFields({ name: 'Warn History', value: Object.entries(warnCounts).sort(([a],[b])=>a-b).map(([l,c])=>`Level ${l}: **${c}**`).join('\n'), inline: true });
+        const modLines = [...(timeoutCount?[`Timeouts: **${timeoutCount}**`]:[]), ...(kickCount?[`Kicks: **${kickCount}**`]:[]), ...(banCount?[`Bans: **${banCount}**`]:[])];
+        if (modLines.length) embed.addFields({ name: 'Mod Actions', value: modLines.join('\n'), inline: true });
+        if (notes.length) { const shown = notes.slice(-5); embed.addFields({ name: `Notes (${notes.length})`, value: shown.map(n => `\`${n.id}\` <t:${Math.floor(n.addedAt/1000)}:d> by **${n.addedBy}**\n${n.text.slice(0,100)}${n.text.length>100?'…':''}`).join('\n\n') }); if (notes.length > 5) embed.setFooter({ text: `Showing last 5 of ${notes.length} notes` }); }
+        await interaction.editReply({ embeds: [embed], components: [refreshBtn(`userinfo_refresh_${user.id}_${guildId}`)] });
+    }
+    else if (commandName === 'note') {
+        const sub = interaction.options.getSubcommand(), user = interaction.options.getUser('user');
+        if (sub === 'add') {
+            const text = interaction.options.getString('text').slice(0,1000).replace(/[\x00-\x1F\x7F]/g,'');
+            const note = { id: Date.now(), text, addedBy: interaction.user.tag, addedAt: Date.now() };
+            addNote(guildId, user.id, note); await reply(`✅ Note added to ${user} (ID: \`${note.id}\`).`);
+        } else if (sub === 'list') {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const embed = await buildNoteListEmbed(guildId, user);
+            await interaction.editReply({ embeds: [embed] });
+        } else if (sub === 'remove') {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const { embeds, components } = await buildNoteViewEmbed(guildId, user);
+            await interaction.editReply({ embeds, components });
+        }
+    }
+    else if (commandName === 'scam') {
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'add') {
+            const att = interaction.options.getAttachment('image'), label = interaction.options.getString('label').slice(0,100).replace(/[\x00-\x1F\x7F]/g,'');
+            if (!att.contentType?.startsWith('image/') && !/\.(png|jpg|jpeg|gif|webp)$/i.test(att.name ?? '')) return reply('❌ Please attach an image file (PNG, JPG, GIF, or WebP).');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            let buffer; try { buffer = await fetchImageBuffer(att.url); } catch (e) { return reply(`❌ Failed to download image: ${e.message}`); }
+            let hash; try { hash = await dHash(buffer); } catch (e) { return reply(`❌ Failed to process image: ${e.message}`); }
+            const existing = await getScamHashes(guildId), spc = await getScamProtConfig(guildId);
+            for (const e of existing) { if (hammingDistance(hash, e.hash) <= spc.threshold) return reply(`❌ Already registered (or similar to) **${e.label}** (ID: \`${e.id}\`).`); }
+            const entry = await addScamHash(guildId, hash, label, interaction.user.tag);
+            const addEmbed = E('#00ff00','Scam Image Registered').addFields({ name: 'Label', value: label, inline: true }, { name: 'ID', value: `${entry.id}`, inline: true }, { name: 'Hash', value: `\`${hash}\``, inline: false }).setFooter({ text: 'Any similar image posted in this server will now be actioned' });
+            const addWarnField = mentionEveryoneWarningField(interaction.guild); if (addWarnField) addEmbed.addFields(addWarnField);
+            await reply({ embeds: [addEmbed] });
+        } else if (sub === 'list') {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const { embeds, components } = await buildScamListEmbed(guildId);
+            await interaction.editReply({ embeds, components });
+        } else if (sub === 'config') {
+            const enabled = interaction.options.getBoolean('enabled'), del = interaction.options.getBoolean('delete'), toStr = interaction.options.getString('timeout'), thresh = interaction.options.getInteger('threshold');
+            const cfg = await getConfig(guildId); cfg.scamProt ??= {};
+            if (enabled !== null) cfg.scamProt.enabled = enabled;
+            if (del !== null) cfg.scamProt.deleteMsg = del;
+            if (thresh !== null) cfg.scamProt.threshold = thresh;
+            if (toStr !== null) {
+                if (toStr.toLowerCase() === 'none') { cfg.scamProt.timeoutMs = null; cfg.scamProt.timeoutDisplay = 'None'; }
+                else { const dur = parseDuration(toStr); if (!dur || dur.isForever) return reply('❌ Invalid timeout.'); if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Timeouts cannot exceed 28 days.'); cfg.scamProt.timeoutMs = dur.totalMs; cfg.scamProt.timeoutDisplay = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds); }
+            }
+            saveConfig(guildId, cfg);
+            const spc = { enabled: true, threshold: 10, timeoutMs: 5*60*1000, timeoutDisplay: '5m', deleteMsg: true, ...cfg.scamProt };
+            const cfgEmbed = E('#5865F2','Scam Protection Config').addFields({ name: 'Detection', value: spc.enabled?'Enabled':'Disabled', inline: true }, { name: 'Delete Messages', value: spc.deleteMsg?'Yes':'No', inline: true }, { name: 'Timeout', value: spc.timeoutMs?spc.timeoutDisplay:'None', inline: true }, { name: 'Threshold', value: `${spc.threshold}`, inline: true });
+            const cfgWarnField = mentionEveryoneWarningField(interaction.guild); if (cfgWarnField) cfgEmbed.addFields(cfgWarnField);
+            await reply({ embeds: [cfgEmbed], flags: [MessageFlags.Ephemeral] });
+        }
+    }
+    else if (commandName === 'spam') {
+        const sub = interaction.options.getSubcommand();
+        const spamEmbed = (sp) => { const s = { enabled: true, count: 5, windowMs: 10_000, timeoutMs: 10*60*1000, timeoutDisplay: '10m', deleteMsg: true, similarityThreshold: 0.7, ...sp }; return E('#ff6600','Spam Protection Config').addFields({ name: 'Detection', value: s.enabled?'Enabled':'Disabled', inline: true }, { name: 'Trigger', value: `${s.count} similar msgs within ${s.windowMs/1000}s`, inline: true }, { name: 'Similarity', value: `${Math.round(s.similarityThreshold*100)}%`, inline: true }, { name: 'Delete Messages', value: s.deleteMsg?'Yes':'No', inline: true }, { name: 'Timeout', value: s.timeoutMs?s.timeoutDisplay:'None', inline: true }); };
+        if (sub === 'config') {
+            const enabled = interaction.options.getBoolean('enabled'), del = interaction.options.getBoolean('delete'), count = interaction.options.getInteger('count'), window = interaction.options.getInteger('window'), toStr = interaction.options.getString('timeout'), simPct = interaction.options.getInteger('similarity');
+            const cfg = await getConfig(guildId); cfg.spamProt ??= {};
+            if (enabled !== null) cfg.spamProt.enabled = enabled;
+            if (del !== null) cfg.spamProt.deleteMsg = del;
+            if (count !== null) cfg.spamProt.count = count;
+            if (window !== null) cfg.spamProt.windowMs = window * 1000;
+            if (simPct !== null) cfg.spamProt.similarityThreshold = simPct / 100;
+            if (toStr !== null) {
+                if (toStr.toLowerCase() === 'none') { cfg.spamProt.timeoutMs = null; cfg.spamProt.timeoutDisplay = 'None'; }
+                else { const dur = parseDuration(toStr); if (!dur || dur.isForever) return reply('❌ Invalid timeout.'); if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Timeouts cannot exceed 28 days.'); cfg.spamProt.timeoutMs = dur.totalMs; cfg.spamProt.timeoutDisplay = formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds); }
+            }
+            saveConfig(guildId, cfg);
+            await reply({ embeds: [spamEmbed(cfg.spamProt)], flags: [MessageFlags.Ephemeral] });
+        } else {
+            const cfg = await getConfig(guildId);
+            await reply({ embeds: [spamEmbed(cfg.spamProt)], flags: [MessageFlags.Ephemeral] });
+        }
+    }
+    else if (commandName === 'messages') {
+        const sub = interaction.options.getSubcommand();
+        const botMember = interaction.guild.members.me;
+        if (!botMember.permissions.has(PermissionFlagsBits.ManageMessages)) return reply('❌ I need the "Manage Messages" permission.');
+
+        if (sub === 'delete') {
+            const filterUser = interaction.options.getUser('user'), count = interaction.options.getInteger('count') ?? 100;
+            const withinStr = interaction.options.getString('within'), withinDur = withinStr ? parseDuration(withinStr) : null;
+            if (withinStr && (!withinDur || withinDur.isForever)) return reply('❌ Invalid within duration. Use `m:s`, `h:m:s`, or `d:h:m:s`.');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            if (!botMember.permissionsIn(interaction.channel).has(PermissionFlagsBits.ManageMessages)) return reply('❌ I need ManageMessages in this channel.');
+            const since = withinDur ? Date.now() - withinDur.totalMs : null;
+            const deleted = await bulkDeleteInRange(interaction.channel, { userId: filterUser?.id, since, maxCount: count });
+            const withinDisplay = withinDur ? formatDuration(withinDur.days, withinDur.hours, withinDur.minutes, withinDur.seconds) : null;
+            logMod(interaction.guild, guildId, E('#ff6600','Messages Deleted').addFields({ name: 'Channel', value: `${interaction.channel}`, inline: true }, { name: 'Deleted', value: `${deleted}`, inline: true }, ...(filterUser ? [{ name: 'User Filter', value: `${filterUser}`, inline: true }] : []), ...(withinDisplay ? [{ name: 'Within', value: withinDisplay, inline: true }] : []), { name: 'Moderator', value: `${interaction.user}`, inline: true }));
+            await reply(`✅ Deleted **${deleted}** message${deleted !== 1 ? 's' : ''} in ${interaction.channel}.`);
+        }
+        else if (sub === 'purge') {
+            const withinStr = interaction.options.getString('within'), filterUser = interaction.options.getUser('user');
+            const withinDur = parseDuration(withinStr);
+            if (!withinDur || withinDur.isForever) return reply('❌ Invalid within duration. Use `m:s`, `h:m:s`, or `d:h:m:s`.');
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const since = Date.now() - withinDur.totalMs;
+            const channels = interaction.guild.channels.cache.filter(c => c.isTextBased() && botMember.permissionsIn(c).has(PermissionFlagsBits.ManageMessages));
+            let totalDeleted = 0, channelsAffected = 0;
+            for (const ch of channels.values()) { const n = await bulkDeleteInRange(ch, { userId: filterUser?.id, since }); if (n > 0) { totalDeleted += n; channelsAffected++; } }
+            const withinDisplay = formatDuration(withinDur.days, withinDur.hours, withinDur.minutes, withinDur.seconds);
+            logMod(interaction.guild, guildId, E('#ff0000','Messages Purged').addFields({ name: 'Deleted', value: `${totalDeleted} messages`, inline: true }, { name: 'Channels Affected', value: `${channelsAffected}`, inline: true }, { name: 'Within', value: withinDisplay, inline: true }, ...(filterUser ? [{ name: 'User Filter', value: `${filterUser}`, inline: true }] : []), { name: 'Moderator', value: `${interaction.user}`, inline: true }));
+            await reply(`✅ Purged **${totalDeleted}** message${totalDeleted !== 1 ? 's' : ''} across **${channelsAffected}** channel${channelsAffected !== 1 ? 's' : ''} in the last **${withinDisplay}**.`);
+        }
+    }
+    else if (commandName === 'escalation') {
+        const sub = interaction.options.getSubcommand(), cfg = await getConfig(guildId);
+        cfg.escalation ??= { thresholds: {} }; const esc = cfg.escalation;
+        if (sub === 'set') {
+            const level = interaction.options.getInteger('level'), threshold = interaction.options.getInteger('threshold');
+            if (level < 1 || level > 100) return reply('❌ Level must be between 1 and 100.');
+            if (threshold < 2 || threshold > 50) return reply('❌ Threshold must be between 2 and 50.');
+            if (!cfg.levels?.[level]) return reply(`❌ Level ${level} not configured. Use /config set first.`);
+            const targetLevel = level + 1; if (!cfg.levels?.[targetLevel]) return reply(`❌ Level ${targetLevel} not configured. Use /config set first.`);
+            esc.thresholds[level] = threshold; saveConfig(guildId, cfg);
+            await reply(`**${threshold}x** Level ${level} → auto Level ${targetLevel}.`);
+        } else if (sub === 'cap') {
+            const level = interaction.options.getInteger('level'); if (level < 1 || level > 100) return reply('❌ Cap must be between 1 and 100.');
+            esc.cap = level; saveConfig(guildId, cfg); await reply(`Level cap set to **${level}**.`);
+        } else if (sub === 'timeout') {
+            const level = interaction.options.getInteger('level'), threshold = interaction.options.getInteger('threshold'), durationStr = interaction.options.getString('duration');
+            if (level < 2 || level > 100) return reply('❌ Target level must be between 2 and 100.');
+            if (threshold < 2 || threshold > 50) return reply('❌ Threshold must be between 2 and 50.');
+            const dur = parseDuration(durationStr); if (!dur || dur.isForever) return reply('❌ Invalid duration.'); if (dur.totalMs > MAX_TIMEOUT_MS) return reply('❌ Timeouts cannot exceed 28 days.');
+            cfg.levels ??= {};
+            if (!cfg.levels[level]) cfg.levels[level] = { isTimeoutLevel: true, timeoutDurationMs: dur.totalMs, timeoutDisplay: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds) };
+            esc.timeouts ??= {}; esc.timeouts[level] = { durationMs: dur.totalMs, durationDisplay: formatDuration(dur.days, dur.hours, dur.minutes, dur.seconds), threshold };
+            saveConfig(guildId, cfg); await reply(`Timeout escalation: **${threshold}x** Level ${level-1} → Level ${level} + **${esc.timeouts[level].durationDisplay}** timeout.`);
+        } else if (sub === 'view') {
+            const { embeds, components } = await buildEscalationViewEmbed(guildId);
+            await reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
+        }
     }
 
   } catch (error) {
@@ -1735,222 +1355,9 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-(async () => {
-    await ensureIPv4Pool();
-    try {
-        await initDB();
-    } catch (e) {
-        console.error('⚠️ initDB failed, starting bot anyway:', e.message);
-    }
-    if (!process.env.DISCORD_TOKEN || !process.env.DISCORD_TOKEN.trim()) {
-        console.error('❌ DISCORD_TOKEN is missing or empty. Set it in this service\'s environment variables and redeploy.');
-        process.exit(1);
-    }
-    try {
-        await client.login(process.env.DISCORD_TOKEN.trim());
-    } catch (e) {
-        console.error('❌ Discord login failed:', e.message, '\nDouble-check DISCORD_TOKEN on this service — copy it fresh from the Developer Portal with no extra whitespace/quotes.');
-        process.exit(1);
-    }
-})();
-
 process.on('unhandledRejection', e => console.error('⚠️ Unhandled rejection:', e));
 client.on('error', e => console.error('⚠️ Discord client error:', e));
-
-// ── OAuth code exchange (called from the HTTP callback routes) ────────────
-// Uses the newer "Instagram API with Instagram Login" (launched July 2024) — unlike the
-// older Facebook Login flow, this does NOT require the account to be linked to a Facebook
-// Page. The account just needs to be an Instagram Business/Creator account.
-async function exchangeInstagramCode(code) {
-    const cfg = OAUTH_CONFIG.instagram;
-    // 1. Exchange the auth code for a short-lived Instagram User access token.
-    const { json: tokenRes } = await postForm('https://api.instagram.com/oauth/access_token', {
-        client_id: cfg.clientId, client_secret: cfg.clientSecret, grant_type: 'authorization_code', redirect_uri: cfg.redirectUri, code,
-    });
-    if (!tokenRes?.access_token) throw new Error(tokenRes?.error_message || tokenRes?.error?.message || 'Instagram token exchange failed');
-
-    // 2. Exchange for a long-lived token (~60 days).
-    const { json: longRes } = await fetchJson(
-        `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${cfg.clientSecret}&access_token=${encodeURIComponent(tokenRes.access_token)}`
-    );
-    const accessToken = longRes?.access_token || tokenRes.access_token;
-    const expiresIn = longRes?.expires_in || 60 * 24 * 60 * 60;
-
-    // 3. Get the account's own ID + username directly — no Facebook Page lookup needed.
-    const { json: profile } = await fetchJson(`https://graph.instagram.com/me?fields=user_id,username&access_token=${encodeURIComponent(accessToken)}`);
-    if (!profile?.user_id) throw new Error('Could not fetch the Instagram profile — make sure it\'s a Business or Creator account.');
-
-    return { externalUserId: profile.user_id, externalUsername: profile.username || profile.user_id, accessToken, refreshToken: null, expiresAt: Date.now() + expiresIn * 1000 };
-}
-
-async function exchangeTikTokCode(code) {
-    const cfg = OAUTH_CONFIG.tiktok;
-    const { json } = await postForm('https://open.tiktokapis.com/v2/oauth/token/', {
-        client_key: cfg.clientId, client_secret: cfg.clientSecret, code, grant_type: 'authorization_code', redirect_uri: cfg.redirectUri,
-    });
-    if (!json?.access_token) throw new Error(json?.error_description || 'TikTok token exchange failed');
-    // GET, not POST — the query string carries `fields`, there's no request body.
-    const { json: userInfo } = await fetchJson('https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name', { Authorization: `Bearer ${json.access_token}` });
-    const username = userInfo?.data?.user?.display_name || json.open_id;
-    return {
-        externalUserId: json.open_id, externalUsername: username,
-        accessToken: json.access_token, refreshToken: json.refresh_token,
-        expiresAt: Date.now() + (json.expires_in || 86400) * 1000,
-    };
-}
-
-function htmlResponse(res, status, title, message) {
-    res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;"><h2>${title}</h2><p>${message}</p></body></html>`);
-}
-
-async function handleOAuthCallback(platform, req, res) {
-    const u = new URL(req.url, `https://${req.headers.host}`);
-    const code = u.searchParams.get('code');
-    const state = u.searchParams.get('state');
-    const oauthError = u.searchParams.get('error');
-    if (oauthError) return htmlResponse(res, 400, 'Authorization denied', 'You can close this tab.');
-
-    const stateEntry = state ? consumeOAuthState(state) : null;
-    if (!stateEntry || stateEntry.platform !== platform) return htmlResponse(res, 400, 'Invalid or expired link', 'Run /social link again in Discord and try once more within 10 minutes.');
-    if (!code) return htmlResponse(res, 400, 'Missing code', 'Something went wrong — no authorization code was returned.');
-
-    try {
-        const identity = platform === 'instagram' ? await exchangeInstagramCode(code) : await exchangeTikTokCode(code);
-        await upsertSocialLink({
-            guildId: stateEntry.guildId, platform,
-            externalUserId: identity.externalUserId, externalUsername: identity.externalUsername,
-            accessToken: identity.accessToken, refreshToken: identity.refreshToken, expiresAt: identity.expiresAt,
-            linkedBy: stateEntry.userId,
-        });
-        return htmlResponse(res, 200, 'Linked!', `<b>${identity.externalUsername}</b> is now linked. You can close this tab and go back to Discord, then use <code>/social add</code> to start tracking it.`);
-    } catch (e) {
-        console.error(`OAuth callback (${platform}):`, e.message);
-        return htmlResponse(res, 500, 'Link failed', `${e.message} — you can close this tab and try /social link again.`);
-    }
-}
-
-function legalPage(title, bodyHtml) {
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} — Notifyer</title>
-<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1a1a1a;} h1{margin-bottom:4px;} .updated{color:#666;font-size:0.9em;margin-top:0;} h2{margin-top:28px;} a{color:#5865F2;}</style>
-</head><body>${bodyHtml}</body></html>`;
-}
-
-const LEGAL_LAST_UPDATED = 'August 29, 2026';
-const LEGAL_CONTACT = process.env.LEGAL_CONTACT_EMAIL || process.env.BOT_OWNER_DISCORD_TAG || 'the bot owner via the support server';
-
-const TERMS_HTML = legalPage('Terms of Service', `
-<h1>Terms of Service</h1>
-<p class="updated">Last updated: ${LEGAL_LAST_UPDATED}</p>
-<p>These Terms govern your use of the Notifyer Discord bot ("the Bot"). By adding the Bot to a server or using its commands, you agree to these Terms.</p>
-
-<h2>What the Bot does</h2>
-<p>The Bot watches accounts you configure on YouTube, Twitter/X, Twitch, Instagram, and TikTok, and posts a notification in a Discord channel you choose when those accounts publish new content. For Instagram and TikTok, this only works for accounts that have explicitly authorized the Bot via OAuth (<code>/social link</code>) — the Bot cannot and does not access those platforms' accounts without their consent.</p>
-
-<h2>Acceptable use</h2>
-<ul>
-<li>You must comply with Discord's <a href="https://discord.com/terms">Terms of Service</a> and <a href="https://discord.com/guidelines">Community Guidelines</a> while using the Bot.</li>
-<li>You must have the right to link any Instagram or TikTok account you connect via <code>/social link</code> — only link accounts you own or are authorized to manage.</li>
-<li>Don't use the Bot to spam, harass, or send notifications to channels/servers without appropriate permission.</li>
-<li>Don't attempt to abuse, overload, or reverse-engineer the Bot's infrastructure.</li>
-</ul>
-
-<h2>No warranty</h2>
-<p>The Bot is provided "as is," without warranty of any kind. Notifications may be delayed, missed, or occasionally inaccurate, particularly where the Bot relies on unofficial or rate-limited data sources (e.g. Twitter). We don't guarantee uninterrupted availability.</p>
-
-<h2>Limitation of liability</h2>
-<p>To the maximum extent permitted by law, the Bot's operator is not liable for any indirect, incidental, or consequential damages arising from your use of, or inability to use, the Bot.</p>
-
-<h2>Termination</h2>
-<p>We may suspend or terminate the Bot's access to your server, or discontinue the Bot entirely, at any time. You can remove the Bot from your server at any time via Discord's server settings.</p>
-
-<h2>Changes</h2>
-<p>We may update these Terms from time to time. Continued use of the Bot after changes are posted constitutes acceptance of the revised Terms.</p>
-
-<h2>Contact</h2>
-<p>Questions about these Terms can be directed to ${LEGAL_CONTACT}.</p>
-`);
-
-const PRIVACY_HTML = legalPage('Privacy Policy', `
-<h1>Privacy Policy</h1>
-<p class="updated">Last updated: ${LEGAL_LAST_UPDATED}</p>
-<p>This Privacy Policy explains what data the Notifyer Discord bot ("the Bot") collects and how it's used.</p>
-
-<h2>Data we collect</h2>
-<ul>
-<li><b>Server configuration:</b> the Discord server (guild) ID, channel IDs, role IDs, and the account handles/URLs you choose to track, along with any custom notification message templates you set.</li>
-<li><b>Discord identifiers:</b> the Discord user ID and username of whoever adds a watch or links an account, stored only to show who configured something.</li>
-<li><b>OAuth tokens:</b> if you use <code>/social link</code> to connect an Instagram or TikTok account, we store the access token, refresh token, and the linked account's platform user ID/username, so the Bot can check that account for new posts on your behalf.</li>
-<li><b>Post metadata:</b> IDs and timestamps of posts already seen, so the Bot doesn't re-notify for the same content.</li>
-</ul>
-<p>We do not collect message content from your Discord server beyond what's needed to operate slash commands, and we do not read or store the content of DMs.</p>
-
-<h2>How we use data</h2>
-<p>Data is used solely to operate the Bot's core function: checking tracked accounts on a schedule and posting notifications to the channel you specify. We do not sell data, use it for advertising, or share it with third parties except the platform APIs (Instagram/TikTok) strictly as needed to fetch posts from accounts you've linked.</p>
-
-<h2>Data retention & deletion</h2>
-<p>Watch configurations and linked accounts are retained until you remove them (<code>/social list</code> → Remove, or by revoking a link) or remove the Bot from your server. You can request deletion of any data tied to your server or Discord account by contacting ${LEGAL_CONTACT}.</p>
-
-<h2>Third-party services</h2>
-<p>The Bot communicates with Discord's API, and — where you've configured it — YouTube, Twitter/X, Twitch, Meta's Instagram Graph API, and TikTok's API. Each of those platforms has its own privacy policy governing data you share with them directly.</p>
-
-<h2>Security</h2>
-<p>OAuth tokens are stored in a private database and are not exposed through any Bot command or public endpoint. No storage method is 100% secure, but we take reasonable steps to protect stored data.</p>
-
-<h2>Children's privacy</h2>
-<p>The Bot is not directed at children under 13, consistent with Discord's own age requirements.</p>
-
-<h2>Changes</h2>
-<p>We may update this Privacy Policy from time to time. Material changes will be reflected by updating the "Last updated" date above.</p>
-
-<h2>Contact</h2>
-<p>Questions about this policy, or requests to access/delete your data, can be directed to ${LEGAL_CONTACT}.</p>
-`);
-
-const STATUS_HTML = legalPage('Status', `
-<h1>🔔 Notifyer Beta</h1>
-<p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>
-<p>This is the backend for the beta build of a Discord bot that posts notifications in a server channel whenever a tracked creator publishes new content or goes live.</p>
-<p>
-<a href="/terms">Terms of Service</a> &nbsp;·&nbsp;
-<a href="/privacy">Privacy Policy</a> &nbsp;·&nbsp;
-<a href="https://github.com/DaniBottoni/Notifyer/tree/main">GitHub</a> &nbsp;·&nbsp;
-<a href="https://top.gg/bot/1515779889737896006">top.gg</a>
-</p>
-`);
+client.login(process.env.DISCORD_TOKEN);
 
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-    const path = req.url.split('?')[0];
-    if (path === '/health') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('OK');
-    }
-    if (path === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(STATUS_HTML);
-    }
-    if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
-    if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
-    // TikTok (and similar) URL-prefix/domain ownership verification: they give you a .txt
-    // file to download and host at a specific path. This is hardcoded from the actual
-    // downloaded file's content to avoid any copy/paste corruption through env vars — if
-    // TikTok ever issues a NEW verification file later, update these two constants.
-    const TIKTOK_VERIFY_FILENAME = process.env.TIKTOK_VERIFY_FILENAME || 'tiktok54ye0zN8LYl3cx2fMAolswrgKzdRfnvK.txt';
-    const TIKTOK_VERIFY_CONTENT = process.env.TIKTOK_VERIFY_CONTENT || 'tiktok-developers-site-verification=54ye0zN8LYl3cx2fMAolswrgKzdRfnvK';
-    if (path === `/${TIKTOK_VERIFY_FILENAME}`) {
-        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(TIKTOK_VERIFY_CONTENT);
-    }
-    if (path === '/oauth/instagram/callback') return handleOAuthCallback('instagram', req, res);
-    if (path === '/oauth/tiktok/callback') return handleOAuthCallback('tiktok', req, res);
-    res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
-}).listen(PORT, () => console.log(`🌐 HTTP server on port ${PORT}`));
-
-// Keep-alive: ping our own URL periodically so Render's free tier doesn't spin down.
-const KEEP_ALIVE_URL = process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE_URL;
-if (KEEP_ALIVE_URL) {
-    setInterval(() => {
-        https.get(`${KEEP_ALIVE_URL.replace(/\/$/, '')}/health`, res => res.resume())
-            .on('error', e => console.error('⚠️ Keep-alive ping failed:', e.message));
-    }, 10 * 60 * 1000); // every 10 minutes
-} else {
-    console.log('ℹ️ KEEP_ALIVE_URL/RENDER_EXTERNAL_URL not set — self-ping disabled.');
-}
+http.createServer((req, res) => { const ok = req.url === '/' || req.url === '/health'; res.writeHead(ok ? 200 : 404, { 'Content-Type': 'text/plain' }); res.end(ok ? 'Police bot is running!' : 'Not found'); }).listen(PORT, () => console.log(`🌐 HTTP server on port ${PORT}`));
